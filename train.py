@@ -50,23 +50,23 @@ exp_config = {
     "initial_vocab_size": 259,  # Matches ByteLevelTokenizer default + 3 special tokens
     "compressor_level_configs": [
         {"dim": 512, "heads": 8, "window": 128,
-         "num_encoder_layers": 6,
+         "num_encoder_layers": 2,
          'encoder_ffn_dim_multiplier': 4,
          'encoder_dropout': 0.1,
          'max_seq_len_encoder': 4096,
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 2048,
-         "beta": 0.25},
+         "codebook_size": 512,
+         "beta": 0.5},
         {"dim": 1024, "heads": 16, "window": 64,
-         "num_encoder_layers": 6,
+         "num_encoder_layers": 2,
          'encoder_ffn_dim_multiplier': 4,
          'encoder_dropout': 0.1,
          'max_seq_len_encoder': 4096,
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 32768,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
-         "beta": 0.25}
+         "codebook_size": 1024,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
+         "beta": 0.5}
     ],
     "expander_dim_scale": 1.0,
     "expander_num_enc_layers": 3,
@@ -76,8 +76,9 @@ exp_config = {
     "expander_eos_id": 1,  # As used in CodeExpander
     "expander_max_len": 2048,  # Default max generation length for CodeExpander
     "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
+    "aux_lm_loss_weight": 0.8,
     "learning_rate": 1e-4,
-    "batch_size": 2,  # Centralized BATCH_SIZE
+    "batch_size": 16,  # Centralized BATCH_SIZE
     "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
     "num_epochs": 10,
     "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)
@@ -85,7 +86,7 @@ exp_config = {
     # Dataset configurations
     "dataset_name": "HuggingFaceFW/fineweb-edu",
     "dataset_config": "sample-10BT",
-    "dataset_train_split": "train[:20000]",  # Using a larger subset for demo
+    "dataset_train_split": "train[:200000]",  # Using a larger subset for demo
     "text_column_name": "text",
 
     # --- Generation during training settings ---
@@ -122,7 +123,8 @@ model = HierarchicalAutoencoder(
     expander_dropout=exp_config["expander_dropout"],
     expander_eos_id=exp_config["expander_eos_id"],
     expander_max_len=exp_config["expander_max_len"],  # Pass expander_max_len
-    propagate_key_padding_mask=exp_config["propagate_key_padding_mask"]
+    propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
+    aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
 ).to(DEVICE)
 
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -339,6 +341,13 @@ for epoch in range(exp_config["num_epochs"]):
                 aim_run.track(val.item(), name=f'loss_detail/{name}', step=global_step, epoch=epoch,
                               context={"subset": "train"})
 
+            if 'avg_aux_lm_loss' in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                aim_run.track(output_dict['avg_aux_lm_loss'].item(), name='loss/aux_lm_avg', step=global_step,
+                              epoch=epoch, context={"subset": "train"})
+                for name, val in output_dict['aux_lm_loss_details'].items():
+                    aim_run.track(val.item(), name=f'loss_detail/{name}', step=global_step, epoch=epoch,
+                                  context={"subset": "train"})
+
             if 'compression_ratios' in output_dict:  # Check if metrics are present
                 for i, ratio in enumerate(output_dict['compression_ratios']):
                     aim_run.track(ratio, name=f'compression/ratio_L{i}', step=global_step,
@@ -353,11 +362,26 @@ for epoch in range(exp_config["num_epochs"]):
             aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate', step=global_step,
                           epoch=epoch)
 
-            progress_bar.set_postfix({
+            if 'all_codebook_perplexities' in output_dict:
+                for i, perplexity_val in enumerate(output_dict['all_codebook_perplexities']):
+                    aim_run.track(perplexity_val.item(), name=f'vq_metrics/perplexity_L{i}', step=global_step,
+                                  epoch=epoch)
+                    # Log codebook size for reference
+                    # This requires actual_codebook_sizes to be accessible or passed to logger
+                    # Or, get it from compressor_level_configs
+                    codebook_size_L_i = exp_config["compressor_level_configs"][i]["codebook_size"]
+                    aim_run.track(codebook_size_L_i, name=f'vq_metrics/codebook_size_L{i}', step=global_step,
+                                  epoch=epoch, context={"type": "config"})
+
+            postfix_dict = {
                 "loss": f"{total_loss.item():.4f}",
                 "vq": f"{output_dict['vq_loss'].item():.4f}",
+                "reco": f"{output_dict['avg_reconstruction_loss'].item():.4f}",
                 "ratios": ", ".join([f"{r:.2f}" for r in output_dict.get('compression_ratios', [])])
-            })
+            }
+            if 'avg_aux_lm_loss' in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                postfix_dict["auxLM"] = f"{output_dict['avg_aux_lm_loss'].item():.4f}"
+            progress_bar.set_postfix(postfix_dict)
 
         # --- Generation During Training ---
         if global_step > 0 and global_step % exp_config["generation_interval"] == 0:

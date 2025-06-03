@@ -25,7 +25,8 @@ class HierarchicalAutoencoder(nn.Module):
                  expander_dropout: float = 0.1,
                  expander_eos_id: int = 1,
                  expander_max_len: int = 2048,
-                 propagate_key_padding_mask: bool = True):
+                 propagate_key_padding_mask: bool = True,
+                 aux_lm_loss_weight: float = 0.1):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -37,6 +38,7 @@ class HierarchicalAutoencoder(nn.Module):
         self.initial_vocab_size = initial_vocab_size
         self.expander_eos_id = expander_eos_id  # Used as BOS in CodeExpander
         self.propagate_key_padding_mask = propagate_key_padding_mask
+        self.aux_lm_loss_weight = aux_lm_loss_weight  # Weight for auxiliary LM loss
 
         # ---- Configure Compressor Stack ----
         self.compressors = nn.ModuleList()
@@ -93,10 +95,20 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_level_valid_masks: List[Optional[torch.Tensor]] = []
         total_vq_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
 
+        # For auxiliary LM loss
+        all_encoder_logits_list: List[torch.Tensor] = []
+        all_compressor_input_tokens_list: List[torch.Tensor] = []
+        all_compressor_input_kpms_list: List[Optional[torch.Tensor]] = []
+
+        all_perplexities_list: List[torch.Tensor] = []
+
         current_input_tokens = tokens
         current_kpm = key_padding_mask
 
         for i, compressor in enumerate(self.compressors):
+            all_compressor_input_tokens_list.append(current_input_tokens) # Store input for aux LM loss
+            all_compressor_input_kpms_list.append(current_kpm) # Store KPM for aux LM loss
+
             if current_kpm is not None:
                 input_seq_len = (~current_kpm).sum(dim=1).float().mean().item()
             else:
@@ -105,8 +117,12 @@ class HierarchicalAutoencoder(nn.Module):
 
             comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
             output_codes = comp_out['codes']
+            encoder_logits_level_i = comp_out['encoder_logits']
+            all_perplexities_list.append(comp_out['codebook_perplexity'])
+
             all_codes_list.append(output_codes)
             all_continuous_list.append(comp_out['continuous'])
+            all_encoder_logits_list.append(encoder_logits_level_i)
             total_vq_loss += comp_out['vq_loss']
 
             # valid_mask_for_output from ByteSegmentCompressor is (B, S_hat_segments)
@@ -151,9 +167,13 @@ class HierarchicalAutoencoder(nn.Module):
             'compression_ratios': compression_ratios,
             'input_seq_lengths': all_input_seq_lengths,
             'output_seq_lengths': all_output_seq_lengths,
-            'all_compressor_level_valid_masks': all_compressor_level_valid_masks
-            # Segment-level valid masks
+            'all_compressor_level_valid_masks': all_compressor_level_valid_masks,
+            'all_encoder_logits': all_encoder_logits_list,
+            'all_compressor_input_tokens': all_compressor_input_tokens_list,
+            'all_compressor_input_kpms': all_compressor_input_kpms_list,
+            'all_codebook_perplexities': all_perplexities_list,
         }
+
 
     def decompress(self,
                    top_codes: torch.Tensor,
@@ -238,7 +258,14 @@ class HierarchicalAutoencoder(nn.Module):
         vq_loss = compression_results['vq_loss']
         kpm_for_top_expander_input = compression_results['final_key_padding_mask']
         all_compressor_level_valid_masks = compression_results['all_compressor_level_valid_masks']
+        all_codebook_perplexities = compression_results['all_codebook_perplexities']
 
+        # For auxiliary LM loss
+        all_encoder_logits = compression_results['all_encoder_logits']
+        all_compressor_input_tokens = compression_results['all_compressor_input_tokens']
+        all_compressor_input_kpms = compression_results['all_compressor_input_kpms']
+
+        # For metrics
         compression_ratios = compression_results['compression_ratios']
         input_seq_lengths_c = compression_results['input_seq_lengths']
         output_seq_lengths_c = compression_results['output_seq_lengths']
@@ -325,16 +352,80 @@ class HierarchicalAutoencoder(nn.Module):
 
         avg_reconstruction_loss = total_reconstruction_loss / self.num_levels if self.num_levels > 0 else torch.tensor(
             0.)
-        final_total_loss = avg_reconstruction_loss + vq_loss
+
+        # --- 5. Calculate Auxiliary LM Loss for Compressors ---
+        total_aux_lm_loss_unweighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+        aux_lm_loss_details: Dict[str, torch.Tensor] = {}
+
+        if self.aux_lm_loss_weight > 0 and all_encoder_logits:  # Ensure weight is positive and logits list exists
+            num_valid_aux_lm_levels = 0
+            for i in range(self.num_levels):
+                encoder_logits_i = all_encoder_logits[i]  # (B, S_in_i, V_in_i)
+                input_tokens_i = all_compressor_input_tokens[i]  # (B, S_in_i)
+                input_kpm_i = all_compressor_input_kpms[i]  # (B, S_in_i) or None
+
+                # Ensure there's enough sequence length to predict a next token
+                if input_tokens_i.size(1) <= 1:  # Cannot form shifted targets if seq_len is 0 or 1
+                    current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                    # Optionally log that this level was skipped for aux LM loss
+                    # print(f"Skipping aux LM loss for level {i} due to short sequence length: {input_tokens_i.size(1)}")
+                else:
+                    # Shift logits and targets for next token prediction
+                    # Logits from position t are used to predict token t+1
+                    logits_for_next_token_pred = encoder_logits_i[:, :-1, :]  # (B, S_in_i - 1, V_in_i)
+                    # Target token at t+1 is the label for logits from position t
+                    target_tokens_for_next_token_pred = input_tokens_i[:, 1:]  # (B, S_in_i - 1)
+
+                    # Shift key_padding_mask for the targets
+                    kpm_for_shifted_targets = None
+                    if input_kpm_i is not None:
+                        kpm_for_shifted_targets = input_kpm_i[:, 1:]  # (B, S_in_i - 1)
+
+                    if logits_for_next_token_pred.size(1) == 0:  # Should be caught by outer if, but defensive
+                        current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                    else:
+                        loss_lm_i_per_token = F.cross_entropy(
+                            logits_for_next_token_pred.reshape(-1, logits_for_next_token_pred.size(-1)),
+                            target_tokens_for_next_token_pred.reshape(-1),
+                            reduction='none'
+                        ).view_as(target_tokens_for_next_token_pred)  # (B, S_in_i - 1)
+
+                        if kpm_for_shifted_targets is not None:
+                            loss_mask = ~kpm_for_shifted_targets  # True for valid (non-padded) target tokens
+                            # Ensure loss_mask is not all False, which can happen if all shifted targets are padding
+                            valid_targets_count = loss_mask.sum()
+                            if valid_targets_count > 0:
+                                current_aux_loss = (loss_lm_i_per_token * loss_mask).sum() / valid_targets_count.clamp(
+                                    min=1e-9)
+                            else:  # No valid targets to compute loss on (e.g., sequence was all padding after shift)
+                                current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                        else:  # No padding mask for targets
+                            current_aux_loss = loss_lm_i_per_token.mean()
+
+                    num_valid_aux_lm_levels += 1
+
+                aux_lm_loss_details[f"aux_lm_loss_L{i}"] = current_aux_loss
+                total_aux_lm_loss_unweighted += current_aux_loss
+
+            # Average only over levels where loss was actually computed meaningfully
+            avg_aux_lm_loss = total_aux_lm_loss_unweighted / num_valid_aux_lm_levels if num_valid_aux_lm_levels > 0 else torch.tensor(
+                0.)
+        else:
+            avg_aux_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)  # Default if not active
+
+        final_total_loss = avg_reconstruction_loss + vq_loss + (self.aux_lm_loss_weight * avg_aux_lm_loss)
 
         return {
             'total_loss': final_total_loss, 'vq_loss': vq_loss,
             'avg_reconstruction_loss': avg_reconstruction_loss,
             'reconstruction_loss_details': reconstruction_loss_details,
+            'avg_aux_lm_loss': avg_aux_lm_loss,  # For logging
+            'aux_lm_loss_details': aux_lm_loss_details,  # For logging
             'final_reconstructed_logits': decompression_results['final_reconstructed_logits'],
             'compression_ratios': compression_ratios,
             'input_seq_lengths_compressors': input_seq_lengths_c,
             'output_seq_lengths_compressors': output_seq_lengths_c,
+            'all_codebook_perplexities': all_codebook_perplexities,
         }
 
     @torch.no_grad()

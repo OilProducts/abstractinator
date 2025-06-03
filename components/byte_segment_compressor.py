@@ -105,8 +105,9 @@ class ByteSegmentCompressor(nn.Module):
         # ── 1. Encode Tokens ───────────────────────────────────────────────────
         # `hidden` are token embeddings, `logits` for prediction (e.g., for entropy calc)
         # Note: key_padding_mask is not explicitly passed to self.encoder here.
-        # If DeeperSlidingWindowEncoder supports it, it should be passed.
+        # If StackedSlidingWindowEncoder supports it, it should be passed.
         hidden, logits = self.encoder(token_ids) # hidden: (B,S,D), logits: (B,S,Vocab)
+        #TODO should encoder take key_padding_mask? does it need safe_softmax then?
 
         # ── 2. Perform Entropy-Based Segmentation ─────────────────────────────
         # This part determines segment boundaries based on token prediction entropy.
@@ -145,10 +146,39 @@ class ByteSegmentCompressor(nn.Module):
         # quantised_embeddings: (B, S_hat*L, D)
         # vq_loss: scalar
         # codebook_indices: (B, S_hat*L)
+        # Calculate codebook perplexity
+        codebook_perplexity = torch.tensor(1.0, device=token_ids.device)  # Default for empty/no codes
+        if codebook_indices.numel() > 0:
+            flat_indices = codebook_indices.reshape(-1)
+            # Ensure K is correctly accessed from your VQ instance
+            # Assuming self.vq.K holds the codebook size
+            num_codebook_vectors = self.vq.K
 
-        return {
+            # Clamp indices to be safe, though they should be in range [0, K-1]
+            clamped_indices = torch.clamp(flat_indices, 0, num_codebook_vectors - 1)
+
+            counts = torch.bincount(clamped_indices.long(), minlength=num_codebook_vectors)
+
+            # Probabilities of using each code
+            p_codes = counts.float() / flat_indices.numel()
+            # Filter out p=0 for entropy calculation to avoid log(0)
+            p_codes_nz = p_codes[p_codes > 0]
+
+            if p_codes_nz.numel() > 0:  # If any codes were actually used
+                entropy_val = -torch.sum(p_codes_nz * torch.log(p_codes_nz))  # Natural log for nats
+                codebook_perplexity = torch.exp(entropy_val)  # Perplexity = e^H
+            # else: perplexity remains 1.0 (e.g., if flat_indices was empty or all codes had 0 prob somehow)
+        elif pooled_embeddings.numel() > 0 and pooled_embeddings.size(
+                1) == 0:  # Pooled embeddings exist but have 0 query dim
+            codebook_perplexity = torch.tensor(1.0, device=token_ids.device)  # No codes to choose from
+
+        # Update the return dictionary
+        return_dict = {
             'continuous': quantised_embeddings,
             'codes': codebook_indices,
             'vq_loss': vq_loss,
-            'valid_mask': valid_segments_mask # Mask for valid *segments* (B, S_hat)
+            'valid_mask': valid_segments_mask,  # (B, S_hat_segments)
+            'encoder_logits': logits,
+            'codebook_perplexity': codebook_perplexity  # <<< ADDED
         }
+        return return_dict
