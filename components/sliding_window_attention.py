@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 
 class SlidingWindowAttention(nn.Module):
     """Multi-head scaled-dot-product attention restricted to a fixed retrospective window.

@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from .learned_query_attention import LearnedQueryAttention
 from .vector_quantizer import VectorQuantizer
+from .sliding_window_attention import StackedSlidingWindowEncoder
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask
 
 class ByteSegmentCompressor(nn.Module):
@@ -48,7 +49,7 @@ class ByteSegmentCompressor(nn.Module):
 
         # Initialize the token encoder
         # (Assuming DeeperSlidingWindowEncoder is defined elsewhere)
-        self.encoder = DeeperSlidingWindowEncoder(
+        self.encoder = StackedSlidingWindowEncoder(
             vocab_size=vocab_size,
             dim=dim,
             num_heads=heads,
