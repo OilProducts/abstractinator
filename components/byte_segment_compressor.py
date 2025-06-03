@@ -1,0 +1,153 @@
+from typing import Dict, Optional # Already imported if combined
+
+import torch
+import torch.nn as nn
+
+from .learned_query_attention import LearnedQueryAttention
+from .vector_quantizer import VectorQuantizer
+from .utils import token_entropy, entropy_segments, build_segment_queries_mask
+
+class ByteSegmentCompressor(nn.Module):
+    """
+    End-to-end module that processes a sequence of byte-level tokens.
+
+    It first encodes the tokens using a `DeeperSlidingWindowEncoder`. Then, it
+    segments the encoded sequence based on token entropy. For each segment,
+    a fixed number (`num_queries`) of learned query vectors are used to pool
+    features from the segment via `LearnedQueryAttention`. Finally, these
+    pooled segment embeddings are vector-quantized.
+
+    The module outputs continuous segment embeddings, discrete codebook indices
+    for these embeddings, the VQ loss, and a validity mask for the segments.
+
+    Output dictionary structure:
+      {
+        'continuous': torch.Tensor (B, Q_total, D)  # Pooled & quantized segment vectors
+        'codes'     : torch.Tensor (B, Q_total)     # Integer codebook indices
+        'vq_loss'   : torch.Tensor (scalar)         # VQ loss (0 if VQ disabled/eval)
+        'valid_mask': torch.Tensor (B, S_hat)       # Boolean mask for valid segments
+                                                    # (S_hat is max segments in batch)
+      }
+    where Q_total = S_hat * num_queries_per_segment.
+    """
+    def __init__(self,
+                 vocab_size: int = 259,
+                 dim: int = 256,
+                 heads: int = 8, # Num heads for both encoder and pooler
+                 window: int = 128, # Window size for encoder
+                 num_encoder_layers: int = 3,
+                 encoder_ffn_dim_multiplier: int = 4,
+                 encoder_dropout: float = 0.1,
+                 max_seq_len_encoder: int = 4096, # Max sequence length for encoder's PE
+                 num_queries: int = 1, # L: Number of queries per segment for the pooler
+                 pooler_dropout: float = 0.1, # Dropout for the LearnedQueryAttention pooler
+                 codebook_size: int = 512,    # K: Number of codes in VQ codebook
+                 beta: float = 0.25):          # Beta for VQ commitment loss
+        super().__init__()
+        self.num_queries_per_segment = num_queries # Store L for convenience
+
+        # Initialize the token encoder
+        # (Assuming DeeperSlidingWindowEncoder is defined elsewhere)
+        self.encoder = DeeperSlidingWindowEncoder(
+            vocab_size=vocab_size,
+            dim=dim,
+            num_heads=heads,
+            window_size=window,
+            num_layers=num_encoder_layers,
+            ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+            dropout=encoder_dropout,
+            max_seq_len=max_seq_len_encoder
+        )
+
+        # Initialize the attention pooler that uses learned queries per segment
+        self.pooler = LearnedQueryAttention(
+            embed_dim=dim,
+            num_queries_per_segment=num_queries,
+            num_heads=heads,
+            dropout=pooler_dropout # Pass the specific dropout for the pooler
+        )
+
+        # Initialize the Vector Quantizer
+        self.vq = VectorQuantizer(
+            K=codebook_size,
+            D=dim,
+            beta=beta
+        )
+
+    def forward(self, token_ids: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None
+               ) -> Dict[str, torch.Tensor]:
+        """
+        Processes input token IDs to produce compressed segment representations.
+
+        Args:
+            token_ids (torch.Tensor): Input token IDs.
+                Shape: (batch_size, sequence_length). Expected dtype: int16/int32/int64.
+            key_padding_mask (Optional[torch.Tensor]): Boolean mask for `token_ids`
+                where `True` indicates a padded token.
+                Shape: (batch_size, sequence_length).
+                Note: This mask is passed to the pooler. Its usage by the encoder
+                depends on the DeeperSlidingWindowEncoder implementation.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing:
+                - 'continuous': Quantized continuous segment embeddings.
+                  Shape: (batch_size, S_hat * L, embed_dim), where S_hat is the
+                  max number of segments in the batch, and L is num_queries_per_segment.
+                - 'codes': Discrete codebook indices for the embeddings.
+                  Shape: (batch_size, S_hat * L).
+                - 'vq_loss': The vector quantization loss (scalar tensor).
+                - 'valid_mask': A boolean mask indicating valid segments among the S_hat
+                  potential segment slots. Shape: (batch_size, S_hat). To get a mask
+                  for valid query vectors, this would need to be expanded/repeated.
+        """
+        # ── 1. Encode Tokens ───────────────────────────────────────────────────
+        # `hidden` are token embeddings, `logits` for prediction (e.g., for entropy calc)
+        # Note: key_padding_mask is not explicitly passed to self.encoder here.
+        # If DeeperSlidingWindowEncoder supports it, it should be passed.
+        hidden, logits = self.encoder(token_ids) # hidden: (B,S,D), logits: (B,S,Vocab)
+
+        # ── 2. Perform Entropy-Based Segmentation ─────────────────────────────
+        # This part determines segment boundaries based on token prediction entropy.
+        # It's done with no_grad as the segmentation logic itself is not learned here.
+        with torch.no_grad():
+            # token_entropy and entropy_segments are assumed to be defined elsewhere
+            entropy = token_entropy(logits)  # (B,S)
+            seg_id = entropy_segments(entropy) # (B,S), integer segment IDs
+        # seg_id now maps each token position to a segment index.
+
+        # Build queries and attention mask for segment-restricted pooling.
+        # `self.pooler.query_template` are the L learned base queries (L,D).
+        # `self.pooler.num_heads` is used for repeating the attention mask.
+        queries, seg_attn_mask, valid_segments_mask = build_segment_queries_mask(
+            seg_id,
+            self.pooler.query_template,
+            self.pooler.num_heads
+        )
+        # queries: (B, S_hat*L, D) - Tiled learned queries for each potential segment.
+        # seg_attn_mask: (B*H, S_hat*L, S_original) - Masks attention outside segments.
+        # valid_segments_mask: (B, S_hat) - Indicates which of S_hat segments are real.
+
+        # ── 3. Learned-Query Pooling (Segment-Restricted) ───────────────────
+        # Pool features from `hidden` states using the constructed `queries`.
+        # Attention is restricted by `seg_attn_mask` and `key_padding_mask`.
+        pooled_embeddings, _ = self.pooler(
+            x=hidden,                         # Keys and Values from encoder output (B,S,D)
+            queries=queries,                  # Segment-specific queries (B, S_hat*L, D)
+            attn_mask=seg_attn_mask,          # Restricts attention within segments
+            key_padding_mask=key_padding_mask # Masks padded tokens in `hidden`
+        ) # pooled_embeddings: (B, S_hat*L, D)
+
+        # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
+        # Apply vector quantization to the pooled segment embeddings.
+        quantised_embeddings, vq_loss, codebook_indices = self.vq(pooled_embeddings)
+        # quantised_embeddings: (B, S_hat*L, D)
+        # vq_loss: scalar
+        # codebook_indices: (B, S_hat*L)
+
+        return {
+            'continuous': quantised_embeddings,
+            'codes': codebook_indices,
+            'vq_loss': vq_loss,
+            'valid_mask': valid_segments_mask # Mask for valid *segments* (B, S_hat)
+        }

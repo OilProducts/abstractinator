@@ -1,0 +1,331 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
+class SlidingWindowAttention(nn.Module):
+    """Multi-head scaled-dot-product attention restricted to a fixed retrospective window.
+
+    Each position `i` in the sequence can attend to tokens in the range
+    `[max(0, i - window_size), i]`. This creates a causal attention mechanism
+    where attention is limited to a recent context.
+
+    Attributes:
+        embed_dim (int): Total embedding dimension.
+        num_heads (int): Number of attention heads.
+        head_dim (int): Dimension of each attention head (`embed_dim // num_heads`).
+        window_size (int): The number of previous tokens (relative to the current token)
+                           that a query can attend to. The current token itself is always
+                           included in the window. Thus, the total window length is `window_size + 1`.
+        q_proj (nn.Linear): Linear projection for queries.
+        k_proj (nn.Linear): Linear projection for keys.
+        v_proj (nn.Linear): Linear projection for values.
+        out_proj (nn.Linear): Final linear projection for the output.
+        dropout (nn.Dropout): Dropout layer applied to attention probabilities.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, window_size: int,
+                 dropout: float = 0.0, bias: bool = True) -> None:
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+            )
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.window_size = window_size # Number of *previous* tokens query can attend to
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def _sliding_window_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Generates a sliding window attention mask.
+
+        The mask ensures that a token at position `i` can only attend to tokens
+        in the range `[max(0, i - window_size), i]`.
+
+        Args:
+            seq_len (int): The length of the sequence.
+            device (torch.device): The device to create the mask on.
+
+        Returns:
+            torch.Tensor: A boolean mask of shape (seq_len, seq_len) where `True`
+                          indicates positions that should be *blocked* from attention.
+        """
+        # Create indices for sequence positions: [0, 1, ..., seq_len-1]
+        idx = torch.arange(seq_len, device=device)
+
+        # Calculate relative positions: rel_pos[i, j] = j - i
+        # Rows are query positions (i), columns are key positions (j).
+        # Shape: (seq_len, seq_len)
+        rel_pos = idx[None, :] - idx[:, None]
+
+        # Mask conditions:
+        # 1. `rel_pos > 0`: Block attention to future tokens (j > i). This ensures causality.
+        # 2. `rel_pos < -self.window_size`: Block attention to tokens too far in the past.
+        #    This means j - i < -window_size, or j < i - window_size.
+        #    So, tokens from `i - window_size` up to `i` are allowed.
+        #    The window includes the current token and `self.window_size` previous tokens.
+        mask = (rel_pos > 0) | (rel_pos < -self.window_size)
+        return mask  # True means blocked
+
+    def forward(self,
+                x: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Computes sliding-window multi-head attention.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+                Shape: (batch_size, sequence_length, embed_dim).
+            attn_mask (Optional[torch.Tensor]): Additional attention mask, broadcastable
+                to (sequence_length, sequence_length). `True` indicates positions
+                where attention is **not permitted**.
+            key_padding_mask (Optional[torch.Tensor]): Boolean mask indicating padded
+                tokens in `x`. `True` for padding.
+                Shape: (batch_size, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+                Shape: (batch_size, sequence_length, embed_dim).
+        """
+        B, S, D = x.shape # D is embed_dim
+        if D != self.embed_dim:
+            raise ValueError(f"Input embed_dim ({D}) does not match layer embed_dim ({self.embed_dim})")
+
+        # Linear projections for Q, K, V
+        q = self.q_proj(x)  # (B, S, D)
+        k = self.k_proj(x)  # (B, S, D)
+        v = self.v_proj(x)  # (B, S, D)
+
+        # Reshape and transpose for multi-head attention
+        # (B, S, D) -> (B, S, num_heads, head_dim) -> (B, num_heads, S, head_dim)
+        q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scale queries for scaled dot-product attention
+        q = q * (self.head_dim ** -0.5)
+
+        # Compute attention scores: (B, num_heads, S, S)
+        # (B, H, S, d_h) @ (B, H, d_h, S) -> (B, H, S, S)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1))
+
+        # --- Apply masks ---
+        # 1. Sliding window mask (causal + fixed window)
+        # This mask is (S, S) and applies to all heads and batch items uniformly.
+        combined_mask = self._sliding_window_mask(S, x.device) # (S, S)
+
+        # 2. Optional additional attention mask (e.g., for specific blocked patterns)
+        if attn_mask is not None:
+            # Ensure attn_mask is boolean and combine with OR logic
+            combined_mask = combined_mask | attn_mask.to(device=x.device, dtype=torch.bool)
+
+        # Unsqueeze combined_mask to be broadcastable for batch and heads: (1, 1, S, S)
+        combined_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+
+        # 3. Key padding mask (masks attention *to* padded keys)
+        if key_padding_mask is not None:
+            # Expand key_padding_mask from (B, S) to (B, 1, 1, S)
+            # This masks columns (keys) corresponding to padded input tokens.
+            expanded_kpm = key_padding_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, S)
+            # Combine with OR: if any mask says block, then block.
+            # combined_mask (1,1,S,S) | expanded_kpm (B,1,1,S) -> (B,1,S,S) by broadcasting rules
+            combined_mask = combined_mask | expanded_kpm
+
+        # Apply the combined mask to attention scores
+        # attn_scores: (B, H, S, S)
+        # combined_mask can be (S,S), (1,1,S,S) or (B,1,S,S). It will broadcast.
+        attn_scores = attn_scores.masked_fill(combined_mask, float('-inf'))
+
+        # Compute attention probabilities
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Compute weighted sum of values
+        # (B, H, S, S) @ (B, H, S, d_h) -> (B, H, S, d_h)
+        output = torch.matmul(attn_probs, v)
+
+        # Concatenate heads and apply final projection
+        # (B, H, S, d_h) -> (B, S, H, d_h) -> (B, S, D)
+        output = output.transpose(1, 2).contiguous().view(B, S, self.embed_dim)
+        output = self.out_proj(output)
+
+        return output
+
+
+class SlidingWindowTransformerBlock(nn.Module):
+    """
+    A single Transformer block using SlidingWindowAttention (Pre-LN variant).
+
+    The block consists of two main sub-layers:
+    1. Multi-Head Self-Attention (SlidingWindowAttention) with Pre-LayerNorm.
+    2. Feed-Forward Network (FFN) with Pre-LayerNorm.
+    Residual connections and dropout are applied after each sub-layer.
+
+    Attributes:
+        norm1 (nn.LayerNorm): Layer normalization before the attention layer.
+        attn (SlidingWindowAttention): The sliding window self-attention mechanism.
+        dropout1 (nn.Dropout): Dropout applied after the attention layer's output.
+        norm2 (nn.LayerNorm): Layer normalization before the FFN.
+        ffn (nn.Sequential): The feed-forward network.
+        dropout2 (nn.Dropout): Dropout applied after the FFN's output.
+    """
+
+    def __init__(self, dim: int, num_heads: int, window_size: int,
+                 ffn_dim_multiplier: int = 4, dropout: float = 0.1):
+        super().__init__()
+        # First sub-block: Sliding Window Multi-Head Attention
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SlidingWindowAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            dropout=dropout  # Pass attention-specific dropout here
+        )
+        self.dropout1 = nn.Dropout(dropout) # Dropout for the residual connection
+
+        # Second sub-block: Feed-Forward Network
+        self.norm2 = nn.LayerNorm(dim)
+        ffn_hidden_dim = dim * ffn_dim_multiplier
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_hidden_dim),
+            nn.GELU(), # GELU activation function
+            nn.Dropout(dropout),  # Dropout within the FFN, applied after activation
+            nn.Linear(ffn_hidden_dim, dim)
+        )
+        self.dropout2 = nn.Dropout(dropout) # Dropout for the residual connection
+
+    def forward(self, x: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass for the Transformer block.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+                Shape: (batch_size, sequence_length, embed_dim).
+            key_padding_mask (Optional[torch.Tensor]): Boolean mask indicating
+                padded tokens. Passed to the attention layer.
+                Shape: (batch_size, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor of the block.
+                Shape: (batch_size, sequence_length, embed_dim).
+        """
+        # Attention sub-layer (Pre-LN)
+        # x_norm1 = self.norm1(x) # Normalize input
+        # attn_output = self.attn(x_norm1, key_padding_mask=key_padding_mask) # Apply attention
+        # x = x + self.dropout1(attn_output) # Add residual and apply dropout
+
+        # Corrected Pre-LN application: Normalize before passing to attention
+        attn_output = self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
+        x = x + self.dropout1(attn_output) # Add residual and apply dropout
+
+        # Feed-forward sub-layer (Pre-LN)
+        # x_norm2 = self.norm2(x) # Normalize input to FFN
+        # ffn_output = self.ffn(x_norm2) # Apply FFN
+        # x = x + self.dropout2(ffn_output) # Add residual and apply dropout
+
+        # Corrected Pre-LN application: Normalize before passing to FFN
+        ffn_output = self.ffn(self.norm2(x))
+        x = x + self.dropout2(ffn_output) # Add residual and apply dropout
+
+        return x
+
+
+class StackedSlidingWindowEncoder(nn.Module):
+    """
+    A Transformer-style encoder composed of a stack of SlidingWindowTransformerBlock layers.
+
+    It includes token embeddings, learned positional encodings, the stacked
+    Transformer blocks, a final layer normalization, and a projection to logits.
+
+    Attributes:
+        embedding (nn.Embedding): Token embedding layer.
+        pos_encoding (nn.Parameter): Learned absolute positional encoding.
+        embed_dropout (nn.Dropout): Dropout applied after summing token and positional embeddings.
+        layers (nn.ModuleList): List of SlidingWindowTransformerBlock layers.
+        final_norm (nn.LayerNorm): Layer normalization applied to the output of the
+                                   last Transformer block before logit projection.
+        logit_proj (nn.Linear): Linear layer to project Transformer output to vocabulary logits.
+    """
+    def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
+                 num_layers: int, ffn_dim_multiplier: int = 4, dropout: float = 0.1,
+                 max_seq_len: int = 4096):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, dim)
+        # Learned absolute positional encodings
+        # Initialized with small random values to break symmetry
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList([
+            SlidingWindowTransformerBlock(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(dim) # Normalization before output projection
+        self.logit_proj = nn.Linear(dim, vocab_size) # Projects to vocabulary size
+
+    def forward(self, token_ids: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None
+               ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for the encoder.
+
+        Args:
+            token_ids (torch.Tensor): Input tensor of token IDs.
+                Shape: (batch_size, sequence_length).
+            key_padding_mask (Optional[torch.Tensor]): Boolean mask indicating
+                padded tokens in `token_ids`.
+                Shape: (batch_size, sequence_length).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+            - hidden_states (torch.Tensor): Output hidden states from the last
+              Transformer block. Shape: (batch_size, sequence_length, embed_dim).
+            - logits (torch.Tensor): Output logits over the vocabulary.
+              Shape: (batch_size, sequence_length, vocab_size).
+        """
+        B, S = token_ids.shape
+
+        # 1. Token Embeddings
+        x = self.embedding(token_ids) # (B, S, D)
+
+        # 2. Add Positional Encodings
+        if S > self.pos_encoding.size(1):
+            raise ValueError(
+                f"Input sequence length ({S}) exceeds max_seq_len for positional "
+                f"encoding ({self.pos_encoding.size(1)}). "
+                f"Consider increasing `max_seq_len` or truncating input."
+            )
+        # Add positional encodings (sliced to current sequence length)
+        x = x + self.pos_encoding[:, :S, :]
+
+        x = self.embed_dropout(x)
+
+        # 3. Pass through Transformer Layers
+        for layer in self.layers:
+            x = layer(x, key_padding_mask=key_padding_mask)
+            # x is continuously updated by each layer
+
+        # `x` is now the output of the last Transformer block.
+        # This can be used as hidden states for downstream tasks (e.g., pooling).
+        hidden_states_for_pooling = x
+
+        # 4. Final Normalization and Logit Projection
+        normed_output = self.final_norm(hidden_states_for_pooling)
+        logits = self.logit_proj(normed_output)  # (B, S, V)
+
+        return hidden_states_for_pooling, logits
