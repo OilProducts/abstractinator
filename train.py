@@ -57,7 +57,7 @@ exp_config = {
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
          "codebook_size": 512,
-         "beta": 0.5},
+         "beta": 0.05},
         {"dim": 1024, "heads": 16, "window": 64,
          "num_encoder_layers": 2,
          'encoder_ffn_dim_multiplier': 4,
@@ -66,19 +66,19 @@ exp_config = {
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
          "codebook_size": 1024,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
-         "beta": 0.5}
+         "beta": 0.05}
     ],
     "expander_dim_scale": 1.0,
-    "expander_num_enc_layers": 3,
-    "expander_num_dec_layers": 3,
+    "expander_num_enc_layers": 2,
+    "expander_num_dec_layers": 2,
     "expander_heads_scale": 1.0,
     "expander_dropout": 0.1,
     "expander_eos_id": 1,  # As used in CodeExpander
     "expander_max_len": 2048,  # Default max generation length for CodeExpander
     "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
-    "aux_lm_loss_weight": 0.8,
+    "aux_lm_loss_weight": 1.0,
     "learning_rate": 1e-4,
-    "batch_size": 16,  # Centralized BATCH_SIZE
+    "batch_size": 32,  # Centralized BATCH_SIZE
     "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
     "num_epochs": 10,
     "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)

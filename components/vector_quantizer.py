@@ -50,7 +50,7 @@ class VectorQuantizer(nn.Module):
             assigned to each code. Shape (K, D). Only used if `ema` is True.
     """
     def __init__(self, K: int, D: int, beta: float = 0.25,
-                 ema: bool = True, decay: float = 0.99, eps: float = 1e-5):
+                 ema: bool = False, decay: float = 0.99, eps: float = 1e-5):
         super().__init__()
         self.K = K  # Number of codebook vectors
         self.D = D  # Dimensionality of codebook vectors
@@ -176,7 +176,7 @@ class VectorQuantizer(nn.Module):
 
         # Total VQ loss
         # The beta factor scales the commitment loss.
-        vq_loss = codebook_loss + self.beta * commitment_loss
+        vq_loss = codebook_loss + (self.beta * commitment_loss)
 
         # --- Straight-Through Estimator (STE) ---
         # This allows gradients to pass through the discrete quantization step (argmin).
