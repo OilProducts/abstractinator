@@ -1,5 +1,7 @@
 import os
 import math
+import time
+from collections import defaultdict
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
@@ -57,7 +59,7 @@ exp_config = {
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
          "codebook_size": 512,
-         "beta": 0.05},
+         "beta": 1.25},
         {"dim": 1024, "heads": 16, "window": 64,
          "num_encoder_layers": 2,
          'encoder_ffn_dim_multiplier': 4,
@@ -66,7 +68,7 @@ exp_config = {
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
          "codebook_size": 1024,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
-         "beta": 0.05}
+         "beta": 1.25}
     ],
     "expander_dim_scale": 1.0,
     "expander_num_enc_layers": 2,
@@ -78,11 +80,12 @@ exp_config = {
     "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
     "aux_lm_loss_weight": 1.0,
     "learning_rate": 1e-4,
-    "batch_size": 32,  # Centralized BATCH_SIZE
+    "batch_size": 4,  # Centralized BATCH_SIZE
     "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
     "num_epochs": 10,
     "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)
     "gradient_clip_norm": 1.0,  # Optional gradient clipping
+    "gradient_accumulation_steps": 16,  # No accumulation for simplicity, can be adjusted
     # Dataset configurations
     "dataset_name": "HuggingFaceFW/fineweb-edu",
     "dataset_config": "sample-10BT",
@@ -307,117 +310,213 @@ print(f"DataLoader created with {N_CPU} workers.")
 print("\nStarting training loop...")
 global_step = 0
 model.train()  # Set model to training mode
+optimizer.zero_grad()  # Reset gradients before training
+
+# --- Metric Accumulators ---
+def reset_accumulators(num_levels):
+    accumulators = {
+        "total_loss": 0.0,
+        "vq_loss": 0.0,
+        "avg_reconstruction_loss": 0.0,
+        "reconstruction_loss_details": defaultdict(float),
+        "avg_aux_lm_loss": 0.0,
+        "aux_lm_loss_details": defaultdict(float),
+        "compression_ratios": [0.0] * num_levels,
+        "input_seq_lengths_compressors": [0.0] * num_levels,
+        "output_seq_lengths_compressors": [0.0] * num_levels,
+        "all_codebook_perplexities": [0.0] * num_levels,
+        "non_padded_tokens": 0,  # For tokens/sec
+        "count": 0 # To track number of batches accumulated
+    }
+    return accumulators
+
+accumulators = reset_accumulators(exp_config["num_levels"])
+time_of_last_optimizer_step_event = time.time() # Initialize timer for tokens/sec
 
 for epoch in range(exp_config["num_epochs"]):
-    progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{exp_config['num_epochs']}",
-                        unit="batch")
-    for batch in progress_bar:
+    progress_bar = tqdm(train_dataloader,
+                        desc=f"Epoch {epoch + 1}/{exp_config['num_epochs']} (Opt Step: {global_step})",
+                        unit=" minibatch")
+    for i, batch in enumerate(progress_bar):
         tokens = batch["input_ids"].to(DEVICE)
         # KPM is already boolean, just move to device
         kpm = batch["key_padding_mask"].to(DEVICE) if exp_config[
             "propagate_key_padding_mask"] else None
 
-        optimizer.zero_grad()
         # HierarchicalAutoencoder.forward now handles loss calculation internally
         # and expects KPM for the initial tokens.
         output_dict = model(tokens, key_padding_mask=kpm)
-
         total_loss = output_dict['total_loss']
-        total_loss.backward()
-        if exp_config.get("gradient_clip_norm"):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config["gradient_clip_norm"])
-        optimizer.step()
 
-        if global_step % exp_config["log_interval"] == 0:
-            aim_run.track(total_loss.item(), name='loss/total', step=global_step, epoch=epoch,
-                          context={"subset": "train"})
-            aim_run.track(output_dict['vq_loss'].item(), name='loss/vq', step=global_step,
-                          epoch=epoch, context={"subset": "train"})
-            aim_run.track(output_dict['avg_reconstruction_loss'].item(),
-                          name='loss/reconstruction_avg', step=global_step, epoch=epoch,
-                          context={"subset": "train"})
+        # Normalize loss to account for accumulation
+        # Each batch contributes 1/N to the total gradient, so scale loss by 1/N
+        # This ensures that the magnitude of the gradients is similar to non-accumulated training
+        loss_for_backward = total_loss / exp_config["gradient_accumulation_steps"]
+        loss_for_backward.backward()
 
-            for name, val in output_dict['reconstruction_loss_details'].items():
-                aim_run.track(val.item(), name=f'loss_detail/{name}', step=global_step, epoch=epoch,
+        # --- Accumulate Metrics ---
+        accumulators["total_loss"] += total_loss.item()
+        accumulators["vq_loss"] += output_dict['vq_loss'].item()
+        accumulators["avg_reconstruction_loss"] += output_dict['avg_reconstruction_loss'].item()
+        accumulators["count"] += 1
+
+        if kpm is not None:
+            accumulators["non_padded_tokens"] += (~kpm).sum().item() # Add count of non-padded tokens
+        else:
+            accumulators["non_padded_tokens"] += tokens.numel() # All tokens are considered valid
+
+
+        for key, value in output_dict['reconstruction_loss_details'].items():
+            accumulators["reconstruction_loss_details"][key] += value.item()
+
+        if 'avg_aux_lm_loss' in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+            accumulators["avg_aux_lm_loss"] += output_dict['avg_aux_lm_loss'].item()
+            for key, value in output_dict['aux_lm_loss_details'].items():
+                accumulators["aux_lm_loss_details"][key] += value.item()
+
+        if 'compression_ratios' in output_dict:
+            for level_idx, ratio in enumerate(output_dict['compression_ratios']):
+                accumulators["compression_ratios"][level_idx] += ratio # Assuming ratio is already a float or .item() called
+            for level_idx, length in enumerate(output_dict['input_seq_lengths_compressors']):
+                accumulators["input_seq_lengths_compressors"][level_idx] += length
+            for level_idx, length in enumerate(output_dict['output_seq_lengths_compressors']):
+                accumulators["output_seq_lengths_compressors"][level_idx] += length
+
+        if 'all_codebook_perplexities' in output_dict:
+            for level_idx, perplexity in enumerate(output_dict['all_codebook_perplexities']):
+                accumulators["all_codebook_perplexities"][level_idx] += perplexity.item()
+        # --- End Accumulate Metrics ---
+
+        if (i + 1) % exp_config["gradient_accumulation_steps"] == 0:
+            if exp_config.get("gradient_clip_norm"):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config["gradient_clip_norm"])
+            optimizer.step()
+            optimizer.zero_grad()  # Reset gradients after accumulation
+
+            # Calculate metrics for the completed accumulation window
+            current_time = time.time()
+            duration_accumulation_window = current_time - time_of_last_optimizer_step_event
+
+            tokens_processed_this_window = accumulators["non_padded_tokens"]
+            tokens_per_second = tokens_processed_this_window / duration_accumulation_window
+
+            # --- Logging to AIM (occurs every optimizer step) ---
+            if global_step % exp_config["log_interval"] == 0 and accumulators["count"] > 0:
+                steps_accumulated = accumulators[
+                    "count"]  # Should be exp_config["gradient_accumulation_steps"]
+
+                aim_run.track(accumulators["total_loss"] / steps_accumulated,
+                              name='loss/total_avg_accum', step=global_step, epoch=epoch,
                               context={"subset": "train"})
+                aim_run.track(accumulators["vq_loss"] / steps_accumulated, name='loss/vq_avg_accum',
+                              step=global_step, epoch=epoch, context={"subset": "train"})
+                aim_run.track(accumulators["avg_reconstruction_loss"] / steps_accumulated,
+                              name='loss/reconstruction_avg_accum', step=global_step, epoch=epoch,
+                              context={"subset": "train"})
+                aim_run.track(tokens_per_second, name='performance/tokens_per_sec', step=global_step, epoch=epoch)
 
-            if 'avg_aux_lm_loss' in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                aim_run.track(output_dict['avg_aux_lm_loss'].item(), name='loss/aux_lm_avg', step=global_step,
-                              epoch=epoch, context={"subset": "train"})
-                for name, val in output_dict['aux_lm_loss_details'].items():
-                    aim_run.track(val.item(), name=f'loss_detail/{name}', step=global_step, epoch=epoch,
+
+                for key, value in accumulators["reconstruction_loss_details"].items():
+                    aim_run.track(value / steps_accumulated, name=f'loss_detail_avg_accum/{key}',
+                                  step=global_step, epoch=epoch, context={"subset": "train"})
+
+                if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                    aim_run.track(accumulators["avg_aux_lm_loss"] / steps_accumulated,
+                                  name='loss/aux_lm_avg_accum', step=global_step, epoch=epoch,
                                   context={"subset": "train"})
+                    for key, value in accumulators["aux_lm_loss_details"].items():
+                        aim_run.track(value / steps_accumulated,
+                                      name=f'loss_detail_avg_accum/{key}', step=global_step,
+                                      epoch=epoch, context={"subset": "train"})
 
-            if 'compression_ratios' in output_dict:  # Check if metrics are present
-                for i, ratio in enumerate(output_dict['compression_ratios']):
-                    aim_run.track(ratio, name=f'compression/ratio_L{i}', step=global_step,
+                if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
+                    for level_idx in range(exp_config["num_levels"]):
+                        aim_run.track(
+                            accumulators["compression_ratios"][level_idx] / steps_accumulated,
+                            name=f'compression_avg/ratio_L{level_idx}', step=global_step,
+                            epoch=epoch)
+                        aim_run.track(accumulators["input_seq_lengths_compressors"][
+                                          level_idx] / steps_accumulated,
+                                      name=f'compression_avg/input_len_L{level_idx}',
+                                      step=global_step, epoch=epoch)
+                        aim_run.track(accumulators["output_seq_lengths_compressors"][
+                                          level_idx] / steps_accumulated,
+                                      name=f'compression_avg/output_len_L{level_idx}',
+                                      step=global_step, epoch=epoch)
+
+                aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate',
+                              step=global_step, epoch=epoch)
+
+                if 'all_codebook_perplexities' in output_dict:
+                    for level_idx in range(exp_config["num_levels"]):
+                        aim_run.track(accumulators["all_codebook_perplexities"][
+                                          level_idx] / steps_accumulated,
+                                      name=f'vq_metrics_avg/perplexity_L{level_idx}',
+                                      step=global_step, epoch=epoch)
+                        codebook_size_L_i = exp_config["compressor_level_configs"][level_idx][
+                            "codebook_size"]
+                        aim_run.track(codebook_size_L_i,
+                                      name=f'vq_metrics/codebook_size_L{level_idx}',
+                                      step=global_step, epoch=epoch, context={"type": "config"})
+
+                postfix_dict = {
+                    "loss": f"{accumulators['total_loss'] / steps_accumulated:.4f}",
+                    "vq": f"{accumulators['vq_loss'] / steps_accumulated:.4f}",
+                    "reco": f"{accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
+                    "tok_p_s": f"{short_num(tokens_per_second)}"  # Add tokens/sec to postfix
+                }
+                if 'compression_ratios' in output_dict:  # Use last batch's ratios for quick display, or average them too
+                    postfix_dict["ratios"] = ", ".join([f"{r / steps_accumulated:.2f}" for r in
+                                                        accumulators['compression_ratios']])
+
+                if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                    postfix_dict[
+                        "auxLM"] = f"{accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}"
+                progress_bar.set_postfix(postfix_dict)
+
+                # Reset accumulators for the next window
+                accumulators = reset_accumulators(exp_config["num_levels"])
+                # Update the timer to mark the start of the next accumulation window's measurement period
+                time_of_last_optimizer_step_event = time.time()
+
+            # --- End Logging ---
+
+            # --- Generation During Training ---
+            if global_step > 0 and global_step % exp_config["generation_interval"] == 0:
+                print(f"\nStep {global_step}: Generating sample...")
+                model.eval()  # Switch to evaluation mode for generation
+                with torch.no_grad():
+                    sample_text = exp_config["sample_prompt_for_generation"]
+                    # Encode the prompt without padding to a fixed length
+                    # BOS/EOS will be added by tokenizer.encode if configured
+                    input_gen_tokens = tokenizer.encode(sample_text).unsqueeze(0).to(DEVICE)
+
+                    # For unpadded, variable-length input to generate_bytes, KPM is all False
+                    input_gen_kpm = None
+                    if exp_config["propagate_key_padding_mask"]:
+                        input_gen_kpm = torch.zeros_like(input_gen_tokens, dtype=torch.bool).to(DEVICE)
+
+                    reconstructed_tokens = model.generate_bytes(
+                        tokens=input_gen_tokens,
+                        key_padding_mask=input_gen_kpm,  # Pass KPM if propagation is on
+                        max_len_override=exp_config["generation_max_len_override"]
+                    )
+                    reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu(),
+                                                          cut_at_eos=True)
+
+                    print(f"--- Sample Generation at Step {global_step} ---")
+                    print(f"Original Prompt:\n{sample_text}")
+                    print(f"Reconstructed Text:\n{reconstructed_text}")
+                    print("------------------------------------------")
+
+                    # Log to AIM
+                    aim_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
+                    aim_run.track(aim.Text(aim_text_log), name='sample_generation', step=global_step,
                                   epoch=epoch)
-                for i, length in enumerate(output_dict['input_seq_lengths_compressors']):
-                    aim_run.track(length, name=f'compression/input_len_L{i}', step=global_step,
-                                  epoch=epoch)
-                for i, length in enumerate(output_dict['output_seq_lengths_compressors']):
-                    aim_run.track(length, name=f'compression/output_len_L{i}', step=global_step,
-                                  epoch=epoch)
 
-            aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate', step=global_step,
-                          epoch=epoch)
-
-            if 'all_codebook_perplexities' in output_dict:
-                for i, perplexity_val in enumerate(output_dict['all_codebook_perplexities']):
-                    aim_run.track(perplexity_val.item(), name=f'vq_metrics/perplexity_L{i}', step=global_step,
-                                  epoch=epoch)
-                    # Log codebook size for reference
-                    # This requires actual_codebook_sizes to be accessible or passed to logger
-                    # Or, get it from compressor_level_configs
-                    codebook_size_L_i = exp_config["compressor_level_configs"][i]["codebook_size"]
-                    aim_run.track(codebook_size_L_i, name=f'vq_metrics/codebook_size_L{i}', step=global_step,
-                                  epoch=epoch, context={"type": "config"})
-
-            postfix_dict = {
-                "loss": f"{total_loss.item():.4f}",
-                "vq": f"{output_dict['vq_loss'].item():.4f}",
-                "reco": f"{output_dict['avg_reconstruction_loss'].item():.4f}",
-                "ratios": ", ".join([f"{r:.2f}" for r in output_dict.get('compression_ratios', [])])
-            }
-            if 'avg_aux_lm_loss' in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                postfix_dict["auxLM"] = f"{output_dict['avg_aux_lm_loss'].item():.4f}"
-            progress_bar.set_postfix(postfix_dict)
-
-        # --- Generation During Training ---
-        if global_step > 0 and global_step % exp_config["generation_interval"] == 0:
-            print(f"\nStep {global_step}: Generating sample...")
-            model.eval()  # Switch to evaluation mode for generation
-            with torch.no_grad():
-                sample_text = exp_config["sample_prompt_for_generation"]
-                # Encode the prompt without padding to a fixed length
-                # BOS/EOS will be added by tokenizer.encode if configured
-                input_gen_tokens = tokenizer.encode(sample_text).unsqueeze(0).to(DEVICE)
-
-                # For unpadded, variable-length input to generate_bytes, KPM is all False
-                input_gen_kpm = None
-                if exp_config["propagate_key_padding_mask"]:
-                    input_gen_kpm = torch.zeros_like(input_gen_tokens, dtype=torch.bool).to(DEVICE)
-
-                reconstructed_tokens = model.generate_bytes(
-                    tokens=input_gen_tokens,
-                    key_padding_mask=input_gen_kpm,  # Pass KPM if propagation is on
-                    max_len_override=exp_config["generation_max_len_override"]
-                )
-                reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu(),
-                                                      cut_at_eos=True)
-
-                print(f"--- Sample Generation at Step {global_step} ---")
-                print(f"Original Prompt:\n{sample_text}")
-                print(f"Reconstructed Text:\n{reconstructed_text}")
-                print("------------------------------------------")
-
-                # Log to AIM
-                aim_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
-                aim_run.track(aim.Text(aim_text_log), name='sample_generation', step=global_step,
-                              epoch=epoch)
-
-            model.train()  # Switch back to training mode
-        global_step += 1
+                model.train()  # Switch back to training mode
+            global_step += 1
+            progress_bar.set_description(f"Epoch {epoch + 1}/{exp_config['num_epochs']} (Opt Step: {global_step})")
 
 print("Training finished.")
 
