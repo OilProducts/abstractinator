@@ -1,7 +1,9 @@
 import os
 import math
+import sys
 import time
 from collections import defaultdict
+from itertools import batched
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
@@ -36,7 +38,7 @@ def short_num(n):
     return f"{formatted}{millnames[millidx]}"
 
 
-N_CPU = int(os.cpu_count() / 2) if os.cpu_count() else 1  # Ensure at least 1 worker
+N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least 1 worker
 
 # --- Device Setup ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,17 +53,17 @@ exp_config = {
     "num_levels": 1,
     "initial_vocab_size": 259,  # Matches ByteLevelTokenizer default + 3 special tokens
     "compressor_level_configs": [
-        {"dim": 512, "heads": 8, "window": 128,
-         "num_encoder_layers": 6,
+        {"dim": 768, "heads": 12, "window": 512,
+         "num_encoder_layers": 14,
          'encoder_ffn_dim_multiplier': 4,
          'encoder_dropout': 0.1,
          'max_seq_len_encoder': 4096,
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 8192,
-         "beta": 0.25},
+         "codebook_size": 49404,
+         "beta": 1.0},
         # {"dim": 1024, "heads": 16, "window": 64,
-        #  "num_encoder_layers": 2,
+        #  "num_encoder_layers": 8,
         #  'encoder_ffn_dim_multiplier': 4,
         #  'encoder_dropout': 0.1,
         #  'max_seq_len_encoder': 4096,
@@ -71,8 +73,8 @@ exp_config = {
         #  "beta": 1.25}
     ],
     "expander_dim_scale": 1.0,
-    "expander_num_enc_layers": 2,
-    "expander_num_dec_layers": 12,
+    "expander_num_enc_layers": 6,
+    "expander_num_dec_layers": 6,
     "expander_heads_scale": 1.0,
     "expander_dropout": 0.1,
     "expander_eos_id": 1,  # As used in CodeExpander
@@ -80,29 +82,29 @@ exp_config = {
     "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
     "aux_lm_loss_weight": 1.0,
     "top_lm_loss_weight": 0.2,  # <<< ADDED: Weight for the new LM loss on top codes
-    "top_transformer_config": {  # <<< ADDED: Configuration for the new Transformer
-        "dim": 512,  # Example: Dimension for this Transformer
-        "num_layers": 12,
-        "num_heads": 8,
-        "ffn_dim_multiplier": 4,
-        "dropout": 0.1,
-        "max_seq_len": 2048,  # Max length of top_code sequences it can handle
-        "output_lm_logits": True  # Ensure it has an LM head
-    },
+    # "top_transformer_config": {  # <<< ADDED: Configuration for the new Transformer
+    #     "dim": 768,  # Example: Dimension for this Transformer
+    #     "num_layers": 16,
+    #     "num_heads": 12,
+    #     "ffn_dim_multiplier": 4,
+    #     "dropout": 0.1,
+    #     "max_seq_len": 2048,  # Max length of top_code sequences it can handle
+    #     "output_lm_logits": True  # Ensure it has an LM head
+    # },
     "learning_rate": 1e-4,
-    "batch_size": 16,  # Centralized BATCH_SIZE
-    "sequence_length": 2048,  # Centralized SEQUENCE_LENGTH
+    "batch_size": 4,  # Centralized BATCH_SIZE
+    "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
     "num_epochs": 10,
     "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)
     "gradient_clip_norm": 1.0,  # Optional gradient clipping
-    "gradient_accumulation_steps": 8,  # No accumulation for simplicity, can be adjusted
+    "gradient_accumulation_steps": 32,  # No accumulation for simplicity, can be adjusted
     # Dataset configurations
     "dataset_name": "HuggingFaceFW/fineweb-edu",
     "dataset_config": "sample-10BT",
     "dataset_train_split": "train",  # Using a larger subset for demo
     "text_column_name": "text",
 
-    # --- Generation during training settings ---
+    # Generation during training settings
     "generation_interval": 50,  # Generate every 50 global steps
     "sample_prompt_for_generation": "The purpose of education is ",
     "generation_max_len_override": 512  # Max length for the generated sample
@@ -279,15 +281,12 @@ try:
     print(f"Dataset loaded. Number of examples: {len(raw_dataset)}")
 except Exception as e:
     print(f"Error loading dataset '{exp_config['dataset_name']}': {e}")
-    print("Using a small dummy dataset for demonstration.")
-    dummy_data = {"text": ["Sample text for testing tokenization and model."] * 100}
-    raw_dataset = Dataset.from_dict(dummy_data)
-    exp_config["text_column_name"] = "text"  # Ensure text column matches dummy
-    print(f"Dummy dataset created with {len(raw_dataset)} examples.")
+    sys.exit()
 
 print(
     f"\nTokenizing and processing dataset with sequence length {exp_config['sequence_length']}...")
-tokenized_dataset = raw_dataset.map(tokenize_and_process_examples,
+tokenized_dataset = raw_dataset.map(
+    tokenize_and_process_examples,
     batched=True,
     fn_kwargs={
         "tokenizer_instance": tokenizer,  # Pass the instantiated tokenizer
@@ -345,12 +344,14 @@ def reset_accumulators(num_levels):
 
 accumulators = reset_accumulators(exp_config["num_levels"])
 time_of_last_optimizer_step_event = time.time() # Initialize timer for tokens/sec
+total_minibatches_in_epoch = len(train_dataloader)
 
 for epoch in range(exp_config["num_epochs"]):
-    progress_bar = tqdm(train_dataloader,
-                        desc=f"Epoch {epoch + 1}/{exp_config['num_epochs']} (Opt Step: {global_step})",
-                        unit=" minibatch")
-    for i, batch in enumerate(progress_bar):
+    print(f"\n--- Epoch {epoch + 1}/{exp_config['num_epochs']} ---") # MODIFIED: Epoch start print
+    epoch_start_time = time.time()
+    model.train() # Ensure model is in train mode at start of epoch
+
+    for i, batch in enumerate(train_dataloader):
         tokens = batch["input_ids"].to(DEVICE)
         # KPM is already boolean, just move to device
         kpm = batch["key_padding_mask"].to(DEVICE) if exp_config[
@@ -421,101 +422,115 @@ for epoch in range(exp_config["num_epochs"]):
             tokens_processed_this_window = accumulators["non_padded_tokens"]
             tokens_per_second = tokens_processed_this_window / duration_accumulation_window
 
-            # --- Logging to AIM (occurs every optimizer step) ---
-            if global_step % exp_config["log_interval"] == 0 and accumulators["count"] > 0:
-                steps_accumulated = accumulators[
-                    "count"]  # Should be exp_config["gradient_accumulation_steps"]
+            steps_accumulated = accumulators["count"]
 
-                aim_run.track(accumulators["total_loss"] / steps_accumulated,
-                              name='loss/total_avg_accum', step=global_step, epoch=epoch,
-                              context={"subset": "train"})
-                aim_run.track(accumulators["vq_loss"] / steps_accumulated, name='loss/vq_avg_accum',
-                              step=global_step, epoch=epoch, context={"subset": "train"})
-                aim_run.track(accumulators["avg_reconstruction_loss"] / steps_accumulated,
-                              name='loss/reconstruction_avg_accum', step=global_step, epoch=epoch,
-                              context={"subset": "train"})
-                aim_run.track(tokens_per_second, name='performance/tokens_per_sec', step=global_step, epoch=epoch)
-                aim_run.track(accumulators["avg_top_code_lm_loss"] / steps_accumulated,
-                              name='loss/top_code_lm_avg_accum', step=global_step, epoch=epoch,
-                              context={"subset": "train"})
+            if steps_accumulated > 0:  # Ensure there's something to log
+                # --- Console Logging (replaces tqdm postfix and description updates) ---
+                console_log_parts = [
+                    f"Epoch {epoch + 1}/{exp_config['num_epochs']}",
+                    f"OptStep {global_step}",
+                    f"MB {i + 1}/{total_minibatches_in_epoch}",  # Minibatch progress
+                    f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
+                    f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}",
+                    f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
+                    f"Tok/s {short_num(tokens_per_second)}"
+                ]
 
-                for key, value in accumulators["reconstruction_loss_details"].items():
-                    aim_run.track(value / steps_accumulated, name=f'loss_detail_avg_accum/{key}',
-                                  step=global_step, epoch=epoch, context={"subset": "train"})
-
-                if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                    aim_run.track(accumulators["avg_aux_lm_loss"] / steps_accumulated,
-                                  name='loss/aux_lm_avg_accum', step=global_step, epoch=epoch,
-                                  context={"subset": "train"})
-                    for key, value in accumulators["aux_lm_loss_details"].items():
-                        aim_run.track(value / steps_accumulated,
-                                      name=f'loss_detail_avg_accum/{key}', step=global_step,
-                                      epoch=epoch, context={"subset": "train"})
-
-                if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
-                    for level_idx in range(exp_config["num_levels"]):
-                        aim_run.track(
-                            accumulators["compression_ratios"][level_idx] / steps_accumulated,
-                            name=f'compression_avg/ratio_L{level_idx}', step=global_step,
-                            epoch=epoch)
-                        aim_run.track(accumulators["input_seq_lengths_compressors"][
-                                          level_idx] / steps_accumulated,
-                                      name=f'compression_avg/input_len_L{level_idx}',
-                                      step=global_step, epoch=epoch)
-                        aim_run.track(accumulators["output_seq_lengths_compressors"][
-                                          level_idx] / steps_accumulated,
-                                      name=f'compression_avg/output_len_L{level_idx}',
-                                      step=global_step, epoch=epoch)
-
-                aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate',
-                              step=global_step, epoch=epoch)
-
-                if 'all_codebook_perplexities' in output_dict:
-                    for level_idx in range(exp_config["num_levels"]):
-                        aim_run.track(accumulators["all_codebook_perplexities"][
-                                          level_idx] / steps_accumulated,
-                                      name=f'vq_metrics_avg/perplexity_L{level_idx}',
-                                      step=global_step, epoch=epoch)
-                        codebook_size_L_i = exp_config["compressor_level_configs"][level_idx][
-                            "codebook_size"]
-                        aim_run.track(codebook_size_L_i,
-                                      name=f'vq_metrics/codebook_size_L{level_idx}',
-                                      step=global_step, epoch=epoch, context={"type": "config"})
-
-                if 'all_smoothed_perplexities' in output_dict:
-                    for level_idx in range(exp_config["num_levels"]):
-                        aim_run.track(accumulators["all_smoothed_perplexities"][
-                                          level_idx] / steps_accumulated,
-                                      name=f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
-                                      step=global_step, epoch=epoch)
-
-
-
-                postfix_dict = {
-                    "loss": f"{accumulators['total_loss'] / steps_accumulated:.4f}",
-                    "vq": f"{accumulators['vq_loss'] / steps_accumulated:.4f}",
-                    "reco": f"{accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                    "tok_p_s": f"{short_num(tokens_per_second)}",
-                }
+                # Mimicking the original postfix_dict logic for specific items
                 if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
-                    postfix_dict["TopLM"] = f"{output_dict['avg_top_code_lm_loss'].item():.4f}"
-                if 'compression_ratios' in output_dict:  # Use last batch's ratios for quick display, or average them too
-                    postfix_dict["ratios"] = ", ".join([f"{r / steps_accumulated:.2f}" for r in
-                                                        accumulators['compression_ratios']])
-                if 'all_smoothed_perplexities' in output_dict:
-                    postfix_dict["smooth_perplexities"] = ", ".join(
-                        [f"{p / steps_accumulated:.4f}" for p in
-                         accumulators['all_smoothed_perplexities']])
+                    # TQDM showed the last batch's value for this
+                    console_log_parts.append(f"TopLM {output_dict['avg_top_code_lm_loss'].item():.4f}")
 
-                if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                    postfix_dict[
-                        "auxLM"] = f"{accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}"
-                progress_bar.set_postfix(postfix_dict)
+                if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config[
+                    "num_levels"]:
+                    # TQDM showed accumulated average for ratios
+                    ratios_str = ", ".join([f"{r / steps_accumulated:.2f}" for r in accumulators['compression_ratios']])
+                    console_log_parts.append(f"Ratios [{ratios_str}]")
 
-                # Reset accumulators for the next window
-                accumulators = reset_accumulators(exp_config["num_levels"])
-                # Update the timer to mark the start of the next accumulation window's measurement period
-                time_of_last_optimizer_step_event = time.time()
+                if 'all_smoothed_perplexities' in accumulators and len(accumulators["all_smoothed_perplexities"]) == \
+                        exp_config["num_levels"]:
+                    # TQDM showed accumulated average for smooth perplexities
+                    ppl_str = ", ".join(
+                        [f"{p / steps_accumulated:.4f}" for p in accumulators['all_smoothed_perplexities']])
+                    console_log_parts.append(f"SmoothPPL [{ppl_str}]")
+
+                if exp_config.get("aux_lm_loss_weight", 0.0) > 0 and "avg_aux_lm_loss" in accumulators:
+                    # TQDM showed accumulated average for auxLM
+                    console_log_parts.append(f"AuxLM {accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}")
+
+                print(" | ".join(console_log_parts), flush=True)
+
+
+                # --- Logging to AIM (occurs every optimizer step) ---
+                if global_step % exp_config["log_interval"] == 0 and accumulators["count"] > 0:
+
+                    aim_run.track(accumulators["total_loss"] / steps_accumulated,
+                                  name='loss/total_avg_accum', step=global_step, epoch=epoch,
+                                  context={"subset": "train"})
+                    aim_run.track(accumulators["vq_loss"] / steps_accumulated, name='loss/vq_avg_accum',
+                                  step=global_step, epoch=epoch, context={"subset": "train"})
+                    aim_run.track(accumulators["avg_reconstruction_loss"] / steps_accumulated,
+                                  name='loss/reconstruction_avg_accum', step=global_step, epoch=epoch,
+                                  context={"subset": "train"})
+                    aim_run.track(tokens_per_second, name='performance/tokens_per_sec', step=global_step, epoch=epoch)
+                    aim_run.track(accumulators["avg_top_code_lm_loss"] / steps_accumulated,
+                                  name='loss/top_code_lm_avg_accum', step=global_step, epoch=epoch,
+                                  context={"subset": "train"})
+
+                    for key, value in accumulators["reconstruction_loss_details"].items():
+                        aim_run.track(value / steps_accumulated, name=f'loss_detail_avg_accum/{key}',
+                                      step=global_step, epoch=epoch, context={"subset": "train"})
+
+                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                        aim_run.track(accumulators["avg_aux_lm_loss"] / steps_accumulated,
+                                      name='loss/aux_lm_avg_accum', step=global_step, epoch=epoch,
+                                      context={"subset": "train"})
+                        for key, value in accumulators["aux_lm_loss_details"].items():
+                            aim_run.track(value / steps_accumulated,
+                                          name=f'loss_detail_avg_accum/{key}', step=global_step,
+                                          epoch=epoch, context={"subset": "train"})
+
+                    if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
+                        for level_idx in range(exp_config["num_levels"]):
+                            aim_run.track(
+                                accumulators["compression_ratios"][level_idx] / steps_accumulated,
+                                name=f'compression_avg/ratio_L{level_idx}', step=global_step,
+                                epoch=epoch)
+                            aim_run.track(accumulators["input_seq_lengths_compressors"][
+                                              level_idx] / steps_accumulated,
+                                          name=f'compression_avg/input_len_L{level_idx}',
+                                          step=global_step, epoch=epoch)
+                            aim_run.track(accumulators["output_seq_lengths_compressors"][
+                                              level_idx] / steps_accumulated,
+                                          name=f'compression_avg/output_len_L{level_idx}',
+                                          step=global_step, epoch=epoch)
+
+                    aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate',
+                                  step=global_step, epoch=epoch)
+
+                    if 'all_codebook_perplexities' in output_dict:
+                        for level_idx in range(exp_config["num_levels"]):
+                            aim_run.track(accumulators["all_codebook_perplexities"][
+                                              level_idx] / steps_accumulated,
+                                          name=f'vq_metrics_avg/perplexity_L{level_idx}',
+                                          step=global_step, epoch=epoch)
+                            codebook_size_L_i = exp_config["compressor_level_configs"][level_idx][
+                                "codebook_size"]
+                            aim_run.track(codebook_size_L_i,
+                                          name=f'vq_metrics/codebook_size_L{level_idx}',
+                                          step=global_step, epoch=epoch, context={"type": "config"})
+
+                    if 'all_smoothed_perplexities' in output_dict:
+                        for level_idx in range(exp_config["num_levels"]):
+                            aim_run.track(accumulators["all_smoothed_perplexities"][
+                                              level_idx] / steps_accumulated,
+                                          name=f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
+                                          step=global_step, epoch=epoch)
+
+            # Reset accumulators for the next window
+            accumulators = reset_accumulators(exp_config["num_levels"])
+            # Update the timer to mark the start of the next accumulation window's measurement period
+            time_of_last_optimizer_step_event = time.time()
 
             # --- End Logging ---
 
@@ -554,7 +569,8 @@ for epoch in range(exp_config["num_epochs"]):
 
                 model.train()  # Switch back to training mode
             global_step += 1
-            progress_bar.set_description(f"Epoch {epoch + 1}/{exp_config['num_epochs']} (Opt Step: {global_step})")
+    epoch_duration = time.time() - epoch_start_time
+    print(f"--- Epoch {epoch + 1} finished. Duration: {epoch_duration:.2f}s ---") # MODIFIED: Epoch end print
 
 print("Training finished.")
 
