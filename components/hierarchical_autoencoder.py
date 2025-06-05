@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 
 from .byte_segment_compressor import ByteSegmentCompressor
 from .expander import CodeExpander
-
+from .code_sequence_transformer import CodeSequenceTransformer
 
 class HierarchicalAutoencoder(nn.Module):
     """
@@ -26,7 +26,9 @@ class HierarchicalAutoencoder(nn.Module):
                  expander_eos_id: int = 1,
                  expander_max_len: int = 2048,
                  propagate_key_padding_mask: bool = True,
-                 aux_lm_loss_weight: float = 0.1):
+                 aux_lm_loss_weight: float = 0.1,
+                 top_transformer_config: Optional[Dict[str, Any]] = None,
+                 top_lm_loss_weight: float=1.0,):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -39,6 +41,9 @@ class HierarchicalAutoencoder(nn.Module):
         self.expander_eos_id = expander_eos_id  # Used as BOS in CodeExpander
         self.propagate_key_padding_mask = propagate_key_padding_mask
         self.aux_lm_loss_weight = aux_lm_loss_weight  # Weight for auxiliary LM loss
+
+        self.top_transformer_config = top_transformer_config
+        self.top_lm_loss_weight = top_lm_loss_weight
 
         # ---- Configure Compressor Stack ----
         self.compressors = nn.ModuleList()
@@ -61,6 +66,43 @@ class HierarchicalAutoencoder(nn.Module):
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])
             current_input_vocab_size = config['codebook_size']
+
+        if self.top_transformer_config and self.num_levels > 0:
+            if not self.actual_codebook_sizes:
+                raise ValueError(
+                    "Compressor stack must be configured before top_transformer (actual_codebook_sizes is empty).")
+
+            top_code_vocab_size = self.actual_codebook_sizes[-1]  # Vocab of the highest level codes
+
+            # The dimension for the CodeSequenceTransformer can be independent or related to
+            # the last compressor's dimension. Let's assume it's specified in its config.
+            # If top_transformer_config['dim'] is not set, it could default to last compressor's dim.
+            # For simplicity, assume top_transformer_config contains all necessary args for CodeSequenceTransformer.
+
+            transformer_dim = self.top_transformer_config.get('dim')
+            if transformer_dim is None:
+                # Default to the dimension of the codes it will process (output dim of last compressor)
+                # This assumes the codes themselves are indices, and CST will embed them.
+                # The 'dim' of the last compressor config is the dim of its *continuous vectors* before VQ.
+                # For CodeSequenceTransformer, its 'dim' is its internal model dimension.
+                # It's better if top_transformer_config explicitly defines its 'dim'.
+                # Let's raise an error if not explicitly set, or define a clear default logic.
+                # For this example, let's assume it's in the config:
+                if 'dim' not in self.top_transformer_config:
+                    raise ValueError("'dim' must be specified in top_transformer_config")
+
+            self.code_sequence_transformer = CodeSequenceTransformer(
+                code_vocab_size=top_code_vocab_size,
+                dim=self.top_transformer_config['dim'],
+                num_layers=self.top_transformer_config.get('num_layers', 4),
+                num_heads=self.top_transformer_config.get('num_heads', 8),
+                ffn_dim_multiplier=self.top_transformer_config.get('ffn_dim_multiplier', 4),
+                dropout=self.top_transformer_config.get('dropout', 0.1),
+                max_seq_len=self.top_transformer_config.get('max_seq_len', 2048),
+                output_lm_logits=self.top_transformer_config.get('output_lm_logits', True)
+            )
+            print(
+                f"Initialized CodeSequenceTransformer for top codes (vocab: {top_code_vocab_size}, dim: {self.top_transformer_config['dim']})")
 
         # ---- Configure Expander Stack ----
         self.expanders = nn.ModuleList()
@@ -101,6 +143,7 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_input_kpms_list: List[Optional[torch.Tensor]] = []
 
         all_perplexities_list: List[torch.Tensor] = []
+        all_smoothed_perplexities_list: List[Optional[torch.Tensor]] = []
 
         current_input_tokens = tokens
         current_kpm = key_padding_mask
@@ -118,7 +161,8 @@ class HierarchicalAutoencoder(nn.Module):
             comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
             output_codes = comp_out['codes']
             encoder_logits_level_i = comp_out['encoder_logits']
-            all_perplexities_list.append(comp_out['codebook_perplexity'])
+            all_perplexities_list.append(comp_out['current_codebook_perplexity'])
+            all_smoothed_perplexities_list.append(comp_out.get('smoothed_codebook_perplexity'))
 
             all_codes_list.append(output_codes)
             all_continuous_list.append(comp_out['continuous'])
@@ -172,6 +216,7 @@ class HierarchicalAutoencoder(nn.Module):
             'all_compressor_input_tokens': all_compressor_input_tokens_list,
             'all_compressor_input_kpms': all_compressor_input_kpms_list,
             'all_codebook_perplexities': all_perplexities_list,
+            'all_smoothed_perplexities': all_smoothed_perplexities_list
         }
 
 
@@ -256,9 +301,10 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressed_codes = compression_results['all_codes']
         top_codes = compression_results['top_codes']
         vq_loss = compression_results['vq_loss']
-        kpm_for_top_expander_input = compression_results['final_key_padding_mask']
+        kpm_for_top_codes = compression_results['final_key_padding_mask']
         all_compressor_level_valid_masks = compression_results['all_compressor_level_valid_masks']
         all_codebook_perplexities = compression_results['all_codebook_perplexities']
+        all_smoothed_perplexities = compression_results['all_smoothed_perplexities']
 
         # For auxiliary LM loss
         all_encoder_logits = compression_results['all_encoder_logits']
@@ -269,6 +315,49 @@ class HierarchicalAutoencoder(nn.Module):
         compression_ratios = compression_results['compression_ratios']
         input_seq_lengths_c = compression_results['input_seq_lengths']
         output_seq_lengths_c = compression_results['output_seq_lengths']
+
+        # --- 1.5 Process top_codes with CodeSequenceTransformer (if it exists) ---
+        avg_top_code_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+        top_code_lm_loss_details: Dict[str, torch.Tensor] = {}  # For consistency, though only one level here
+
+        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and top_codes.numel() > 0:
+            cst_output_dict = self.code_sequence_transformer(
+                input_codes=top_codes,
+                key_padding_mask=kpm_for_top_codes
+            )
+            top_code_lm_logits = cst_output_dict.get('logits')
+
+            if top_code_lm_logits is not None:
+                # Calculate LM loss: predict next top_code
+                if top_codes.size(1) <= 1:  # Not enough length for next token prediction
+                    current_top_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                else:
+                    logits_for_pred = top_code_lm_logits[:, :-1, :]  # (B, S_top-1, V_top)
+                    targets_for_pred = top_codes[:, 1:]  # (B, S_top-1)
+
+                    kpm_for_shifted_targets = None
+                    if kpm_for_top_codes is not None:
+                        kpm_for_shifted_targets = kpm_for_top_codes[:, 1:]
+
+                    loss_per_token = F.cross_entropy(
+                        logits_for_pred.reshape(-1, logits_for_pred.size(-1)),
+                        targets_for_pred.reshape(-1),
+                        reduction='none'
+                    ).view_as(targets_for_pred)
+
+                    if kpm_for_shifted_targets is not None:
+                        loss_mask = ~kpm_for_shifted_targets
+                        valid_targets_count = loss_mask.sum()
+                        if valid_targets_count > 0:
+                            current_top_lm_loss = (loss_per_token * loss_mask).sum() / valid_targets_count.clamp(
+                                min=1e-9)
+                        else:
+                            current_top_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                    else:
+                        current_top_lm_loss = loss_per_token.mean()
+
+                avg_top_code_lm_loss = current_top_lm_loss  # Since it's a single loss term, not averaged over levels
+                top_code_lm_loss_details["top_code_lm_loss"] = avg_top_code_lm_loss
 
         # 2. Prepare targets and their KPMs for the expander stack (teacher forcing)
         targets_for_expander_stack: List[torch.Tensor] = []
@@ -297,7 +386,7 @@ class HierarchicalAutoencoder(nn.Module):
         # 3. Decompress with teacher forcing
         decompression_results = self.decompress(
             top_codes=top_codes,
-            top_codes_key_padding_mask=kpm_for_top_expander_input,
+            top_codes_key_padding_mask=kpm_for_top_codes,
             targets_for_teacher_forcing=targets_for_expander_stack,
             target_key_padding_masks=target_kpms_for_expander_stack
         )
@@ -413,19 +502,27 @@ class HierarchicalAutoencoder(nn.Module):
         else:
             avg_aux_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)  # Default if not active
 
-        final_total_loss = avg_reconstruction_loss + vq_loss + (self.aux_lm_loss_weight * avg_aux_lm_loss)
-
+        final_total_loss = (
+                avg_reconstruction_loss +
+                vq_loss +
+                (self.aux_lm_loss_weight * avg_aux_lm_loss) +
+                (self.top_lm_loss_weight * avg_top_code_lm_loss)  # <<< ADDED
+        )
         return {
             'total_loss': final_total_loss, 'vq_loss': vq_loss,
             'avg_reconstruction_loss': avg_reconstruction_loss,
             'reconstruction_loss_details': reconstruction_loss_details,
             'avg_aux_lm_loss': avg_aux_lm_loss,  # For logging
             'aux_lm_loss_details': aux_lm_loss_details,  # For logging
+            'avg_top_code_lm_loss': avg_top_code_lm_loss,  # <<< ADDED for logging
+            'top_code_lm_loss_details': top_code_lm_loss_details,  # <<< ADDED for logging
             'final_reconstructed_logits': decompression_results['final_reconstructed_logits'],
             'compression_ratios': compression_ratios,
             'input_seq_lengths_compressors': input_seq_lengths_c,
             'output_seq_lengths_compressors': output_seq_lengths_c,
             'all_codebook_perplexities': all_codebook_perplexities,
+            'all_smoothed_perplexities': all_smoothed_perplexities,
+
         }
 
     @torch.no_grad()

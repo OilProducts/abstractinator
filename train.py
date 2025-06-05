@@ -48,53 +48,63 @@ print(f"Using device: {DEVICE}")
 exp_config = {
     "run_name": "HierarchicalAE_KPM_Run_v2",  # Updated run name
     "project_name": "TemporalAutoencodedLanguageModelling",
-    "num_levels": 2,
+    "num_levels": 1,
     "initial_vocab_size": 259,  # Matches ByteLevelTokenizer default + 3 special tokens
     "compressor_level_configs": [
         {"dim": 512, "heads": 8, "window": 128,
-         "num_encoder_layers": 2,
+         "num_encoder_layers": 6,
          'encoder_ffn_dim_multiplier': 4,
          'encoder_dropout': 0.1,
          'max_seq_len_encoder': 4096,
          "num_queries": 1,
          "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 512,
-         "beta": 1.25},
-        {"dim": 1024, "heads": 16, "window": 64,
-         "num_encoder_layers": 2,
-         'encoder_ffn_dim_multiplier': 4,
-         'encoder_dropout': 0.1,
-         'max_seq_len_encoder': 4096,
-         "num_queries": 1,
-         "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 1024,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
-         "beta": 1.25}
+         "codebook_size": 8192,
+         "beta": 0.25},
+        # {"dim": 1024, "heads": 16, "window": 64,
+        #  "num_encoder_layers": 2,
+        #  'encoder_ffn_dim_multiplier': 4,
+        #  'encoder_dropout': 0.1,
+        #  'max_seq_len_encoder': 4096,
+        #  "num_queries": 1,
+        #  "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
+        #  "codebook_size": 32768,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
+        #  "beta": 1.25}
     ],
     "expander_dim_scale": 1.0,
     "expander_num_enc_layers": 2,
-    "expander_num_dec_layers": 2,
+    "expander_num_dec_layers": 12,
     "expander_heads_scale": 1.0,
     "expander_dropout": 0.1,
     "expander_eos_id": 1,  # As used in CodeExpander
     "expander_max_len": 2048,  # Default max generation length for CodeExpander
     "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
     "aux_lm_loss_weight": 1.0,
+    "top_lm_loss_weight": 0.2,  # <<< ADDED: Weight for the new LM loss on top codes
+    "top_transformer_config": {  # <<< ADDED: Configuration for the new Transformer
+        "dim": 512,  # Example: Dimension for this Transformer
+        "num_layers": 12,
+        "num_heads": 8,
+        "ffn_dim_multiplier": 4,
+        "dropout": 0.1,
+        "max_seq_len": 2048,  # Max length of top_code sequences it can handle
+        "output_lm_logits": True  # Ensure it has an LM head
+    },
     "learning_rate": 1e-4,
-    "batch_size": 4,  # Centralized BATCH_SIZE
-    "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
+    "batch_size": 16,  # Centralized BATCH_SIZE
+    "sequence_length": 2048,  # Centralized SEQUENCE_LENGTH
     "num_epochs": 10,
     "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)
     "gradient_clip_norm": 1.0,  # Optional gradient clipping
-    "gradient_accumulation_steps": 16,  # No accumulation for simplicity, can be adjusted
+    "gradient_accumulation_steps": 8,  # No accumulation for simplicity, can be adjusted
     # Dataset configurations
     "dataset_name": "HuggingFaceFW/fineweb-edu",
     "dataset_config": "sample-10BT",
-    "dataset_train_split": "train[:200000]",  # Using a larger subset for demo
+    "dataset_train_split": "train",  # Using a larger subset for demo
     "text_column_name": "text",
 
     # --- Generation during training settings ---
     "generation_interval": 50,  # Generate every 50 global steps
-    "sample_prompt_for_generation": "This is a test sentence for the hierarchical autoencoder to compress and then reconstruct. Let's see how well it performs on this particular piece of text, including some special characters like é, ë, and numbers 12345.",
+    "sample_prompt_for_generation": "The purpose of education is ",
     "generation_max_len_override": 512  # Max length for the generated sample
 }
 
@@ -128,6 +138,8 @@ model = HierarchicalAutoencoder(
     expander_max_len=exp_config["expander_max_len"],  # Pass expander_max_len
     propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
     aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
+    top_transformer_config=exp_config.get("top_transformer_config", None),  # <<< ADDED
+    top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0)
 ).to(DEVICE)
 
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -275,8 +287,7 @@ except Exception as e:
 
 print(
     f"\nTokenizing and processing dataset with sequence length {exp_config['sequence_length']}...")
-tokenized_dataset = raw_dataset.map(
-    tokenize_and_process_examples,
+tokenized_dataset = raw_dataset.map(tokenize_and_process_examples,
     batched=True,
     fn_kwargs={
         "tokenizer_instance": tokenizer,  # Pass the instantiated tokenizer
@@ -325,8 +336,10 @@ def reset_accumulators(num_levels):
         "input_seq_lengths_compressors": [0.0] * num_levels,
         "output_seq_lengths_compressors": [0.0] * num_levels,
         "all_codebook_perplexities": [0.0] * num_levels,
+        "all_smoothed_perplexities": [0.0] * num_levels,  # For smooth perplexity if used
         "non_padded_tokens": 0,  # For tokens/sec
-        "count": 0 # To track number of batches accumulated
+        "count": 0, # To track number of batches accumulated
+        "avg_top_code_lm_loss": 0.0,
     }
     return accumulators
 
@@ -374,6 +387,9 @@ for epoch in range(exp_config["num_epochs"]):
             for key, value in output_dict['aux_lm_loss_details'].items():
                 accumulators["aux_lm_loss_details"][key] += value.item()
 
+        if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
+            accumulators["avg_top_code_lm_loss"] += output_dict['avg_top_code_lm_loss'].item()
+
         if 'compression_ratios' in output_dict:
             for level_idx, ratio in enumerate(output_dict['compression_ratios']):
                 accumulators["compression_ratios"][level_idx] += ratio # Assuming ratio is already a float or .item() called
@@ -385,6 +401,11 @@ for epoch in range(exp_config["num_epochs"]):
         if 'all_codebook_perplexities' in output_dict:
             for level_idx, perplexity in enumerate(output_dict['all_codebook_perplexities']):
                 accumulators["all_codebook_perplexities"][level_idx] += perplexity.item()
+
+        if 'all_smoothed_perplexities' in output_dict:
+            for level_idx, smooth_perplexity in enumerate(output_dict['all_smoothed_perplexities']):
+                accumulators["all_smoothed_perplexities"][level_idx] += smooth_perplexity.item()
+
         # --- End Accumulate Metrics ---
 
         if (i + 1) % exp_config["gradient_accumulation_steps"] == 0:
@@ -414,7 +435,9 @@ for epoch in range(exp_config["num_epochs"]):
                               name='loss/reconstruction_avg_accum', step=global_step, epoch=epoch,
                               context={"subset": "train"})
                 aim_run.track(tokens_per_second, name='performance/tokens_per_sec', step=global_step, epoch=epoch)
-
+                aim_run.track(accumulators["avg_top_code_lm_loss"] / steps_accumulated,
+                              name='loss/top_code_lm_avg_accum', step=global_step, epoch=epoch,
+                              context={"subset": "train"})
 
                 for key, value in accumulators["reconstruction_loss_details"].items():
                     aim_run.track(value / steps_accumulated, name=f'loss_detail_avg_accum/{key}',
@@ -459,15 +482,30 @@ for epoch in range(exp_config["num_epochs"]):
                                       name=f'vq_metrics/codebook_size_L{level_idx}',
                                       step=global_step, epoch=epoch, context={"type": "config"})
 
+                if 'all_smoothed_perplexities' in output_dict:
+                    for level_idx in range(exp_config["num_levels"]):
+                        aim_run.track(accumulators["all_smoothed_perplexities"][
+                                          level_idx] / steps_accumulated,
+                                      name=f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
+                                      step=global_step, epoch=epoch)
+
+
+
                 postfix_dict = {
                     "loss": f"{accumulators['total_loss'] / steps_accumulated:.4f}",
                     "vq": f"{accumulators['vq_loss'] / steps_accumulated:.4f}",
                     "reco": f"{accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                    "tok_p_s": f"{short_num(tokens_per_second)}"  # Add tokens/sec to postfix
+                    "tok_p_s": f"{short_num(tokens_per_second)}",
                 }
+                if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
+                    postfix_dict["TopLM"] = f"{output_dict['avg_top_code_lm_loss'].item():.4f}"
                 if 'compression_ratios' in output_dict:  # Use last batch's ratios for quick display, or average them too
                     postfix_dict["ratios"] = ", ".join([f"{r / steps_accumulated:.2f}" for r in
                                                         accumulators['compression_ratios']])
+                if 'all_smoothed_perplexities' in output_dict:
+                    postfix_dict["smooth_perplexities"] = ", ".join(
+                        [f"{p / steps_accumulated:.4f}" for p in
+                         accumulators['all_smoothed_perplexities']])
 
                 if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
                     postfix_dict[

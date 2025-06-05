@@ -109,7 +109,7 @@ def entropy_segments(ent: torch.Tensor) -> torch.Tensor:
     # Determine where entropy increases compared to the previous token.
     # ent[:, 1:] compares ent[t] with ent[t-1] for t from 1 to S-1.
     # Shape: (batch_size, sequence_length - 1)
-    entropy_increased = (ent[:, 1:] > ent[:, :-1])
+    entropy_increased = (ent[:, 1:] > ent[:, :-1] + .1)
 
     # Convert boolean to integer (True -> 1, False -> 0)
     # These are indicators for starting a new segment (incrementing segment ID).

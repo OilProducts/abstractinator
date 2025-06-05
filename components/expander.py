@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional
 
+@torch.compile
 class CodeExpander(nn.Module):
     """
     A Transformer-based sequence-to-sequence model that converts a sequence of

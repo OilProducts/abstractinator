@@ -1,8 +1,113 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import (
+    flex_attention,           # fused kernel
+    create_block_mask         # helper to build sparse mask
+)
 from typing import Optional, Tuple
 
+@torch.compile
+class LocalSlidingWindowAttention(nn.Module):
+    """
+    Causal sliding‑window multi‑head attention in O(S·w) with FlexAttention.
+
+    *   Works with torch.compile → single Flash‑class kernel.
+    *   Key‑padding mask is applied to keys inside each window.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        window_size: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if embed_dim % num_heads:
+            raise ValueError("embed_dim must be divisible by num_heads")
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.window = window_size
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.o_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # dropout on the *output* (FlexAttention has no attn‑prob dropout arg)
+        self.out_dropout = nn.Dropout(dropout)
+
+    # ------------------------------------------------------------------ #
+    # helper: memo‑cached BlockMask builder
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _sliding_block(seq_len: int, window: int, device: torch.device):
+        cache_key = (seq_len, window, device.index if device.type == "cuda" else -1)
+        cache = LocalSlidingWindowAttention._sliding_block.__dict__.setdefault(
+            "cache", {}
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+
+        # python callback: keep (q,k) if q‑window ≤ k ≤ q
+        def mask_mod(b, h, q, k):
+            return (k >= q - window) & (k <= q)
+
+        blk = create_block_mask(
+            mask_mod,
+            B=None,
+            H=None,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            BLOCK_SIZE=128,
+            _compile=True,           # pre‑compile sparse metadata
+        ).to(device)
+
+        cache[cache_key] = blk
+        return blk
+
+    # ------------------------------------------------------------------ #
+    # forward
+    # ------------------------------------------------------------------ #
+    def forward(
+        self,
+        x: torch.Tensor,                            # (B, S, D)
+        key_padding_mask: Optional[torch.Tensor] = None,   # (B, S) – True = pad
+    ) -> torch.Tensor:
+        B, S, D = x.shape
+        H, d = self.num_heads, self.head_dim
+        if D != self.embed_dim:
+            raise ValueError("embed_dim mismatch")
+
+        # project and reshape -------------------------------------------------
+        q = self.q_proj(x).view(B, S, H, d).transpose(1, 2)  # (B,H,S,d)
+        k = self.k_proj(x).view(B, S, H, d).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, H, d).transpose(1, 2)
+        q = q * (d ** -0.5)                                  # scale
+
+        # block mask ----------------------------------------------------------
+        block_mask = self._sliding_block(S, self.window, x.device)
+        if key_padding_mask is not None:
+            block_mask = block_mask.add_padding_mask(key_padding_mask)
+
+        # fused attention -----------------------------------------------------
+        ctx = flex_attention(
+            query=q,
+            key=k,
+            value=v,
+            block_mask=block_mask,   # ← mandatory kw‑arg
+        )
+
+        # merge heads + output proj -------------------------------------------
+        out = ctx.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.o_proj(out)
+        return out
+
+@torch.compile
 class SlidingWindowAttention(nn.Module):
     """Multi-head scaled-dot-product attention restricted to a fixed retrospective window.
 

@@ -8,6 +8,7 @@ from .vector_quantizer import VectorQuantizer
 from .sliding_window_attention import StackedSlidingWindowEncoder
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask
 
+@torch.compile
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
@@ -142,7 +143,7 @@ class ByteSegmentCompressor(nn.Module):
 
         # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
         # Apply vector quantization to the pooled segment embeddings.
-        quantised_embeddings, vq_loss, codebook_indices = self.vq(pooled_embeddings)
+        quantised_embeddings, vq_loss, codebook_indices, perplexity = self.vq(pooled_embeddings)
         # quantised_embeddings: (B, S_hat*L, D)
         # vq_loss: scalar
         # codebook_indices: (B, S_hat*L)
@@ -179,6 +180,7 @@ class ByteSegmentCompressor(nn.Module):
             'vq_loss': vq_loss,
             'valid_mask': valid_segments_mask,  # (B, S_hat_segments)
             'encoder_logits': logits,
-            'codebook_perplexity': codebook_perplexity  # <<< ADDED
+            'current_codebook_perplexity': codebook_perplexity,
+            'smoothed_codebook_perplexity': perplexity
         }
         return return_dict
