@@ -64,10 +64,11 @@ class VectorQuantizer(nn.Module):
                  D: int,
                  beta: float = 0.25,
                  ema: bool = True,
-                 decay: float = 0.995,
+                 decay: float = 0.99,
                  eps: float = 1e-5,
                  reset_codes: bool = True,
-                 reset_interval: int = 500,
+                 usage_decay: float = 0.95,
+                 reset_interval: int = 100,
                  min_usage_threshold: float = 0.01,
                  max_codes_to_reset_pct: float = 0.1,
                  reset_ema_on_reset: bool = True):
@@ -78,7 +79,7 @@ class VectorQuantizer(nn.Module):
         self.ema = ema    # Whether to use EMA for codebook updates
         self.decay = decay  # EMA decay factor
         self.eps = eps    # Epsilon for numerical stability
-        self.usage_decay = 0.6
+        self.usage_decay = usage_decay
 
         self.reset_codes = reset_codes # bool: whether to enable code resetting
         self.reset_interval = reset_interval # int: steps between reset checks
@@ -90,9 +91,10 @@ class VectorQuantizer(nn.Module):
             if not self.ema and self.reset_ema_on_reset:
                 print("Warning: reset_ema_on_reset is True, but EMA is not enabled. EMA stats won't be reset.")
             # Buffer to track code usage count within a reset interval
-            self.register_buffer("code_usage_count", torch.zeros(K, dtype=torch.float32))
+            # self.register_buffer("code_usage_count", torch.zeros(K, dtype=torch.float32))
             # Buffer to track steps since last reset
             self.register_buffer("steps_since_last_reset", torch.tensor(0, dtype=torch.int64))
+            self.min_usage_threshold = 1.0
 
         # Initialize the codebook as a learnable parameter
         self.codebook = nn.Parameter(torch.randn(K, D))
@@ -151,6 +153,15 @@ class VectorQuantizer(nn.Module):
         self.codebook.data.copy_(self.ema_weight_sum / stabilized_cluster_size.unsqueeze(1))
 
     @torch.no_grad()
+    def _sample_farthest(self, xs, n):
+        # xs : (N,D)
+        picked = xs[torch.randint(0, xs.size(0), (1,))]
+        for _ in range(n - 1):
+            dist2 = torch.cdist(xs, picked).pow(2).min(dim=1).values
+            picked = torch.cat([picked, xs[dist2.argmax()].unsqueeze(0)], 0)
+        return picked  # (n,D)
+
+    @torch.no_grad()
     def _reset_dead_codes(self, current_batch_encoder_outputs: torch.Tensor):
         """
         Identifies and resets dead/underutilized codebook vectors.
@@ -165,9 +176,9 @@ class VectorQuantizer(nn.Module):
         if not self.reset_codes:
             return
 
-        num_codes_to_consider_reset = self.K
+        self.ema_cluster_size.mul_(self.usage_decay)
         # Identify dead codes: those with usage count below the threshold
-        dead_code_candidates_indices = (self.code_usage_count < self.min_usage_threshold).nonzero(as_tuple=True)[0]
+        dead_code_candidates_indices = (self.ema_cluster_size < self.min_usage_threshold).nonzero(as_tuple=True)[0]
         num_dead_candidates = dead_code_candidates_indices.size(0)
 
         if num_dead_candidates == 0:
@@ -205,29 +216,31 @@ class VectorQuantizer(nn.Module):
         if self.training:
             print(f"VQ: Resetting {num_actually_reset} dead codes (out of {num_dead_candidates} candidates).")
 
+        replacement_vectors = self._sample_farthest(flat_input, dead_idx.numel())
+
         # Select replacement vectors from the current batch's encoder outputs
         # Ensure enough unique samples from the batch, or sample with replacement
-        num_batch_vectors = current_batch_encoder_outputs.size(0)
-        if num_batch_vectors == 0:
-            if self.training:
-                print("VQ: Warning - Cannot reset codes, current batch encoder outputs are empty.")
-            return
-
-        # Get unique encoder outputs from the batch first
-        unique_batch_outputs = torch.unique(current_batch_encoder_outputs, dim=0)
-        num_unique_batch_outputs = unique_batch_outputs.size(0)
-
-        if num_unique_batch_outputs >= num_actually_reset:
-            # Sample without replacement from unique outputs
-            perm = torch.randperm(num_unique_batch_outputs, device=unique_batch_outputs.device)[:num_actually_reset]
-            replacement_vectors = unique_batch_outputs[perm]
-        else:
-            # Not enough unique outputs, sample with replacement from all batch outputs
-            # (or use all unique and then sample with replacement for the remainder)
-            # Simpler: sample with replacement from all batch outputs to fill num_actually_reset
-            indices_to_sample = torch.randint(0, num_batch_vectors, (num_actually_reset,),
-                                              device=current_batch_encoder_outputs.device)
-            replacement_vectors = current_batch_encoder_outputs[indices_to_sample]
+        # num_batch_vectors = current_batch_encoder_outputs.size(0)
+        # if num_batch_vectors == 0:
+        #     if self.training:
+        #         print("VQ: Warning - Cannot reset codes, current batch encoder outputs are empty.")
+        #     return
+        #
+        # # Get unique encoder outputs from the batch first
+        # unique_batch_outputs = torch.unique(current_batch_encoder_outputs, dim=0)
+        # num_unique_batch_outputs = unique_batch_outputs.size(0)
+        #
+        # if num_unique_batch_outputs >= num_actually_reset:
+        #     # Sample without replacement from unique outputs
+        #     perm = torch.randperm(num_unique_batch_outputs, device=unique_batch_outputs.device)[:num_actually_reset]
+        #     replacement_vectors = unique_batch_outputs[perm]
+        # else:
+        #     # Not enough unique outputs, sample with replacement from all batch outputs
+        #     # (or use all unique and then sample with replacement for the remainder)
+        #     # Simpler: sample with replacement from all batch outputs to fill num_actually_reset
+        #     indices_to_sample = torch.randint(0, num_batch_vectors, (num_actually_reset,),
+        #                                       device=current_batch_encoder_outputs.device)
+        #     replacement_vectors = current_batch_encoder_outputs[indices_to_sample]
 
         # Update the codebook with the replacement vectors
         self.codebook.data[actual_dead_indices] = replacement_vectors
@@ -244,8 +257,8 @@ class VectorQuantizer(nn.Module):
 
         # Important: Reset the usage count for ALL codes after a reset operation,
         # so that usage accumulation starts fresh for the next interval.
-        self.code_usage_count[actual_dead_indices] = 0.0
-        self.code_usage_count.mul_(self.usage_decay)
+        # self.code_usage_count[actual_dead_indices] = 0.0
+        # self.code_usage_count.mul_(self.usage_decay)
 
     def forward(self, z: torch.Tensor) -> tuple[Tensor | Any, Tensor, Tensor, Any]:
         """
@@ -325,9 +338,8 @@ class VectorQuantizer(nn.Module):
             # `encodings` needs to be computed if not already available from EMA logic
             # If EMA is off, `encodings` isn't computed by default in the current EMA block.
             # Let's assume `indices` is always available.
-            current_batch_one_hot_encodings = F.one_hot(indices, self.K).type_as(flat_input)
-            self.code_usage_count.add_(current_batch_one_hot_encodings.sum(0).detach()) # Sum over N dim
-
+            # current_batch_one_hot_encodings = F.one_hot(indices, self.K).type_as(flat_input)
+            # self.code_usage_count.add_(current_batch_one_hot_encodings.sum(0).detach()) # Sum over N dim
             self.steps_since_last_reset.add_(1)
 
             if self.steps_since_last_reset >= self.reset_interval:
@@ -376,13 +388,12 @@ class VectorQuantizer(nn.Module):
         # else: # If all probabilities are zero (e.g., no codes used yet)
         #     perplexity = torch.tensor(0.0, device=z.device)
         # choose the raw counts that represent usage
-        if self.ema:
-            raw_counts = self.ema_cluster_size  # (K,)
-        else:
-            raw_counts = self.code_usage_count  # (K,)
+        probs = self.ema_cluster_size  # (K,)
+        # else:
+        #     raw_counts = self.code_usage_count  # (K,)
 
         # 1) make sure nothing is exactly zero
-        probs = torch.clamp(raw_counts, min=self.eps)
+        # probs = torch.clamp(raw_counts, min=self.eps)
 
         # 2) normalise to a true probability distribution
         denom = probs.sum() + self.eps  # add eps once more for safety
