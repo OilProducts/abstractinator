@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, Any
+
+from torch import Tensor
+
 
 class VectorQuantizer(nn.Module):
     """
@@ -61,10 +64,10 @@ class VectorQuantizer(nn.Module):
                  D: int,
                  beta: float = 0.25,
                  ema: bool = True,
-                 decay: float = 0.99,
+                 decay: float = 0.9,
                  eps: float = 1e-5,
                  reset_codes: bool = True,
-                 reset_interval: int = 500,
+                 reset_interval: int = 2000,
                  min_usage_threshold: float = 0.01,
                  max_codes_to_reset_pct: float = 0.1,
                  reset_ema_on_reset: bool = True):
@@ -139,6 +142,8 @@ class VectorQuantizer(nn.Module):
             (self.ema_cluster_size + self.eps) /
             (n_total_clusters + self.K * self.eps)
         ) * n_total_clusters
+
+        stabilized_cluster_size = torch.clamp(stabilized_cluster_size, min=self.eps)  # <-- NEW
 
         # Update the codebook by dividing the EMA of summed vectors by the EMA of cluster sizes.
         # unsqueeze(1) is for broadcasting (K,) to (K,1) for element-wise division.
@@ -240,7 +245,7 @@ class VectorQuantizer(nn.Module):
         # so that usage accumulation starts fresh for the next interval.
         self.code_usage_count.zero_()
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> tuple[Tensor | Any, Tensor, Tensor, Any]:
         """
         Forward pass of the Vector Quantizer.
 
@@ -339,38 +344,53 @@ class VectorQuantizer(nn.Module):
         # Perplexity = exp(-sum(p_i * log(p_i))), where p_i is usage probability of code i
         # A simpler related metric is active_codes / K
         # For perplexity, we need probabilities. Use EMA cluster size for a stable estimate.
-        if self.ema: # Use EMA cluster sizes if available for a more stable perplexity
-            probs = self.ema_cluster_size / (self.ema_cluster_size.sum() + self.eps) # Normalized probabilities
-        else: # Use current batch usage if EMA is off (less stable, but an indicator)
-             if self.training and self.reset_codes and self.code_usage_count.sum() > 0:
-                 probs = self.code_usage_count / self.code_usage_count.sum()
-             else: # Fallback or if not training/no usage yet
-                 # Create a uniform distribution if no usage info, or a tensor of zeros
-                 # This might not be very meaningful if no codes have been used.
-                 # Let's make it NaN if no codes used, or handle it upstream.
-                 # For now, if sum is zero, perplexity calculation will result in NaN or error.
-                 # A simple active code count is often more robust initially.
-                 # Let's compute active codes for now.
-                 # active_codes_in_batch = torch.unique(indices).numel()
-                 # perplexity = torch.tensor(float('nan'), device=z.device) # Placeholder for now
-                 # Let's calculate effective number of codes used in the current batch as a proxy
-                 # if not self.ema and self.training:
-                 #    current_batch_usage = F.one_hot(indices, self.K).float().mean(dim=0)
-                 #    perplexity = torch.exp(-torch.sum(current_batch_usage * torch.log(current_batch_usage + 1e-10), dim=-1))
-                 # else: # Fallback for non-EMA / non-training
-                 #    perplexity = torch.tensor(float('nan'), device=z.device)
-                 probs = torch.ones(self.K, device=z.device) / self.K # Assume uniform if no better info
+        # if self.ema: # Use EMA cluster sizes if available for a more stable perplexity
+        #     probs = self.ema_cluster_size / (self.ema_cluster_size.sum() + self.eps) # Normalized probabilities
+        # else: # Use current batch usage if EMA is off (less stable, but an indicator)
+        #      if self.training and self.reset_codes and self.code_usage_count.sum() > 0:
+        #          probs = self.code_usage_count / self.code_usage_count.sum()
+        #      else: # Fallback or if not training/no usage yet
+        #          # Create a uniform distribution if no usage info, or a tensor of zeros
+        #          # This might not be very meaningful if no codes have been used.
+        #          # Let's make it NaN if no codes used, or handle it upstream.
+        #          # For now, if sum is zero, perplexity calculation will result in NaN or error.
+        #          # A simple active code count is often more robust initially.
+        #          # Let's compute active codes for now.
+        #          # active_codes_in_batch = torch.unique(indices).numel()
+        #          # perplexity = torch.tensor(float('nan'), device=z.device) # Placeholder for now
+        #          # Let's calculate effective number of codes used in the current batch as a proxy
+        #          # if not self.ema and self.training:
+        #          #    current_batch_usage = F.one_hot(indices, self.K).float().mean(dim=0)
+        #          #    perplexity = torch.exp(-torch.sum(current_batch_usage * torch.log(current_batch_usage + 1e-10), dim=-1))
+        #          # else: # Fallback for non-EMA / non-training
+        #          #    perplexity = torch.tensor(float('nan'), device=z.device)
+        #          probs = torch.ones(self.K, device=z.device) / self.K # Assume uniform if no better info
+        #
+        # # Filter out zero probabilities to avoid log(0) = -inf
+        # probs_nz = probs[probs > 0]
+        # if probs_nz.numel() > 0:
+        #     entropy = -torch.sum(probs_nz * torch.log(probs_nz))
+        #     perplexity = torch.exp(entropy)
+        # else: # If all probabilities are zero (e.g., no codes used yet)
+        #     perplexity = torch.tensor(0.0, device=z.device)
+        # choose the raw counts that represent usage
+        if self.ema:
+            raw_counts = self.ema_cluster_size  # (K,)
+        else:
+            raw_counts = self.code_usage_count  # (K,)
 
-        # Filter out zero probabilities to avoid log(0) = -inf
-        probs_nz = probs[probs > 0]
-        if probs_nz.numel() > 0:
-            entropy = -torch.sum(probs_nz * torch.log(probs_nz))
-            perplexity = torch.exp(entropy)
-        else: # If all probabilities are zero (e.g., no codes used yet)
-            perplexity = torch.tensor(0.0, device=z.device)
+        # 1) make sure nothing is exactly zero
+        probs = torch.clamp(raw_counts, min=self.eps)
 
+        # 2) normalise to a true probability distribution
+        denom = probs.sum() + self.eps  # add eps once more for safety
+        probs = probs / denom  # shape (K,)
+
+        # 3) perplexity
+        entropy = -(probs.double() * probs.double().log()).sum()
+        perplexity = entropy.exp().float()
 
         return z_q_ste, vq_loss, indices.view(B, Q), perplexity.detach()
 
-        # Return quantized output (with STE), VQ loss, and codebook indices
-        return z_q_ste, vq_loss, indices.view(B, Q)
+        # # Return quantized output (with STE), VQ loss, and codebook indices
+        # return z_q_ste, vq_loss, indices.view(B, Q)
