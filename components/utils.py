@@ -129,99 +129,155 @@ def entropy_segments(ent: torch.Tensor) -> torch.Tensor:
 
     return seg_id
 
+# def build_segment_queries_mask(
+#     seg_id: torch.Tensor,          # Integer segment IDs for each token: [B, S_original]
+#     query_embed: torch.Tensor,     # Learned query template: [L, D]
+#     num_heads: int                 # Number of attention heads for repeating the mask
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#     """
+#     Constructs queries and attention masks for segment-based attention.
+#
+#     It takes a learned query template (`query_embed` of shape [L, D]) and
+#     repeats it for each potential segment up to the maximum number of segments
+#     (`S_hat`) found in the batch. This creates a `queries` tensor of shape
+#     [B, S_hat*L, D].
+#
+#     An attention mask (`att_mask`) is generated to ensure that each block of L
+#     queries (corresponding to a specific segment) can only attend to tokens
+#     within that same segment in the original sequence `x`.
+#
+#     A validity mask (`valid`) indicates which of the `S_hat` segments are
+#     actually present for each item in the batch.
+#
+#     Args:
+#         seg_id (torch.Tensor): Tensor of integer segment IDs for each token in the
+#             original sequence. Shape: (batch_size, original_sequence_length).
+#             Segment IDs are assumed to be 0-indexed and contiguous per batch item.
+#         query_embed (torch.Tensor): The learned query template (e.g.,
+#             `LearnedQueryAttention.query_template`). Shape: (L, embed_dim), where L
+#             is the number of queries per segment.
+#         num_heads (int): The number of attention heads. Used to repeat the
+#             attention mask for compatibility with multi-head attention implementations
+#             that expect a mask per head, possibly flattened with the batch dimension.
+#
+#     Returns:
+#         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         - queries (torch.Tensor): The constructed query tensor, tiled for each
+#           potential segment. Shape: (batch_size, S_hat * L, embed_dim).
+#         - att_mask (torch.Tensor): The boolean attention mask. `True` indicates
+#           positions that should be blocked (masked out).
+#           Shape: (batch_size * num_heads, S_hat * L, original_sequence_length).
+#         - valid (torch.Tensor): A boolean mask indicating which segments (out of S_hat
+#           potential segments) are valid for each batch item.
+#           Shape: (batch_size, S_hat).
+#     """
+#     B, S_original = seg_id.shape # S_original is the original sequence length of tokens
+#     L, D = query_embed.shape
+#     device = seg_id.device
+#
+#     # Determine the number of segments for each batch item
+#     # Assumes seg_id contains 0-indexed segment IDs (0, 1, ..., num_segments-1)
+#     seg_count = seg_id.max(dim=1).values + 1  # Shape: (B,)
+#     # S_hat: Maximum number of segments in any batch item. This determines the
+#     #        query dimension size for padding/batching purposes.
+#     S_hat = seg_count.max().item()
+#
+#     # ------- 1. Construct Queries ------------------------------------------
+#     # Repeat the learned L query embeddings for every potential segment slot (up to S_hat).
+#     # query_embed: (L, D) -> (1, L, D) -> (1, 1, L, D)
+#     # queries: (B, S_hat, L, D)
+#     queries = (query_embed
+#                .unsqueeze(0)
+#                .unsqueeze(0)
+#                .repeat(B, S_hat, 1, 1))
+#     # Reshape to (B, S_hat*L, D). This is Q_tot = S_hat * L.
+#     queries = queries.view(B, S_hat * L, D)
+#
+#     # ------- 2. Assign Segment ID to each Query ----------------------------
+#     # Create a tensor indicating which segment each of the S_hat*L queries belongs to.
+#     # Example: if L=2, S_hat=3 -> [0,0, 1,1, 2,2]
+#     seg_for_q = torch.arange(S_hat, device=device, dtype=torch.long) \
+#                      .repeat_interleave(L)  # Shape: (S_hat*L,)
+#     # Expand to batch: (B, S_hat*L)
+#     seg_for_q = seg_for_q.unsqueeze(0).expand(B, -1)
+#
+#     # ------- 3. Construct Attention Mask -----------------------------------
+#     # The attention mask ensures a query 'q' can only attend to a key/token 's'
+#     # if they belong to the same segment.
+#     # seg_for_q[:, :, None]: (B, S_hat*L, 1)
+#     # seg_id[:, None, :]:    (B, 1, S_original)
+#     # same_segment_matrix: (B, S_hat*L, S_original). True if query q and token s are in the same segment.
+#     same_segment_matrix = (seg_for_q[:, :, None] == seg_id[:, None, :])
+#
+#     # att_mask should be True where attention is BLOCKED.
+#     # So, block if query and token are NOT in the same segment.
+#     att_mask = ~same_segment_matrix  # Shape: (B, S_hat*L, S_original)
+#
+#     # Repeat mask for each attention head: (B*num_heads, S_hat*L, S_original)
+#     # This matches the format expected by some MHA layers where batch and head dims are merged.
+#     att_mask = att_mask.repeat_interleave(num_heads, dim=0)
+#
+#     # ------- 4. Create Validity Map for Segments ---------------------------
+#     # `valid` indicates which of the `S_hat` segment slots are actual, non-padded segments.
+#     # torch.arange(S_hat, device=device)[None, :]: (1, S_hat) -> [0, 1, ..., S_hat-1]
+#     # seg_count[:, None]: (B, 1)
+#     # valid[b, i] is True if segment index i < actual number of segments for batch item b.
+#     valid_segments = torch.arange(S_hat, device=device, dtype=torch.long)[None, :] < seg_count[:, None] # Shape: (B, S_hat)
+#
+#     return queries, att_mask, valid_segments
+
+
 def build_segment_queries_mask(
-    seg_id: torch.Tensor,          # Integer segment IDs for each token: [B, S_original]
-    query_embed: torch.Tensor,     # Learned query template: [L, D]
-    num_heads: int                 # Number of attention heads for repeating the mask
+    seg_id: torch.Tensor,          # [B, S_original]   – integer segment ids
+    query_embed: torch.Tensor,     # [L, D]            – learned query template
+    num_heads: int                 # number of attention heads
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Constructs queries and attention masks for segment-based attention.
-
-    It takes a learned query template (`query_embed` of shape [L, D]) and
-    repeats it for each potential segment up to the maximum number of segments
-    (`S_hat`) found in the batch. This creates a `queries` tensor of shape
-    [B, S_hat*L, D].
-
-    An attention mask (`att_mask`) is generated to ensure that each block of L
-    queries (corresponding to a specific segment) can only attend to tokens
-    within that same segment in the original sequence `x`.
-
-    A validity mask (`valid`) indicates which of the `S_hat` segments are
-    actually present for each item in the batch.
-
-    Args:
-        seg_id (torch.Tensor): Tensor of integer segment IDs for each token in the
-            original sequence. Shape: (batch_size, original_sequence_length).
-            Segment IDs are assumed to be 0-indexed and contiguous per batch item.
-        query_embed (torch.Tensor): The learned query template (e.g.,
-            `LearnedQueryAttention.query_template`). Shape: (L, embed_dim), where L
-            is the number of queries per segment.
-        num_heads (int): The number of attention heads. Used to repeat the
-            attention mask for compatibility with multi-head attention implementations
-            that expect a mask per head, possibly flattened with the batch dimension.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        - queries (torch.Tensor): The constructed query tensor, tiled for each
-          potential segment. Shape: (batch_size, S_hat * L, embed_dim).
-        - att_mask (torch.Tensor): The boolean attention mask. `True` indicates
-          positions that should be blocked (masked out).
-          Shape: (batch_size * num_heads, S_hat * L, original_sequence_length).
-        - valid (torch.Tensor): A boolean mask indicating which segments (out of S_hat
-          potential segments) are valid for each batch item.
-          Shape: (batch_size, S_hat).
+    Same contract as before, but **without any .item() calls** so it can live
+    inside `torch.compile` / FX graphs without forcing a graph break.
     """
-    B, S_original = seg_id.shape # S_original is the original sequence length of tokens
-    L, D = query_embed.shape
-    device = seg_id.device
+    B, S_original = seg_id.shape          # SymInts
+    L, D          = query_embed.shape
+    device        = seg_id.device
 
-    # Determine the number of segments for each batch item
-    # Assumes seg_id contains 0-indexed segment IDs (0, 1, ..., num_segments-1)
-    seg_count = seg_id.max(dim=1).values + 1  # Shape: (B,)
-    # S_hat: Maximum number of segments in any batch item. This determines the
-    #        query dimension size for padding/batching purposes.
-    S_hat = seg_count.max().item()
+    # ----------------------------------------------------------------------
+    # 1.  Maximum #segments in the batch (scalar SymInt, NOT Python int)
+    # ----------------------------------------------------------------------
+    seg_count = seg_id.amax(dim=1) + 1          # (B,)  actual segments per item
+    S_hat     = seg_count.amax()                # 0‑D tensor / SymInt ✔️
 
-    # ------- 1. Construct Queries ------------------------------------------
-    # Repeat the learned L query embeddings for every potential segment slot (up to S_hat).
-    # query_embed: (L, D) -> (1, L, D) -> (1, 1, L, D)
-    # queries: (B, S_hat, L, D)
-    queries = (query_embed
-               .unsqueeze(0)
-               .unsqueeze(0)
-               .repeat(B, S_hat, 1, 1))
-    # Reshape to (B, S_hat*L, D). This is Q_tot = S_hat * L.
-    queries = queries.view(B, S_hat * L, D)
+    # ----------------------------------------------------------------------
+    # 2.  Build queries   [B, S_hat * L, D]
+    # ----------------------------------------------------------------------
+    #   Expand with SymInt S_hat – no Python conversion.
+    queries = (
+        query_embed                 # [L, D]
+          .unsqueeze(0)             # [1, L, D]
+          .unsqueeze(0)             # [1, 1, L, D]
+          .expand(B, S_hat, L, D)   # [B, S_hat, L, D]
+          .reshape(B, -1, D)        # [B, S_hat*L, D]
+    )
 
-    # ------- 2. Assign Segment ID to each Query ----------------------------
-    # Create a tensor indicating which segment each of the S_hat*L queries belongs to.
-    # Example: if L=2, S_hat=3 -> [0,0, 1,1, 2,2]
-    seg_for_q = torch.arange(S_hat, device=device, dtype=torch.long) \
-                     .repeat_interleave(L)  # Shape: (S_hat*L,)
-    # Expand to batch: (B, S_hat*L)
-    seg_for_q = seg_for_q.unsqueeze(0).expand(B, -1)
+    # ----------------------------------------------------------------------
+    # 3.  Segment‑id for every query   [B, S_hat*L]
+    # ----------------------------------------------------------------------
+    # Build with arithmetic on SymInts – still no .item().
+    q_positions = torch.arange(queries.shape[1], device=device)   # 0 … S_hat*L‑1
+    seg_for_q   = (q_positions // L).expand(B, -1)                # repeat for batch
 
-    # ------- 3. Construct Attention Mask -----------------------------------
-    # The attention mask ensures a query 'q' can only attend to a key/token 's'
-    # if they belong to the same segment.
-    # seg_for_q[:, :, None]: (B, S_hat*L, 1)
-    # seg_id[:, None, :]:    (B, 1, S_original)
-    # same_segment_matrix: (B, S_hat*L, S_original). True if query q and token s are in the same segment.
-    same_segment_matrix = (seg_for_q[:, :, None] == seg_id[:, None, :])
+    # ----------------------------------------------------------------------
+    # 4.  Attention mask   [B*num_heads, S_hat*L, S_original]   (True ⇒ BLOCK)
+    # ----------------------------------------------------------------------
+    same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])   # broadcast compare
+    att_mask     = (~same_segment).repeat_interleave(num_heads, dim=0)
 
-    # att_mask should be True where attention is BLOCKED.
-    # So, block if query and token are NOT in the same segment.
-    att_mask = ~same_segment_matrix  # Shape: (B, S_hat*L, S_original)
-
-    # Repeat mask for each attention head: (B*num_heads, S_hat*L, S_original)
-    # This matches the format expected by some MHA layers where batch and head dims are merged.
-    att_mask = att_mask.repeat_interleave(num_heads, dim=0)
-
-    # ------- 4. Create Validity Map for Segments ---------------------------
-    # `valid` indicates which of the `S_hat` segment slots are actual, non-padded segments.
-    # torch.arange(S_hat, device=device)[None, :]: (1, S_hat) -> [0, 1, ..., S_hat-1]
-    # seg_count[:, None]: (B, 1)
-    # valid[b, i] is True if segment index i < actual number of segments for batch item b.
-    valid_segments = torch.arange(S_hat, device=device, dtype=torch.long)[None, :] < seg_count[:, None] # Shape: (B, S_hat)
+    # ----------------------------------------------------------------------
+    # 5.  Valid segment slots   [B, S_hat]
+    # ----------------------------------------------------------------------
+    valid_segments = (
+        torch.arange(S_hat, device=device)      # 0 … S_hat‑1   (SymInt end)
+              .unsqueeze(0)
+              .lt(seg_count.unsqueeze(1))       # i < seg_count[b]
+    )
 
     return queries, att_mask, valid_segments
