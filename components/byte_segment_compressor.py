@@ -103,14 +103,14 @@ class ByteSegmentCompressor(nn.Module):
                   potential segment slots. Shape: (batch_size, S_hat). To get a mask
                   for valid query vectors, this would need to be expanded/repeated.
         """
-        # ── 1. Encode Tokens ───────────────────────────────────────────────────
+        # 1. Encode Tokens
         # `hidden` are token embeddings, `logits` for prediction (e.g., for entropy calc)
         # Note: key_padding_mask is not explicitly passed to self.encoder here.
         # If StackedSlidingWindowEncoder supports it, it should be passed.
         hidden, logits = self.encoder(token_ids) # hidden: (B,S,D), logits: (B,S,Vocab)
         #TODO should encoder take key_padding_mask? does it need safe_softmax then?
 
-        # ── 2. Perform Entropy-Based Segmentation ─────────────────────────────
+        # 2. Perform Entropy-Based Segmentation
         # This part determines segment boundaries based on token prediction entropy.
         # It's done with no_grad as the segmentation logic itself is not learned here.
         with torch.no_grad():
