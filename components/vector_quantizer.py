@@ -216,7 +216,7 @@ class VectorQuantizer(nn.Module):
         if self.training:
             print(f"VQ: Resetting {num_actually_reset} dead codes (out of {num_dead_candidates} candidates).")
 
-        replacement_vectors = self._sample_farthest(flat_input, dead_idx.numel())
+        replacement_vectors = self._sample_farthest(current_batch_encoder_outputs, actual_dead_indices.numel())
 
         # Select replacement vectors from the current batch's encoder outputs
         # Ensure enough unique samples from the batch, or sample with replacement
