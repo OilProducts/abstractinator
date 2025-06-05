@@ -64,10 +64,10 @@ class VectorQuantizer(nn.Module):
                  D: int,
                  beta: float = 0.25,
                  ema: bool = True,
-                 decay: float = 0.9,
+                 decay: float = 0.995,
                  eps: float = 1e-5,
                  reset_codes: bool = True,
-                 reset_interval: int = 2000,
+                 reset_interval: int = 500,
                  min_usage_threshold: float = 0.01,
                  max_codes_to_reset_pct: float = 0.1,
                  reset_ema_on_reset: bool = True):
@@ -78,6 +78,7 @@ class VectorQuantizer(nn.Module):
         self.ema = ema    # Whether to use EMA for codebook updates
         self.decay = decay  # EMA decay factor
         self.eps = eps    # Epsilon for numerical stability
+        self.usage_decay = 0.6
 
         self.reset_codes = reset_codes # bool: whether to enable code resetting
         self.reset_interval = reset_interval # int: steps between reset checks
@@ -243,7 +244,8 @@ class VectorQuantizer(nn.Module):
 
         # Important: Reset the usage count for ALL codes after a reset operation,
         # so that usage accumulation starts fresh for the next interval.
-        self.code_usage_count.zero_()
+        self.code_usage_count[actual_dead_indices] = 0.0
+        self.code_usage_count.mul_(self.usage_decay)
 
     def forward(self, z: torch.Tensor) -> tuple[Tensor | Any, Tensor, Tensor, Any]:
         """
