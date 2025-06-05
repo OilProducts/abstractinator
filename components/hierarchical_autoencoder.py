@@ -104,6 +104,9 @@ class HierarchicalAutoencoder(nn.Module):
             print(
                 f"Initialized CodeSequenceTransformer for top codes (vocab: {top_code_vocab_size}, dim: {self.top_transformer_config['dim']})")
 
+        else:
+            self.code_sequence_transformer = None
+
         # ---- Configure Expander Stack ----
         self.expanders = nn.ModuleList()
         for i in range(num_levels - 1, -1, -1):
