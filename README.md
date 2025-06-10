@@ -1,8 +1,31 @@
-# abstractinator
+# Abstractinator
 
-The training script now supports periodic checkpointing. Configuration
-options have been moved to `config.py`.  Edit the
-`checkpoint_interval` and `checkpoint_dir` fields in `config.py`'s
-`exp_config` dictionary to control how often checkpoints are saved and
-where they are stored. Set `resume_from_checkpoint` to the path of a
-saved checkpoint to resume training from that point.
+A hierarchical autoencoder that compresses and reconstructs byte sequences using vector quantization.  Training and dataset parameters are configured in `config.py`.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Training
+
+Run the training loop:
+
+```bash
+python train.py
+```
+
+All experiment settings live in the `exp_config` dictionary within `config.py`.  Edit values there to change model size, dataset selection and training options.
+
+Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps.  To resume training, set `exp_config['resume_from_checkpoint']` to the path of a saved checkpoint.
+
+## Components
+
+Key modules under `components/` include:
+
+- `ByteSegmentCompressor` – segments byte tokens and vector-quantizes them.
+- `CodeExpander` – transformer that reconstructs lower level codes.
+- `HierarchicalAutoencoder` – stacks compressors and expanders for end-to-end compression.
+
+See `notes.md` for additional design thoughts.
