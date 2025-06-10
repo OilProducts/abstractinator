@@ -1,4 +1,4 @@
 torch
 datasets
 aim
-tqdm
+transformers
