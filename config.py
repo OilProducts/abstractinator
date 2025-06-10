@@ -52,6 +52,11 @@ exp_config = {
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
     "gradient_accumulation_steps": 32,
+    "scheduler_type": "cosine_with_min_lr",
+    "warmup_steps": 1000,
+    "scheduler_specific_kwargs": {
+        "min_lr": 1e-6,  # Minimum learning rate for cosine scheduler
+    },
     "dataset_name": "HuggingFaceFW/fineweb-edu",
     "dataset_config": "sample-10BT",
     "dataset_train_split": "train",

@@ -10,9 +10,9 @@ from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
 from torch import optim
 from torch.utils.data import DataLoader
 from typing import List, Dict, Any
+from transformers.optimization import get_scheduler
 
 import aim  # Assuming 'aim' is installed and accessible
-from tqdm import tqdm
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
@@ -20,6 +20,7 @@ from config import DEVICE, N_CPU, exp_config
 
 torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
+torch.set_printoptions(threshold=100_000)
 
 def short_num(n):
     n = float(n)
@@ -51,13 +52,6 @@ if exp_config.get("project_name"):
     # Ensure the AIM repo path is correctly specified if not using default location
     aim_run.repo = f"./aim_repo/{exp_config['project_name']}"
     print(f"AIM repository set to: {aim_run.repo}")
-
-print("Tracking hyperparameters with AIM...")
-# Track all hyperparameters (excluding potentially sensitive or very large ones if any)
-# The loop below is an alternative way, track_hparams is generally preferred.
-for k, v in exp_config.items():
-    aim_run[k] = v
-print("Hyperparameters tracked.")
 
 # --- Model, Optimizer ---
 print("Initializing HierarchicalAutoencoder model...")
@@ -276,6 +270,27 @@ train_dataloader = DataLoader(
 )
 print(f"DataLoader created with {N_CPU} workers.")
 
+
+# --- Scheduler Setup --- # <<< ADDED SECTION
+# Calculate the total number of training (optimizer) steps
+num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config["gradient_accumulation_steps"])
+exp_config["num_training_steps"] = exp_config["num_epochs"] * num_update_steps_per_epoch
+
+print(f"Creating learning rate scheduler: {exp_config['scheduler_type']} with {exp_config['warmup_steps']} warmup steps.")
+lr_scheduler = get_scheduler(
+    name=exp_config['scheduler_type'],
+    optimizer=optimizer,
+    num_warmup_steps=exp_config['warmup_steps'],
+    num_training_steps=exp_config['num_training_steps'],
+    scheduler_specific_kwargs=exp_config["scheduler_specific_kwargs"] if "scheduler_specific_kwargs" in exp_config else {}
+)
+
+# --- Track final hyperparameters with AIM after potential modifications --- # <<< ADDED
+print("Tracking hyperparameters with AIM...")
+for k, v in exp_config.items():
+    aim_run[k] = v
+print("Hyperparameters tracked.")
+
 # --- Training Loop ---
 print("\nStarting training loop...")
 model.train()  # Set model to training mode
@@ -372,6 +387,7 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
             if exp_config.get("gradient_clip_norm"):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config["gradient_clip_norm"])
             optimizer.step()
+            lr_scheduler.step()  # Step the scheduler after optimizer step
             optimizer.zero_grad()  # Reset gradients after accumulation
 
             # Calculate metrics for the completed accumulation window
