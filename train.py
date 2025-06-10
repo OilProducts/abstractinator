@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
+from config import DEVICE, N_CPU, exp_config
 
 torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
@@ -38,82 +39,10 @@ def short_num(n):
     return f"{formatted}{millnames[millidx]}"
 
 
-N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least 1 worker
-
-# --- Device Setup ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.backends.mps.is_available() and DEVICE == "cpu":  # Prefer MPS if available and CUDA not
-    DEVICE = torch.device("mps")
 print(f"Using device: {DEVICE}")
 
 # --- Experiment Configuration ---
-exp_config = {
-    "run_name": "HierarchicalAE_KPM_Run_v2",  # Updated run name
-    "project_name": "TemporalAutoencodedLanguageModelling",
-    "num_levels": 1,
-    "initial_vocab_size": 259,  # Matches ByteLevelTokenizer default + 3 special tokens
-    "compressor_level_configs": [
-        {"dim": 768, "heads": 12, "window": 512,
-         "num_encoder_layers": 14,
-         'encoder_ffn_dim_multiplier': 4,
-         'encoder_dropout': 0.1,
-         'max_seq_len_encoder': 4096,
-         "num_queries": 1,
-         "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-         "codebook_size": 49404,
-         "beta": 1.0},
-        # {"dim": 1024, "heads": 16, "window": 64,
-        #  "num_encoder_layers": 8,
-        #  'encoder_ffn_dim_multiplier': 4,
-        #  'encoder_dropout': 0.1,
-        #  'max_seq_len_encoder': 4096,
-        #  "num_queries": 1,
-        #  "pooler_dropout": 0.1,  # Added from previous HierarchicalAutoencoder init
-        #  "codebook_size": 32768,  # Was CODEBOOK_L0 * MULTIPLIER, direct value now
-        #  "beta": 1.25}
-    ],
-    "expander_dim_scale": 1.0,
-    "expander_num_enc_layers": 6,
-    "expander_num_dec_layers": 6,
-    "expander_heads_scale": 1.0,
-    "expander_dropout": 0.1,
-    "expander_eos_id": 1,  # As used in CodeExpander
-    "expander_max_len": 2048,  # Default max generation length for CodeExpander
-    "propagate_key_padding_mask": True,  # Crucial for KPM pipeline
-    "aux_lm_loss_weight": 1.0,
-    "top_lm_loss_weight": 0.2,  # <<< ADDED: Weight for the new LM loss on top codes
-    # "top_transformer_config": {  # <<< ADDED: Configuration for the new Transformer
-    #     "dim": 768,  # Example: Dimension for this Transformer
-    #     "num_layers": 16,
-    #     "num_heads": 12,
-    #     "ffn_dim_multiplier": 4,
-    #     "dropout": 0.1,
-    #     "max_seq_len": 2048,  # Max length of top_code sequences it can handle
-    #     "output_lm_logits": True  # Ensure it has an LM head
-    # },
-    "learning_rate": 1e-4,
-    "batch_size": 4,  # Centralized BATCH_SIZE
-    "sequence_length": 1024,  # Centralized SEQUENCE_LENGTH
-    "num_epochs": 10,
-    "log_interval": 1,  # Log metrics to AIM every N steps (increased for less frequent logging)
-    "gradient_clip_norm": 1.0,  # Optional gradient clipping
-    "gradient_accumulation_steps": 32,  # No accumulation for simplicity, can be adjusted
-    # Dataset configurations
-    "dataset_name": "HuggingFaceFW/fineweb-edu",
-    "dataset_config": "sample-10BT",
-    "dataset_train_split": "train",  # Using a larger subset for demo
-    "text_column_name": "text",
-
-    # Generation during training settings
-    "generation_interval": 50,  # Generate every 50 global steps
-    "sample_prompt_for_generation": "The purpose of education is ",
-    "generation_max_len_override": 512,  # Max length for the generated sample
-
-    # Checkpoint settings
-    "checkpoint_interval": 1000,  # Save every N optimizer steps
-    "checkpoint_dir": "./checkpoints",
-    "resume_from_checkpoint": None,
-}
+# Loaded from config.py
 
 # --- AIM Setup ---
 print(f"Initializing AIM run: {exp_config.get('run_name', 'DefaultRun')}")
