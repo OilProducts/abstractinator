@@ -107,7 +107,12 @@ exp_config = {
     # Generation during training settings
     "generation_interval": 50,  # Generate every 50 global steps
     "sample_prompt_for_generation": "The purpose of education is ",
-    "generation_max_len_override": 512  # Max length for the generated sample
+    "generation_max_len_override": 512,  # Max length for the generated sample
+
+    # Checkpoint settings
+    "checkpoint_interval": 1000,  # Save every N optimizer steps
+    "checkpoint_dir": "./checkpoints",
+    "resume_from_checkpoint": None,
 }
 
 # --- AIM Setup ---
@@ -149,6 +154,32 @@ print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable par
 
 optimizer = optim.AdamW(model.parameters(), lr=exp_config["learning_rate"])
 print(f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}")
+
+# --- Checkpoint Utilities ---
+def save_checkpoint(model, optimizer, epoch, step, checkpoint_dir):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step{step}.pt")
+    torch.save({
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": step,
+    }, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+
+start_epoch = 0
+global_step = 0
+resume_path = exp_config.get("resume_from_checkpoint")
+if resume_path:
+    if os.path.isfile(resume_path):
+        ckpt = torch.load(resume_path, map_location=DEVICE)
+        model.load_state_dict(ckpt.get("model_state", {}))
+        optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("global_step", 0)
+        print(f"Resumed from checkpoint '{resume_path}' at step {global_step}, epoch {start_epoch}")
+    else:
+        print(f"Checkpoint path '{resume_path}' not found. Starting from scratch.")
 
 
 # --- Tokenizer ---
@@ -318,7 +349,6 @@ print(f"DataLoader created with {N_CPU} workers.")
 
 # --- Training Loop ---
 print("\nStarting training loop...")
-global_step = 0
 model.train()  # Set model to training mode
 optimizer.zero_grad()  # Reset gradients before training
 
@@ -346,7 +376,7 @@ accumulators = reset_accumulators(exp_config["num_levels"])
 time_of_last_optimizer_step_event = time.time() # Initialize timer for tokens/sec
 total_minibatches_in_epoch = len(train_dataloader)
 
-for epoch in range(exp_config["num_epochs"]):
+for epoch in range(start_epoch, exp_config["num_epochs"]):
     print(f"\n--- Epoch {epoch + 1}/{exp_config['num_epochs']} ---") # MODIFIED: Epoch start print
     epoch_start_time = time.time()
     model.train() # Ensure model is in train mode at start of epoch
@@ -568,9 +598,12 @@ for epoch in range(exp_config["num_epochs"]):
                                   epoch=epoch)
 
                 model.train()  # Switch back to training mode
+            if global_step > 0 and global_step % exp_config["checkpoint_interval"] == 0:
+                save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
             global_step += 1
     epoch_duration = time.time() - epoch_start_time
     print(f"--- Epoch {epoch + 1} finished. Duration: {epoch_duration:.2f}s ---") # MODIFIED: Epoch end print
+    save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
 
 print("Training finished.")
 
