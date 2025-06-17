@@ -154,7 +154,10 @@ class VectorQuantizer(nn.Module):
                     self._reset_dead_codes()
                     self.steps_since_last_reset.zero_()
 
-        counts = self.ema_cluster_size.clamp(min=self.eps)
+        if self.ema:
+            counts = self.ema_cluster_size.clamp(min=self.eps)
+        else:
+            counts = torch.bincount(indices, minlength=self.K).float().clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
         entropy = -(probs.double() * probs.double().log()).sum()
         perplexity = entropy.exp().float()
