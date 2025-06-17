@@ -8,10 +8,35 @@ from .expander import CodeExpander
 from .code_sequence_transformer import CodeSequenceTransformer
 
 class HierarchicalAutoencoder(nn.Module):
-    """
-    Encapsulates a stack of ByteSegmentCompressors and CodeExpanders
-    for hierarchical compression and decompression of byte sequences.
-    (Refer to previous detailed docstring for more on attributes and general purpose)
+    """Multi-level autoencoder built from compressors and expanders.
+
+    The model compresses a byte sequence through a stack of
+    :class:`ByteSegmentCompressor` modules, producing progressively shorter
+    sequences of discrete codes.  During decoding the codes are fed through the
+    corresponding :class:`CodeExpander` modules in reverse order to reconstruct
+    the original bytes.  Optionally a :class:`CodeSequenceTransformer` can model
+    the highest-level codes.
+
+    Args:
+        num_levels: Number of compression/expansion levels.
+        compressor_level_configs: Configuration dictionary for each
+            ``ByteSegmentCompressor``.
+        initial_vocab_size: Vocabulary size of the raw byte tokens.
+        expander_dim_scale: Multiplier applied to compressor dims when creating
+            expanders.
+        expander_num_enc_layers: Number of layers in each expander encoder.
+        expander_num_dec_layers: Number of layers in each expander decoder.
+        expander_heads_scale: Multiplier for attention heads in expanders.
+        expander_dropout: Dropout rate used by expanders.
+        expander_eos_id: Token used as EOS/BOS for expanders.
+        expander_max_len: Maximum length an expander may generate.
+        propagate_key_padding_mask: Whether to propagate padding masks between
+            levels.
+        aux_lm_loss_weight: Weight of auxiliary language-modeling losses on
+            compressor inputs.
+        top_transformer_config: Optional configuration for a
+            ``CodeSequenceTransformer`` over the top-level codes.
+        top_lm_loss_weight: Weight for the top-level language-modeling loss.
     """
 
     def __init__(self,
@@ -127,10 +152,26 @@ class HierarchicalAutoencoder(nn.Module):
     def compress(self, tokens: torch.Tensor,
                  key_padding_mask: Optional[torch.Tensor] = None
                  ) -> Dict[str, Any]:
-        """
-        Applies the full stack of compressors.
-        (Refer to previous detailed docstring for args and returns description)
-        Key change: 'all_valid_masks' stores masks that can be used to reconstruct KPMs.
+        """Run all compressors on an input sequence.
+
+        Args:
+            tokens: Tensor of raw byte tokens ``(B, S)``.
+            key_padding_mask: Optional boolean mask ``(B, S)`` where ``True``
+                marks padded positions.
+
+        Returns:
+            Dictionary with keys:
+                ``'top_codes'`` – output of the last compressor;
+                ``'all_codes'`` – list of code tensors from each level;
+                ``'all_continuous'`` – list of continuous embeddings before
+                quantization;
+                ``'vq_loss'`` – accumulated vector‑quantization loss;
+                ``'final_key_padding_mask'`` – padding mask for ``top_codes``;
+                ``'compression_ratios'`` – ratio of output length to input length
+                for each level;
+                ``'all_compressor_level_valid_masks'`` – masks identifying valid
+                segments at each level;
+                plus auxiliary statistics used for language‑modeling losses.
         """
         all_codes_list: List[torch.Tensor] = []
         all_continuous_list: List[torch.Tensor] = []
@@ -230,10 +271,23 @@ class HierarchicalAutoencoder(nn.Module):
                    target_key_padding_masks: Optional[List[Optional[torch.Tensor]]] = None,
                    max_len_override: Optional[int] = None
                    ) -> Dict[str, Any]:
-        """
-        Applies the full stack of expanders.
-        (Refer to previous detailed docstring for args and returns description)
-        Key change: Passes KPMs to CodeExpander.
+        """Decode a sequence of top-level codes back to bytes.
+
+        Args:
+            top_codes: Codes produced by the highest compressor ``(B, S_top)``.
+            top_codes_key_padding_mask: Optional mask for ``top_codes``.
+            targets_for_teacher_forcing: When provided, a list of target
+                sequences for each level used during teacher forcing.
+            target_key_padding_masks: Padding masks corresponding to
+                ``targets_for_teacher_forcing``.
+            max_len_override: Optional length limit used when generating
+                autoregressively.
+
+        Returns:
+            If ``targets_for_teacher_forcing`` is given, returns a dictionary
+            ``{'all_logits': [...], 'final_reconstructed_logits': tensor}``.
+            Otherwise returns ``{'generated_sequences': [...],
+            'final_reconstructed_tokens': tensor}``.
         """
         current_input_codes_hi = top_codes
         # This is the KPM for the input to the current expander (codes_hi)
@@ -293,11 +347,19 @@ class HierarchicalAutoencoder(nn.Module):
     def forward(self, tokens: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None
                 ) -> Dict[str, Any]:
-        """
-        Full forward pass for training: compresses, then decompresses with teacher forcing.
-        Calculates VQ loss and hierarchical reconstruction losses.
-        (Refer to previous detailed docstring for args and returns description)
-        Key change: Uses manual loss masking for reconstruction loss if KPMs for targets are available.
+        """Training forward pass combining compression and reconstruction.
+
+        The input tokens are compressed level by level and then decoded back
+        using teacher forcing.  Losses from vector quantization, reconstruction
+        and optional language-modeling objectives are aggregated and returned.
+
+        Args:
+            tokens: Batch of byte tokens ``(B, S)``.
+            key_padding_mask: Optional padding mask for ``tokens``.
+
+        Returns:
+            Dictionary containing the total loss and detailed statistics for
+            each loss term, along with compression metrics.
         """
         # 1. Compress
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
@@ -533,9 +595,16 @@ class HierarchicalAutoencoder(nn.Module):
                        tokens: torch.Tensor,
                        key_padding_mask: Optional[torch.Tensor] = None,
                        max_len_override: Optional[int] = None) -> torch.Tensor:
-        """
-        End-to-end compression and autoregressive decompression to reconstruct bytes.
-        (Refer to previous detailed docstring for args and returns description)
+        """Compress ``tokens`` and decode them autoregressively.
+
+        Args:
+            tokens: Input byte tokens ``(B, S)``.
+            key_padding_mask: Optional mask marking padded positions.
+            max_len_override: Optional maximum length for generation.
+
+        Returns:
+            Tensor containing the reconstructed byte sequences from the final
+            expander.
         """
         self.eval()
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
