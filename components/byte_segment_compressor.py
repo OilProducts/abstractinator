@@ -13,7 +13,7 @@ class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
 
-    It first encodes the tokens using a `DeeperSlidingWindowEncoder`. Then, it
+    It first encodes the tokens using a `StackedSlidingWindowEncoder`. Then, it
     segments the encoded sequence based on token entropy. For each segment,
     a fixed number (`num_queries`) of learned query vectors are used to pool
     features from the segment via `LearnedQueryAttention`. Finally, these
@@ -49,7 +49,7 @@ class ByteSegmentCompressor(nn.Module):
         self.num_queries_per_segment = num_queries # Store L for convenience
 
         # Initialize the token encoder
-        # (Assuming DeeperSlidingWindowEncoder is defined elsewhere)
+        # Uses StackedSlidingWindowEncoder for token encoding
         self.encoder = StackedSlidingWindowEncoder(
             vocab_size=vocab_size,
             dim=dim,
@@ -89,7 +89,7 @@ class ByteSegmentCompressor(nn.Module):
                 where `True` indicates a padded token.
                 Shape: (batch_size, sequence_length).
                 Note: This mask is passed to the pooler. Its usage by the encoder
-                depends on the DeeperSlidingWindowEncoder implementation.
+                depends on the StackedSlidingWindowEncoder implementation.
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing:
