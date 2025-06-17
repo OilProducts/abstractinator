@@ -107,7 +107,22 @@ if resume_path:
 
 # --- Tokenizer ---
 class ByteLevelTokenizer:
-    """Minimal Byte-level tokenizer (details in previous review)."""
+    """Simple byte-level tokenizer used for the demo training script.
+
+    The tokenizer works directly on raw UTF-8 bytes.  Optionally BOS and EOS
+    tokens are inserted when encoding text.  It keeps byte values (0‑255) as
+    their own token IDs and reserves additional IDs for BOS, EOS and padding.
+
+    Attributes:
+        bos_id (int): Token ID prepended at the start of a sequence when
+            ``add_bos`` is ``True``.
+        eos_id (int): Token ID appended at the end of a sequence when
+            ``add_eos`` is ``True``.
+        pad_id (int): Token ID used for padding sequences.
+        add_bos (bool): Whether ``encode`` adds ``bos_id`` by default.
+        add_eos (bool): Whether ``encode`` adds ``eos_id`` by default.
+        vocab_size (int): Size of the tokenizer vocabulary.
+    """
 
     def __init__(self, bos_id: int = 256, eos_id: int = 257, pad_id: int = 258,
                  add_bos: bool = True, add_eos: bool = True):

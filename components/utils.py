@@ -135,9 +135,28 @@ def build_segment_queries_mask(
     query_embed: torch.Tensor,     # [L, D]            – learned query template
     num_heads: int                 # number of attention heads
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Same contract as before, but **without any .item() calls** so it can live
-    inside `torch.compile` / FX graphs without forcing a graph break.
+    """Construct segment-aware queries and attention masks.
+
+    This helper expands a set of ``L`` learned query vectors for every possible
+    segment in ``seg_id`` and builds an attention mask that restricts each query
+    to attend only to its corresponding segment.  All computations use symbolic
+    ``torch`` shapes so the function is compatible with ``torch.compile``.
+
+    Args:
+        seg_id: Integer tensor of shape ``(B, S_original)`` mapping each token
+            to a segment index.
+        query_embed: Base query tensor of shape ``(L, D)``.
+        num_heads: Number of attention heads used by the pooler.
+
+    Returns:
+        Tuple containing:
+            - ``queries``: Tiled queries of shape ``(B, S_hat * L, D)`` where
+              ``S_hat`` is the maximum number of segments in the batch.
+            - ``att_mask``: Boolean mask of shape
+              ``(B * num_heads, S_hat * L, S_original)`` where ``True`` blocks
+              attention outside a query's segment.
+            - ``valid_segments``: Boolean tensor of shape ``(B, S_hat)`` marking
+              which segment slots are real for each item in the batch.
     """
     B, S_original = seg_id.shape          # SymInts
     L, D          = query_embed.shape
