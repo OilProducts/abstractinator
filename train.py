@@ -3,7 +3,6 @@ import math
 import sys
 import time
 from collections import defaultdict
-from itertools import batched
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
