@@ -16,7 +16,7 @@ Run the training loop:
 python train.py
 ```
 
-All experiment settings live in the `exp_config` dictionary within `config.py`.  Edit values there to change model size, dataset selection and training options.
+All experiment settings live in the `exp_config` dictionary within `config.py`.  Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
 
 Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps.  To resume training, set `exp_config['resume_from_checkpoint']` to the path of a saved checkpoint.
 
