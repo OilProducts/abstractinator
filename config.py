@@ -49,6 +49,7 @@ exp_config = {
     "batch_size": 4,
     "sequence_length": 1024,
     "num_epochs": 10,
+    "max_steps": None,
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
     "gradient_accumulation_steps": 32,
