@@ -288,9 +288,14 @@ print(f"DataLoader created with {N_CPU} workers.")
 # --- Scheduler Setup --- # <<< ADDED SECTION
 # Calculate the total number of training (optimizer) steps
 num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config["gradient_accumulation_steps"])
-exp_config["num_training_steps"] = exp_config["num_epochs"] * num_update_steps_per_epoch
+if exp_config.get("max_steps") is not None:
+    exp_config["num_training_steps"] = int(exp_config["max_steps"])
+else:
+    exp_config["num_training_steps"] = exp_config["num_epochs"] * num_update_steps_per_epoch
 
-print(f"Creating learning rate scheduler: {exp_config['scheduler_type']} with {exp_config['warmup_steps']} warmup steps.")
+print(
+    f"Creating learning rate scheduler: {exp_config['scheduler_type']} with {exp_config['warmup_steps']} warmup steps and {exp_config['num_training_steps']} total steps."
+)
 lr_scheduler = get_scheduler(
     name=exp_config['scheduler_type'],
     optimizer=optimizer,
@@ -560,9 +565,15 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
             if global_step > 0 and global_step % exp_config["checkpoint_interval"] == 0:
                 save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
             global_step += 1
+            if exp_config.get("max_steps") is not None and global_step >= exp_config["max_steps"]:
+                print(f"Reached max_steps {exp_config['max_steps']}. Stopping training.")
+                break
     epoch_duration = time.time() - epoch_start_time
     print(f"--- Epoch {epoch + 1} finished. Duration: {epoch_duration:.2f}s ---") # MODIFIED: Epoch end print
     save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
+
+    if exp_config.get("max_steps") is not None and global_step >= exp_config["max_steps"]:
+        break
 
 print("Training finished.")
 
