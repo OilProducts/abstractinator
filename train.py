@@ -15,28 +15,12 @@ import aim  # Assuming 'aim' is installed and accessible
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
+from components.utils import short_num
 from config import DEVICE, N_CPU, exp_config
 
 torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
 torch.set_printoptions(threshold=100_000)
-
-def short_num(n):
-    n = float(n)
-    millnames = ['', 'k', 'm', 'b', 't', 'q']
-
-    if n == 0:
-        return '0'
-    millidx = max(0, min(len(millnames) - 1,
-                         int(math.floor(math.log10(abs(n)) / 3))))
-    scaled = n / 10 ** (3 * millidx)
-    if scaled < 10:
-        formatted = f"{scaled:.2f}"
-    elif scaled < 100:
-        formatted = f"{scaled:.1f}"
-    else:
-        formatted = f"{scaled:.0f}"
-    return f"{formatted}{millnames[millidx]}"
 
 
 print(f"Using device: {DEVICE}")
