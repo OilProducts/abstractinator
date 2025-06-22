@@ -39,10 +39,8 @@ class ByteSegmentCompressor(nn.Module):
                  window: int = 128, # Window size for encoder
                  num_encoder_layers: int = 3,
                  encoder_ffn_dim_multiplier: int = 4,
-                 encoder_dropout: float = 0.1,
                  max_seq_len_encoder: int = 4096, # Max sequence length for encoder's PE
                  num_queries: int = 1, # L: Number of queries per segment for the pooler
-                 pooler_dropout: float = 0.1, # Dropout for the LearnedQueryAttention pooler
                  codebook_size: int = 512,    # K: Number of codes in VQ codebook
                  beta: float = 0.25):          # Beta for VQ commitment loss
         super().__init__()
@@ -57,7 +55,6 @@ class ByteSegmentCompressor(nn.Module):
             window_size=window,
             num_layers=num_encoder_layers,
             ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-            dropout=encoder_dropout,
             max_seq_len=max_seq_len_encoder
         )
 
@@ -65,8 +62,7 @@ class ByteSegmentCompressor(nn.Module):
         self.pooler = LearnedQueryAttention(
             embed_dim=dim,
             num_queries_per_segment=num_queries,
-            num_heads=heads,
-            dropout=pooler_dropout # Pass the specific dropout for the pooler
+            num_heads=heads
         )
 
         # Initialize the Vector Quantizer

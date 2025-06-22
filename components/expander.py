@@ -47,7 +47,6 @@ class CodeExpander(nn.Module):
                  N_enc: int = 4,       # Number of encoder layers
                  N_dec: int = 4,       # Number of decoder layers
                  H: int = 8,           # Number of attention heads
-                 dropout: float = 0.1,
                  eos_id: int = 1,      # EOS token ID. Also used as BOS.
                                        # (Reserve 0 for PAD if planning to add padding handling)
                  max_len: int = 2048): # Max generation length for low-level codes
@@ -65,12 +64,8 @@ class CodeExpander(nn.Module):
         # Standard Transformer layers with batch_first=True.
         # These use Post-LayerNorm by default (norm_first=False).
         # Feed-forward network dimension is set to 4*D.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=D, nhead=H, dim_feedforward=4*D, dropout=dropout, batch_first=True
-        )
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=D, nhead=H, dim_feedforward=4*D, dropout=dropout, batch_first=True
-        )
+        encoder_layer = nn.TransformerEncoderLayer(D, H, 4*D, 0.0, batch_first=True)
+        decoder_layer = nn.TransformerDecoderLayer(D, H, 4*D, 0.0, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=N_enc)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=N_dec)
 

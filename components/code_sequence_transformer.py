@@ -16,7 +16,6 @@ class CodeSequenceTransformer(nn.Module):
                  num_layers: int,  # Number of Transformer encoder layers
                  num_heads: int,  # Number of attention heads
                  ffn_dim_multiplier: int = 4,  # Multiplier for FFN hidden dimension
-                 dropout: float = 0.1,
                  max_seq_len: int = 2048,  # Max sequence length for positional encoding
                  output_lm_logits: bool = True  # If True, adds an LM head to predict next code
                  ):
@@ -28,15 +27,14 @@ class CodeSequenceTransformer(nn.Module):
         self.token_embedding = nn.Embedding(code_vocab_size, dim)
         # Using nn.Parameter for learned positional encoding, could also use sinusoidal
         self.positional_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
-        self.embed_dropout = nn.Dropout(dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=num_heads,
-            dim_feedforward=dim * ffn_dim_multiplier,
-            dropout=dropout,
+            dim,
+            num_heads,
+            dim * ffn_dim_multiplier,
+            0.0,
             batch_first=True,
-            norm_first=True  # Using Pre-LN for potentially better stability
+            norm_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
@@ -72,7 +70,6 @@ class CodeSequenceTransformer(nn.Module):
 
         x = self.token_embedding(input_codes)  # (B, S, D)
         x = x + self.positional_encoding[:, :S, :]  # Add positional encoding
-        x = self.embed_dropout(x)
 
         # `key_padding_mask` should be True where tokens are padding.
         # `nn.TransformerEncoder` expects src_key_padding_mask.

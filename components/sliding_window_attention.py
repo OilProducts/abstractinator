@@ -21,7 +21,6 @@ class LocalSlidingWindowAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         window_size: int,
-        dropout: float = 0.0,
         bias: bool = True,
     ):
         super().__init__()
@@ -38,8 +37,6 @@ class LocalSlidingWindowAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.o_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        # dropout on the *output* (FlexAttention has no attn‑prob dropout arg)
-        self.out_dropout = nn.Dropout(dropout)
 
     # ------------------------------------------------------------------ #
     # helper: memo‑cached BlockMask builder
@@ -126,11 +123,10 @@ class SlidingWindowAttention(nn.Module):
         k_proj (nn.Linear): Linear projection for keys.
         v_proj (nn.Linear): Linear projection for values.
         out_proj (nn.Linear): Final linear projection for the output.
-        dropout (nn.Dropout): Dropout layer applied to attention probabilities.
     """
 
     def __init__(self, embed_dim: int, num_heads: int, window_size: int,
-                 dropout: float = 0.0, bias: bool = True) -> None:
+                 bias: bool = True) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError(
@@ -145,7 +141,6 @@ class SlidingWindowAttention(nn.Module):
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.dropout = nn.Dropout(dropout)
 
     def _sliding_window_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
@@ -251,7 +246,6 @@ class SlidingWindowAttention(nn.Module):
 
         # Compute attention probabilities
         attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
 
         # Compute weighted sum of values
         # (B, H, S, S) @ (B, H, S, d_h) -> (B, H, S, d_h)
@@ -272,19 +266,17 @@ class SlidingWindowTransformerBlock(nn.Module):
     The block consists of two main sub-layers:
     1. Multi-Head Self-Attention (SlidingWindowAttention) with Pre-LayerNorm.
     2. Feed-Forward Network (FFN) with Pre-LayerNorm.
-    Residual connections and dropout are applied after each sub-layer.
+    Residual connections are applied after each sub-layer.
 
     Attributes:
         norm1 (nn.LayerNorm): Layer normalization before the attention layer.
         attn (SlidingWindowAttention): The sliding window self-attention mechanism.
-        dropout1 (nn.Dropout): Dropout applied after the attention layer's output.
         norm2 (nn.LayerNorm): Layer normalization before the FFN.
         ffn (nn.Sequential): The feed-forward network.
-        dropout2 (nn.Dropout): Dropout applied after the FFN's output.
     """
 
     def __init__(self, dim: int, num_heads: int, window_size: int,
-                 ffn_dim_multiplier: int = 4, dropout: float = 0.1):
+                 ffn_dim_multiplier: int = 4):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
         self.norm1 = nn.LayerNorm(dim)
@@ -292,20 +284,16 @@ class SlidingWindowTransformerBlock(nn.Module):
             embed_dim=dim,
             num_heads=num_heads,
             window_size=window_size,
-            dropout=dropout  # Pass attention-specific dropout here
         )
-        self.dropout1 = nn.Dropout(dropout) # Dropout for the residual connection
 
         # Second sub-block: Feed-Forward Network
         self.norm2 = nn.LayerNorm(dim)
         ffn_hidden_dim = dim * ffn_dim_multiplier
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_hidden_dim),
-            nn.GELU(), # GELU activation function
-            nn.Dropout(dropout),  # Dropout within the FFN, applied after activation
+            nn.GELU(),
             nn.Linear(ffn_hidden_dim, dim)
         )
-        self.dropout2 = nn.Dropout(dropout) # Dropout for the residual connection
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -326,20 +314,14 @@ class SlidingWindowTransformerBlock(nn.Module):
         # Attention sub-layer (Pre-LN)
         # x_norm1 = self.norm1(x) # Normalize input
         # attn_output = self.attn(x_norm1, key_padding_mask=key_padding_mask) # Apply attention
-        # x = x + self.dropout1(attn_output) # Add residual and apply dropout
-
-        # Corrected Pre-LN application: Normalize before passing to attention
         attn_output = self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
-        x = x + self.dropout1(attn_output) # Add residual and apply dropout
+        x = x + attn_output
 
         # Feed-forward sub-layer (Pre-LN)
         # x_norm2 = self.norm2(x) # Normalize input to FFN
         # ffn_output = self.ffn(x_norm2) # Apply FFN
-        # x = x + self.dropout2(ffn_output) # Add residual and apply dropout
-
-        # Corrected Pre-LN application: Normalize before passing to FFN
         ffn_output = self.ffn(self.norm2(x))
-        x = x + self.dropout2(ffn_output) # Add residual and apply dropout
+        x = x + ffn_output
 
         return x
 
@@ -354,29 +336,26 @@ class StackedSlidingWindowEncoder(nn.Module):
     Attributes:
         embedding (nn.Embedding): Token embedding layer.
         pos_encoding (nn.Parameter): Learned absolute positional encoding.
-        embed_dropout (nn.Dropout): Dropout applied after summing token and positional embeddings.
         layers (nn.ModuleList): List of SlidingWindowTransformerBlock layers.
         final_norm (nn.LayerNorm): Layer normalization applied to the output of the
                                    last Transformer block before logit projection.
         logit_proj (nn.Linear): Linear layer to project Transformer output to vocabulary logits.
     """
     def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
-                 num_layers: int, ffn_dim_multiplier: int = 4, dropout: float = 0.1,
+                 num_layers: int, ffn_dim_multiplier: int = 4,
                  max_seq_len: int = 4096):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, dim)
         # Learned absolute positional encodings
         # Initialized with small random values to break symmetry
         self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
-        self.embed_dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
             SlidingWindowTransformerBlock(
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
-                ffn_dim_multiplier=ffn_dim_multiplier,
-                dropout=dropout
+                ffn_dim_multiplier=ffn_dim_multiplier
             ) for _ in range(num_layers)
         ])
 
@@ -417,8 +396,6 @@ class StackedSlidingWindowEncoder(nn.Module):
             )
         # Add positional encodings (sliced to current sequence length)
         x = x + self.pos_encoding[:, :S, :]
-
-        x = self.embed_dropout(x)
 
         # 3. Pass through Transformer Layers
         for layer in self.layers:
