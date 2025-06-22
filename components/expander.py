@@ -62,7 +62,7 @@ class CodeExpander(nn.Module):
 
         # --- Transformer Encoder & Decoder Stacks ---
         # Standard Transformer layers with batch_first=True.
-        # These use Post-LayerNorm by default (norm_first=False).
+        # These use Post-RMSNorm style (norm_first=False).
         # Feed-forward network dimension is set to 4*D.
         encoder_layer = nn.TransformerEncoderLayer(D, H, 4*D, 0.0, batch_first=True)
         decoder_layer = nn.TransformerDecoderLayer(D, H, 4*D, 0.0, batch_first=True)
