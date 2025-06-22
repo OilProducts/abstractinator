@@ -2,3 +2,4 @@ torch
 datasets
 aim
 transformers
+lm-eval
