@@ -264,14 +264,14 @@ class SlidingWindowTransformerBlock(nn.Module):
     A single Transformer block using SlidingWindowAttention (Pre-LN variant).
 
     The block consists of two main sub-layers:
-    1. Multi-Head Self-Attention (SlidingWindowAttention) with Pre-LayerNorm.
-    2. Feed-Forward Network (FFN) with Pre-LayerNorm.
+    1. Multi-Head Self-Attention (SlidingWindowAttention) with Pre-RMSNorm.
+    2. Feed-Forward Network (FFN) with Pre-RMSNorm.
     Residual connections are applied after each sub-layer.
 
     Attributes:
-        norm1 (nn.LayerNorm): Layer normalization before the attention layer.
+        norm1 (nn.RMSNorm): RMS normalization before the attention layer.
         attn (SlidingWindowAttention): The sliding window self-attention mechanism.
-        norm2 (nn.LayerNorm): Layer normalization before the FFN.
+        norm2 (nn.RMSNorm): RMS normalization before the FFN.
         ffn (nn.Sequential): The feed-forward network.
     """
 
@@ -279,7 +279,7 @@ class SlidingWindowTransformerBlock(nn.Module):
                  ffn_dim_multiplier: int = 4):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = nn.RMSNorm(dim)
         self.attn = LocalSlidingWindowAttention(
             embed_dim=dim,
             num_heads=num_heads,
@@ -287,7 +287,7 @@ class SlidingWindowTransformerBlock(nn.Module):
         )
 
         # Second sub-block: Feed-Forward Network
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
         ffn_hidden_dim = dim * ffn_dim_multiplier
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_hidden_dim),
@@ -331,14 +331,14 @@ class StackedSlidingWindowEncoder(nn.Module):
     A Transformer-style encoder composed of a stack of SlidingWindowTransformerBlock layers.
 
     It includes token embeddings, learned positional encodings, the stacked
-    Transformer blocks, a final layer normalization, and a projection to logits.
+    Transformer blocks, a final RMS normalization, and a projection to logits.
 
     Attributes:
         embedding (nn.Embedding): Token embedding layer.
         pos_encoding (nn.Parameter): Learned absolute positional encoding.
         layers (nn.ModuleList): List of SlidingWindowTransformerBlock layers.
-        final_norm (nn.LayerNorm): Layer normalization applied to the output of the
-                                   last Transformer block before logit projection.
+        final_norm (nn.RMSNorm): RMS normalization applied to the output of the
+                                 last Transformer block before logit projection.
         logit_proj (nn.Linear): Linear layer to project Transformer output to vocabulary logits.
     """
     def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
@@ -359,7 +359,7 @@ class StackedSlidingWindowEncoder(nn.Module):
             ) for _ in range(num_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(dim) # Normalization before output projection
+        self.final_norm = nn.RMSNorm(dim) # Normalization before output projection
         self.logit_proj = nn.Linear(dim, vocab_size) # Projects to vocabulary size
 
     def forward(self, token_ids: torch.Tensor,
