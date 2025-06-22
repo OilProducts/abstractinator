@@ -80,7 +80,6 @@ class HierarchicalAutoencoder(nn.Module):
                 dim=config['dim'], heads=config['heads'], window=config['window'],
                 num_encoder_layers=config.get('num_encoder_layers', 3),
                 encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4),
-                max_seq_len_encoder=config.get('max_seq_len_encoder', 4096),
                 num_queries=config['num_queries'],
                 codebook_size=config['codebook_size'], beta=config['beta']
             )
@@ -118,7 +117,6 @@ class HierarchicalAutoencoder(nn.Module):
                 num_layers=self.top_transformer_config.get('num_layers', 4),
                 num_heads=self.top_transformer_config.get('num_heads', 8),
                 ffn_dim_multiplier=self.top_transformer_config.get('ffn_dim_multiplier', 4),
-                max_seq_len=self.top_transformer_config.get('max_seq_len', 2048),
                 output_lm_logits=self.top_transformer_config.get('output_lm_logits', True)
             )
             print(

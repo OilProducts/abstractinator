@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
+from .expander import EncoderBlock
 
 @torch.compile
 class CodeSequenceTransformer(nn.Module):
@@ -16,7 +16,6 @@ class CodeSequenceTransformer(nn.Module):
                  num_layers: int,  # Number of Transformer encoder layers
                  num_heads: int,  # Number of attention heads
                  ffn_dim_multiplier: int = 4,  # Multiplier for FFN hidden dimension
-                 max_seq_len: int = 2048,  # Max sequence length for positional encoding
                  output_lm_logits: bool = True  # If True, adds an LM head to predict next code
                  ):
         super().__init__()
@@ -25,22 +24,11 @@ class CodeSequenceTransformer(nn.Module):
         self.output_lm_logits = output_lm_logits
 
         self.token_embedding = nn.Embedding(code_vocab_size, dim)
-        # Using nn.Parameter for learned positional encoding, could also use sinusoidal
-        self.positional_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            dim,
-            num_heads,
-            dim * ffn_dim_multiplier,
-            0.0,
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            norm=nn.RMSNorm(dim)  # Final norm after all layers
-        )
+        self.encoder = nn.ModuleList([
+            EncoderBlock(dim, num_heads, dim * ffn_dim_multiplier)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.RMSNorm(dim)
 
         if self.output_lm_logits:
             self.lm_head = nn.Linear(dim, code_vocab_size)  # Projects to code vocabulary
@@ -62,18 +50,11 @@ class CodeSequenceTransformer(nn.Module):
                         Shape: (batch_size, sequence_length, code_vocab_size).
         """
         B, S = input_codes.shape
-        if S > self.positional_encoding.size(1):
-            raise ValueError(
-                f"Input sequence length ({S}) exceeds CodeSequenceTransformer's max_seq_len "
-                f"for positional encoding ({self.positional_encoding.size(1)})."
-            )
 
         x = self.token_embedding(input_codes)  # (B, S, D)
-        x = x + self.positional_encoding[:, :S, :]  # Add positional encoding
-
-        # `key_padding_mask` should be True where tokens are padding.
-        # `nn.TransformerEncoder` expects src_key_padding_mask.
-        hidden_states = self.transformer_encoder(x, src_key_padding_mask=key_padding_mask)
+        for layer in self.encoder:
+            x = layer(x, key_padding_mask=key_padding_mask)
+        hidden_states = self.final_norm(x)
 
         output_dict = {'hidden_states': hidden_states}
 
