@@ -39,7 +39,6 @@ class ByteSegmentCompressor(nn.Module):
                  window: int = 128, # Window size for encoder
                  num_encoder_layers: int = 3,
                  encoder_ffn_dim_multiplier: int = 4,
-                 max_seq_len_encoder: int = 4096, # Max sequence length for encoder's PE
                  num_queries: int = 1, # L: Number of queries per segment for the pooler
                  codebook_size: int = 512,    # K: Number of codes in VQ codebook
                  beta: float = 0.25):          # Beta for VQ commitment loss
@@ -54,8 +53,7 @@ class ByteSegmentCompressor(nn.Module):
             num_heads=heads,
             window_size=window,
             num_layers=num_encoder_layers,
-            ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-            max_seq_len=max_seq_len_encoder
+            ffn_dim_multiplier=encoder_ffn_dim_multiplier
         )
 
         # Initialize the attention pooler that uses learned queries per segment
