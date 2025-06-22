@@ -174,3 +174,4 @@ class LearnedQueryAttention(nn.Module):
         # Return final output and mean attention weights for logging/inspection
         # Mean over heads: (B, H, Q_tot, S) -> (B, Q_tot, S)
         return attn_output, attn_weights.mean(dim=1)
+
