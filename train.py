@@ -46,7 +46,6 @@ model = HierarchicalAutoencoder(
     expander_num_enc_layers=exp_config["expander_num_enc_layers"],
     expander_num_dec_layers=exp_config["expander_num_dec_layers"],
     expander_heads_scale=exp_config["expander_heads_scale"],
-    expander_dropout=exp_config["expander_dropout"],
     expander_eos_id=exp_config["expander_eos_id"],
     expander_max_len=exp_config["expander_max_len"],  # Pass expander_max_len
     propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],

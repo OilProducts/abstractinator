@@ -27,7 +27,6 @@ class HierarchicalAutoencoder(nn.Module):
         expander_num_enc_layers: Number of layers in each expander encoder.
         expander_num_dec_layers: Number of layers in each expander decoder.
         expander_heads_scale: Multiplier for attention heads in expanders.
-        expander_dropout: Dropout rate used by expanders.
         expander_eos_id: Token used as EOS/BOS for expanders.
         expander_max_len: Maximum length an expander may generate.
         propagate_key_padding_mask: Whether to propagate padding masks between
@@ -47,7 +46,6 @@ class HierarchicalAutoencoder(nn.Module):
                  expander_num_enc_layers: int = 4,
                  expander_num_dec_layers: int = 4,
                  expander_heads_scale: float = 1.0,
-                 expander_dropout: float = 0.1,
                  expander_eos_id: int = 1,
                  expander_max_len: int = 2048,
                  propagate_key_padding_mask: bool = True,
@@ -82,10 +80,8 @@ class HierarchicalAutoencoder(nn.Module):
                 dim=config['dim'], heads=config['heads'], window=config['window'],
                 num_encoder_layers=config.get('num_encoder_layers', 3),
                 encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4),
-                encoder_dropout=config.get('encoder_dropout', 0.1),
                 max_seq_len_encoder=config.get('max_seq_len_encoder', 4096),
                 num_queries=config['num_queries'],
-                pooler_dropout=config.get('pooler_dropout', 0.1),
                 codebook_size=config['codebook_size'], beta=config['beta']
             )
             self.compressors.append(compressor)
@@ -122,7 +118,6 @@ class HierarchicalAutoencoder(nn.Module):
                 num_layers=self.top_transformer_config.get('num_layers', 4),
                 num_heads=self.top_transformer_config.get('num_heads', 8),
                 ffn_dim_multiplier=self.top_transformer_config.get('ffn_dim_multiplier', 4),
-                dropout=self.top_transformer_config.get('dropout', 0.1),
                 max_seq_len=self.top_transformer_config.get('max_seq_len', 2048),
                 output_lm_logits=self.top_transformer_config.get('output_lm_logits', True)
             )
@@ -144,7 +139,7 @@ class HierarchicalAutoencoder(nn.Module):
             expander = CodeExpander(  # Using updated CodeExpander
                 K_hi=k_hi, K_lo=k_lo, D=exp_dim,
                 N_enc=expander_num_enc_layers, N_dec=expander_num_dec_layers,
-                H=exp_heads, dropout=expander_dropout,
+                H=exp_heads,
                 eos_id=expander_eos_id, max_len=expander_max_len
             )
             self.expanders.append(expander)
