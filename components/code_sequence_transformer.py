@@ -39,7 +39,7 @@ class CodeSequenceTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
-            norm=nn.LayerNorm(dim)  # Final norm after all layers
+            norm=nn.RMSNorm(dim)  # Final norm after all layers
         )
 
         if self.output_lm_logits:

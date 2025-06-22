@@ -17,7 +17,7 @@ class LearnedQueryAttention(nn.Module):
     segment) to construct the actual `queries` tensor passed to the `forward` method.
 
     The module handles attention masking (both a generic attention mask and a key
-    padding mask) and applies layer normalization to the input `x` (keys/values)
+    padding mask) and applies RMS normalization to the input `x` (keys/values)
     and to the output of the attention mechanism before a final projection.
 
     Attributes:
@@ -26,8 +26,8 @@ class LearnedQueryAttention(nn.Module):
         head_dim (int): The dimension of each attention head (embed_dim // num_heads).
         L (int): The number of unique learned query vectors in `query_template`.
                  This is set by `num_queries_per_segment` in the constructor.
-        in_norm (nn.LayerNorm): Layer normalization applied to the input `x`.
-        out_norm (nn.LayerNorm): Layer normalization applied to the attention output
+        in_norm (nn.RMSNorm): RMS normalization applied to the input `x`.
+        out_norm (nn.RMSNorm): RMS normalization applied to the attention output
                                  before the final projection.
         query_template (nn.Parameter): A learnable tensor of shape (L, D). This serves
                                       as a template for generating the actual queries
@@ -52,8 +52,8 @@ class LearnedQueryAttention(nn.Module):
         # L: Number of distinct learned query vectors in the template
         self.L = num_queries_per_segment
 
-        self.in_norm = nn.LayerNorm(embed_dim)
-        self.out_norm = nn.LayerNorm(embed_dim)
+        self.in_norm = nn.RMSNorm(embed_dim)
+        self.out_norm = nn.RMSNorm(embed_dim)
 
         # Learned query template – (L, D).
         # This template is intended to be used by the caller to construct the
