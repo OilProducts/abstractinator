@@ -29,3 +29,22 @@ Key modules under `components/` include:
 - `HierarchicalAutoencoder` – stacks compressors and expanders for end-to-end compression.
 
 See `notes.md` for additional design thoughts.
+
+## Evaluation
+
+Run a suite of standard LLM benchmarks using the evaluation harness:
+
+```bash
+python evaluate.py --model hf --model_args pretrained=facebook/opt-1.3b use_accelerate=True
+```
+
+By default this evaluates on tasks like `lambada_openai`, `hellaswag` and
+`arc_easy`.  Additional tasks or model arguments can be specified via command
+line flags.
+
+To test a model you've trained with `train.py`, point the harness at the saved
+checkpoint using the `hier_ae` model type:
+
+```bash
+python evaluate.py --model hier_ae --model_args checkpoint=./checkpoints/checkpoint_step1000.pt
+```
