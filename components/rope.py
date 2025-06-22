@@ -2,13 +2,11 @@ import torch
 from typing import Dict
 
 class RotaryCache:
-    """Lazy global cache keyed by (max_seq_len, dim, device, dtype)."""
-
-    _store: Dict[tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    _store: dict[tuple[int, int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
-    def get(max_seq: int, dim: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (max_seq, dim, device.index if device.type == "cuda" else -1, torch.dtype(dtype).value)
+    def get(max_seq, dim, device, dtype):
+        key = (max_seq, dim, device, dtype)
         if key not in RotaryCache._store:
             inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
             t = torch.arange(max_seq, device=device, dtype=torch.float32)
@@ -17,6 +15,7 @@ class RotaryCache:
             sin = freqs.sin()[None, None, :, :].to(dtype)
             RotaryCache._store[key] = (cos, sin)
         return RotaryCache._store[key]
+
 
 
 def apply_rope(x: torch.Tensor, seq_pos: slice | None = None) -> torch.Tensor:
