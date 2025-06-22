@@ -5,6 +5,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,           # fused kernel
     create_block_mask         # helper to build sparse mask
 )
+from .rope import apply_rope
 from typing import Optional, Tuple
 
 @torch.compile
@@ -81,10 +82,12 @@ class LocalSlidingWindowAttention(nn.Module):
             raise ValueError("embed_dim mismatch")
 
         # project and reshape -------------------------------------------------
-        q = self.q_proj(x).view(B, S, H, d).transpose(1, 2)  # (B,H,S,d)
+        q = self.q_proj(x).view(B, S, H, d).transpose(1, 2)
         k = self.k_proj(x).view(B, S, H, d).transpose(1, 2)
         v = self.v_proj(x).view(B, S, H, d).transpose(1, 2)
-        q = q * (d ** -0.5)                                  # scale
+        q = apply_rope(q)
+        k = apply_rope(k)
+        q = q * (d ** -0.5)
 
         # block mask ----------------------------------------------------------
         block_mask = self._sliding_block(S, self.window, x.device)
@@ -209,8 +212,8 @@ class SlidingWindowAttention(nn.Module):
         q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Scale queries for scaled dot-product attention
+        q = apply_rope(q)
+        k = apply_rope(k)
         q = q * (self.head_dim ** -0.5)
 
         # Compute attention scores: (B, num_heads, S, S)
@@ -330,25 +333,20 @@ class StackedSlidingWindowEncoder(nn.Module):
     """
     A Transformer-style encoder composed of a stack of SlidingWindowTransformerBlock layers.
 
-    It includes token embeddings, learned positional encodings, the stacked
-    Transformer blocks, a final RMS normalization, and a projection to logits.
+    It includes token embeddings, stacked Transformer blocks with RoPE,
+    a final RMS normalization, and a projection to logits.
 
     Attributes:
         embedding (nn.Embedding): Token embedding layer.
-        pos_encoding (nn.Parameter): Learned absolute positional encoding.
         layers (nn.ModuleList): List of SlidingWindowTransformerBlock layers.
         final_norm (nn.RMSNorm): RMS normalization applied to the output of the
                                  last Transformer block before logit projection.
         logit_proj (nn.Linear): Linear layer to project Transformer output to vocabulary logits.
     """
     def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
-                 num_layers: int, ffn_dim_multiplier: int = 4,
-                 max_seq_len: int = 4096):
+                 num_layers: int, ffn_dim_multiplier: int = 4):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, dim)
-        # Learned absolute positional encodings
-        # Initialized with small random values to break symmetry
-        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
 
         self.layers = nn.ModuleList([
             SlidingWindowTransformerBlock(
@@ -387,15 +385,7 @@ class StackedSlidingWindowEncoder(nn.Module):
         # 1. Token Embeddings
         x = self.embedding(token_ids) # (B, S, D)
 
-        # 2. Add Positional Encodings
-        if S > self.pos_encoding.size(1):
-            raise ValueError(
-                f"Input sequence length ({S}) exceeds max_seq_len for positional "
-                f"encoding ({self.pos_encoding.size(1)}). "
-                f"Consider increasing `max_seq_len` or truncating input."
-            )
-        # Add positional encodings (sliced to current sequence length)
-        x = x + self.pos_encoding[:, :S, :]
+        # 2. (RoPE applied inside attention; no absolute positional encoding)
 
         # 3. Pass through Transformer Layers
         for layer in self.layers:
