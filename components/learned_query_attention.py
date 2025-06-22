@@ -36,13 +36,12 @@ class LearnedQueryAttention(nn.Module):
         k_proj (nn.Linear): Linear projection for keys.
         v_proj (nn.Linear): Linear projection for values.
         out_proj (nn.Linear): Final linear projection for the output.
-        dropout (nn.Dropout): Dropout layer applied to attention scores.
     """
     def __init__(self,
                  embed_dim: int,
                  num_queries_per_segment: int, # Defines the size L of query_template
                  num_heads: int,
-                 dropout: float = 0.0):
+                 ):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads for multi-head attention.")
@@ -69,7 +68,6 @@ class LearnedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
-        self.dropout = nn.Dropout(dropout)
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -117,8 +115,7 @@ class LearnedQueryAttention(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]:
             - attn_output (torch.Tensor): The output of the attention mechanism.
               Shape: (batch_size, total_num_queries, embed_dim).
-            - attn_weights (torch.Tensor): The attention weights, averaged over heads
-              (after softmax but before dropout).
+            - attn_weights (torch.Tensor): The attention weights, averaged over heads.
               Shape: (batch_size, total_num_queries, sequence_length_kv).
               Suitable for logging or analysis (consider detaching if not used for gradients).
         """
@@ -161,12 +158,11 @@ class LearnedQueryAttention(nn.Module):
 
         # Apply softmax with the combined mask
         # `safe_softmax` is assumed to handle masking by setting masked scores to -inf before softmax
-        attn_weights_raw = safe_softmax(scores, combined_mask, dim=-1) # (B, H, Q_tot, S)
-        attn_weights_dropped = self.dropout(attn_weights_raw)
+        attn_weights = safe_softmax(scores, combined_mask, dim=-1) # (B, H, Q_tot, S)
 
         # Compute weighted sum of values (applying attention)
         # (B, H, Q_tot, S) @ (B, H, S, d_h) -> (B, H, Q_tot, d_h)
-        output = attn_weights_dropped @ v
+        output = attn_weights @ v
 
         # Concatenate heads: (B, H, Q_tot, d_h) -> (B, Q_tot, H, d_h) -> (B, Q_tot, D)
         output = output.permute(0, 2, 1, 3).reshape(B, Q_tot, self.d_model)
@@ -175,6 +171,6 @@ class LearnedQueryAttention(nn.Module):
         output_norm = self.out_norm(output)
         attn_output = self.out_proj(output_norm)
 
-        # Return final output and mean attention weights (raw, before dropout, for logging/inspection)
+        # Return final output and mean attention weights for logging/inspection
         # Mean over heads: (B, H, Q_tot, S) -> (B, Q_tot, S)
-        return attn_output, attn_weights_raw.mean(dim=1)
+        return attn_output, attn_weights.mean(dim=1)
