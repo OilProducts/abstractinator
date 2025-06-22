@@ -54,6 +54,8 @@ model = HierarchicalAutoencoder(
     top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0)
 ).to(DEVICE)
 
+model = torch.compile(model, mode="default")
+
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable parameters.")
 
