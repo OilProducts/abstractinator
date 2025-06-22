@@ -6,6 +6,7 @@ from torch.nn.attention.flex_attention import (
     create_block_mask         # helper to build sparse mask
 )
 from .rope import apply_rope
+from .swiglu import SwiGLU
 from typing import Optional, Tuple
 
 @torch.compile
@@ -292,11 +293,7 @@ class SlidingWindowTransformerBlock(nn.Module):
         # Second sub-block: Feed-Forward Network
         self.norm2 = nn.RMSNorm(dim)
         ffn_hidden_dim = dim * ffn_dim_multiplier
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_hidden_dim),
-            nn.GELU(),
-            nn.Linear(ffn_hidden_dim, dim)
-        )
+        self.ffn = SwiGLU(dim, ffn_hidden_dim)
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
