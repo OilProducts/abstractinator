@@ -1,6 +1,21 @@
 # Abstractinator
 
-A hierarchical autoencoder that compresses and reconstructs byte sequences using vector quantization.  Training and dataset parameters are configured in `config.py`.
+An experimental hierarchical autoencoder for compressing and reconstructing raw
+text at the byte level. The project explores whether long sequences can be
+represented with a compact set of discrete codes while still allowing faithful
+recovery. Training and dataset parameters are configured in `config.py`.
+
+## Overview
+
+The autoencoder is built from several custom modules that work together to
+compress sequences of UTF‑8 bytes. Each compression level reduces the length of
+the sequence and discretizes the result, enabling efficient storage or further
+modeling. Decompression reverses this process to reconstruct the original text.
+
+Why build this? Hierarchical discrete representations can decouple expensive
+language models from the byte-level details of text. If a compact code sequence
+faithfully represents a document, the codes themselves become a smaller,
+cleaner target for downstream models or storage.
 
 ## Installation
 
@@ -24,9 +39,29 @@ Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['check
 
 Key modules under `components/` include:
 
-- `ByteSegmentCompressor` – segments byte tokens and vector-quantizes them.
-- `CodeExpander` – transformer that reconstructs lower level codes.
-- `HierarchicalAutoencoder` – stacks compressors and expanders for end-to-end compression.
+- **ByteSegmentCompressor** – Encodes a byte sequence with a local sliding-window
+  transformer, divides it into variable‑length segments using token entropy, and
+  pools each segment with learned queries before vector quantization.  The
+  result is a shorter sequence of discrete codes.
+- **CodeExpander** – A sequence‑to‑sequence transformer that learns to map a
+  sequence of higher-level codes back into the lower-level sequence from which
+  they were produced. During generation it autoregressively expands codes.
+- **CodeSequenceTransformer** – Optional encoder stack for modeling the top-level
+  codes themselves.  It can predict the next code and provide contextual
+  embeddings for the decoder.
+- **HierarchicalAutoencoder** – Orchestrates multiple compressors and expanders.
+  Each level compresses further than the last, and decompression reverses the
+  chain to reconstruct the original bytes.  When enabled, the
+  `CodeSequenceTransformer` operates on the highest-level codes.
+- **LearnedQueryAttention** – Attention module with a bank of learnable query
+  vectors used by the compressors to pool variable-length segments into fixed
+  representations.
+- **VectorQuantizer** – Discretizes segment embeddings with an EMA-updated
+  codebook and provides the VQ loss used during training.
+- **SlidingWindowAttention** – Provides efficient local attention kernels for the
+  token encoder used inside each compressor.
+- **HierarchicalAELM** – Adapter that exposes trained autoencoder checkpoints as
+  language models for evaluation with the LM harness.
 
 See `notes.md` for additional design thoughts.
 
