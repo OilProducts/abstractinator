@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from typing import List, Dict, Any
 from transformers.optimization import get_scheduler
 
-import aim  # Assuming 'aim' is installed and accessible
+import mlflow  # Logging with MLflow
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
@@ -28,13 +28,14 @@ print(f"Using device: {DEVICE}")
 # --- Experiment Configuration ---
 # Loaded from config.py
 
-# --- AIM Setup ---
-print(f"Initializing AIM run: {exp_config.get('run_name', 'DefaultRun')}")
-aim_run = aim.Run(experiment=exp_config.get("run_name", "DefaultRun"))
+# --- MLflow Setup ---
+# See https://mlflow.org/docs/latest/python_api/mlflow.html for API details
+print(f"Initializing MLflow run: {exp_config.get('run_name', 'DefaultRun')}")
 if exp_config.get("project_name"):
-    # Ensure the AIM repo path is correctly specified if not using default location
-    aim_run.repo = f"./aim_repo/{exp_config['project_name']}"
-    print(f"AIM repository set to: {aim_run.repo}")
+    mlflow.set_tracking_uri(f"file:./mlruns/{exp_config['project_name']}")
+    print(f"MLflow tracking URI set to: file:./mlruns/{exp_config['project_name']}")
+mlflow.set_experiment(exp_config.get("project_name", "DefaultExperiment"))
+mlflow_run = mlflow.start_run(run_name=exp_config.get("run_name", "DefaultRun"))
 
 # --- Model, Optimizer ---
 print("Initializing HierarchicalAutoencoder model...")
@@ -289,10 +290,9 @@ lr_scheduler = get_scheduler(
     scheduler_specific_kwargs=exp_config["scheduler_specific_kwargs"] if "scheduler_specific_kwargs" in exp_config else {}
 )
 
-# --- Track final hyperparameters with AIM after potential modifications --- # <<< ADDED
-print("Tracking hyperparameters with AIM...")
-for k, v in exp_config.items():
-    aim_run[k] = v
+# --- Track final hyperparameters with MLflow ---
+print("Tracking hyperparameters with MLflow...")
+mlflow.log_params(exp_config)
 print("Hyperparameters tracked.")
 
 # --- Training Loop ---
@@ -440,71 +440,51 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
                 print(" | ".join(console_log_parts), flush=True)
 
 
-                # --- Logging to AIM (occurs every optimizer step) ---
+                # --- Logging to MLflow (occurs every optimizer step) ---
                 if global_step % exp_config["log_interval"] == 0 and accumulators["count"] > 0:
 
-                    aim_run.track(accumulators["total_loss"] / steps_accumulated,
-                                  name='loss/total_avg_accum', step=global_step, epoch=epoch,
-                                  context={"subset": "train"})
-                    aim_run.track(accumulators["vq_loss"] / steps_accumulated, name='loss/vq_avg_accum',
-                                  step=global_step, epoch=epoch, context={"subset": "train"})
-                    aim_run.track(accumulators["avg_reconstruction_loss"] / steps_accumulated,
-                                  name='loss/reconstruction_avg_accum', step=global_step, epoch=epoch,
-                                  context={"subset": "train"})
-                    aim_run.track(tokens_per_second, name='performance/tokens_per_sec', step=global_step, epoch=epoch)
-                    aim_run.track(accumulators["avg_top_code_lm_loss"] / steps_accumulated,
-                                  name='loss/top_code_lm_avg_accum', step=global_step, epoch=epoch,
-                                  context={"subset": "train"})
+                    mlflow.log_metric('loss/total_avg_accum', accumulators["total_loss"] / steps_accumulated, step=global_step)
+                    mlflow.log_metric('loss/vq_avg_accum', accumulators["vq_loss"] / steps_accumulated, step=global_step)
+                    mlflow.log_metric('loss/reconstruction_avg_accum', accumulators["avg_reconstruction_loss"] / steps_accumulated, step=global_step)
+                    mlflow.log_metric('performance/tokens_per_sec', tokens_per_second, step=global_step)
+                    mlflow.log_metric('loss/top_code_lm_avg_accum', accumulators["avg_top_code_lm_loss"] / steps_accumulated, step=global_step)
 
                     for key, value in accumulators["reconstruction_loss_details"].items():
-                        aim_run.track(value / steps_accumulated, name=f'loss_detail_avg_accum/{key}',
-                                      step=global_step, epoch=epoch, context={"subset": "train"})
+                        mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
 
                     if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                        aim_run.track(accumulators["avg_aux_lm_loss"] / steps_accumulated,
-                                      name='loss/aux_lm_avg_accum', step=global_step, epoch=epoch,
-                                      context={"subset": "train"})
+                        mlflow.log_metric('loss/aux_lm_avg_accum', accumulators["avg_aux_lm_loss"] / steps_accumulated, step=global_step)
                         for key, value in accumulators["aux_lm_loss_details"].items():
-                            aim_run.track(value / steps_accumulated,
-                                          name=f'loss_detail_avg_accum/{key}', step=global_step,
-                                          epoch=epoch, context={"subset": "train"})
+                            mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
 
                     if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
                         for level_idx in range(exp_config["num_levels"]):
-                            aim_run.track(
-                                accumulators["compression_ratios"][level_idx] / steps_accumulated,
-                                name=f'compression_avg/ratio_L{level_idx}', step=global_step,
-                                epoch=epoch)
-                            aim_run.track(accumulators["input_seq_lengths_compressors"][
-                                              level_idx] / steps_accumulated,
-                                          name=f'compression_avg/input_len_L{level_idx}',
-                                          step=global_step, epoch=epoch)
-                            aim_run.track(accumulators["output_seq_lengths_compressors"][
-                                              level_idx] / steps_accumulated,
-                                          name=f'compression_avg/output_len_L{level_idx}',
-                                          step=global_step, epoch=epoch)
+                            mlflow.log_metric(f'compression_avg/ratio_L{level_idx}',
+                                              accumulators["compression_ratios"][level_idx] / steps_accumulated,
+                                              step=global_step)
+                            mlflow.log_metric(f'compression_avg/input_len_L{level_idx}',
+                                              accumulators["input_seq_lengths_compressors"][level_idx] / steps_accumulated,
+                                              step=global_step)
+                            mlflow.log_metric(f'compression_avg/output_len_L{level_idx}',
+                                              accumulators["output_seq_lengths_compressors"][level_idx] / steps_accumulated,
+                                              step=global_step)
 
-                    aim_run.track(optimizer.param_groups[0]['lr'], name='learning_rate',
-                                  step=global_step, epoch=epoch)
+                    mlflow.log_metric('learning_rate', optimizer.param_groups[0]['lr'], step=global_step)
 
                     if 'all_codebook_perplexities' in output_dict:
                         for level_idx in range(exp_config["num_levels"]):
-                            aim_run.track(accumulators["all_codebook_perplexities"][
-                                              level_idx] / steps_accumulated,
-                                          name=f'vq_metrics_avg/perplexity_L{level_idx}',
-                                          step=global_step, epoch=epoch)
+                            mlflow.log_metric(f'vq_metrics_avg/perplexity_L{level_idx}',
+                                              accumulators["all_codebook_perplexities"][level_idx] / steps_accumulated,
+                                              step=global_step)
                             codebook_size_L_i = exp_config["compressor_level_configs"][level_idx][
                                 "codebook_size"]
-                            aim_run.track(codebook_size_L_i,
-                                          name=f'vq_metrics/codebook_size_L{level_idx}',
-                                          step=global_step, epoch=epoch, context={"type": "config"})
+                            mlflow.log_metric(f'vq_metrics/codebook_size_L{level_idx}', codebook_size_L_i, step=global_step)
 
                     if 'all_smoothed_perplexities' in output_dict:
                         for level_idx in range(exp_config["num_levels"]):
-                            aim_run.track(accumulators["all_smoothed_perplexities"][
-                                              level_idx] / steps_accumulated,
-                                          name=f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
-                                          step=global_step, epoch=epoch)
+                            mlflow.log_metric(f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
+                                              accumulators["all_smoothed_perplexities"][level_idx] / steps_accumulated,
+                                              step=global_step)
 
             # Reset accumulators for the next window
             accumulators = reset_accumulators(exp_config["num_levels"])
@@ -541,10 +521,9 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
                     print(f"Reconstructed Text:\n{reconstructed_text}")
                     print("------------------------------------------")
 
-                    # Log to AIM
-                    aim_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
-                    aim_run.track(aim.Text(aim_text_log), name='sample_generation', step=global_step,
-                                  epoch=epoch)
+                    # Log to MLflow
+                    mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
+                    mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
 
                 model.train()  # Switch back to training mode
             if global_step > 0 and global_step % exp_config["checkpoint_interval"] == 0:
@@ -561,6 +540,7 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
         break
 
 print("Training finished.")
+mlflow.end_run()
 
 # Example of saving the model (optional)
 # final_model_path = f"{exp_config.get('run_name', 'model')}_final.pth"

@@ -35,6 +35,8 @@ All experiment settings live in the `exp_config` dictionary within `config.py`. 
 
 Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps.  To resume training, set `exp_config['resume_from_checkpoint']` to the path of a saved checkpoint.
 
+Training metrics and sample outputs are logged with [MLflow](https://mlflow.org/docs/latest/python_api/mlflow.html). If `exp_config['project_name']` is set, logs are stored under `./mlruns/<project_name>`.
+
 ## Components
 
 Key modules under `components/` include:
