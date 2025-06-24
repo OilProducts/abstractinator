@@ -1,5 +1,5 @@
 torch
 datasets
-aim
+mlflow
 transformers
 lm-eval
