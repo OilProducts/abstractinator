@@ -285,7 +285,7 @@ class SlidingWindowTransformerBlock(nn.Module):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
         self.norm1 = nn.RMSNorm(dim)
-        self.attn = LocalSlidingWindowAttention(
+        self.attn = SlidingWindowAttention(
             embed_dim=dim,
             num_heads=num_heads,
             window_size=window_size,
