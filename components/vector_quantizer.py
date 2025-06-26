@@ -6,7 +6,7 @@ from typing import Tuple, Any
 from torch import Tensor
 
 
-@torch.compile
+# @torch.compile
 class VectorQuantizer(nn.Module):
     """
     An efficient Vector Quantizer (VQ) layer with EMA updates and robust,

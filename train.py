@@ -21,7 +21,8 @@ from config import DEVICE, N_CPU, exp_config
 torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
 torch.set_printoptions(threshold=100_000)
-
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.recompile_limit = 128
 
 print(f"Using device: {DEVICE}")
 
@@ -55,7 +56,7 @@ model = HierarchicalAutoencoder(
     top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0)
 ).to(DEVICE)
 
-model = torch.compile(model, mode="default")
+# model = torch.compile(model, mode="default", dynamic=True)
 
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable parameters.")

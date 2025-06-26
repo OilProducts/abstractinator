@@ -9,7 +9,7 @@ from .rope import apply_rope
 from .swiglu import SwiGLU
 from typing import Optional, Tuple
 
-@torch.compile
+# @torch.compile
 class LocalSlidingWindowAttention(nn.Module):
     """
     Causal sliding‑window multi‑head attention in O(S·w) with FlexAttention.
@@ -44,7 +44,7 @@ class LocalSlidingWindowAttention(nn.Module):
     # helper: memo‑cached BlockMask builder
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _sliding_block(seq_len: int, window: int, device: torch.device):
+    def _sliding_block(seq_len: int, window: int, device: torch.device, is_training: bool) -> torch.Tensor:
         cache_key = (seq_len, window, device.index if device.type == "cuda" else -1)
         cache = LocalSlidingWindowAttention._sliding_block.__dict__.setdefault(
             "cache", {}
@@ -63,10 +63,11 @@ class LocalSlidingWindowAttention(nn.Module):
             Q_LEN=seq_len,
             KV_LEN=seq_len,
             BLOCK_SIZE=128,
-            _compile=True,           # pre‑compile sparse metadata
+            _compile=False,           # pre‑compile sparse metadata
         ).to(device)
 
-        cache[cache_key] = blk
+        if is_training:
+            cache[cache_key] = blk
         return blk
 
     # ------------------------------------------------------------------ #
@@ -91,7 +92,7 @@ class LocalSlidingWindowAttention(nn.Module):
         q = q * (d ** -0.5)
 
         # block mask ----------------------------------------------------------
-        block_mask = self._sliding_block(S, self.window, x.device)
+        block_mask = self._sliding_block(S, self.window, x.device, self.training)
         if key_padding_mask is not None:
             block_mask = block_mask.add_padding_mask(key_padding_mask)
 
@@ -262,7 +263,7 @@ class SlidingWindowAttention(nn.Module):
 
         return output
 
-
+@torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
     A single Transformer block using SlidingWindowAttention (Pre-LN variant).
@@ -325,7 +326,7 @@ class SlidingWindowTransformerBlock(nn.Module):
 
         return x
 
-
+@torch.compile
 class StackedSlidingWindowEncoder(nn.Module):
     """
     A Transformer-style encoder composed of a stack of SlidingWindowTransformerBlock layers.

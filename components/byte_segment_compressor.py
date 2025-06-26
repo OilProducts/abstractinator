@@ -8,7 +8,7 @@ from .vector_quantizer import VectorQuantizer
 from .sliding_window_attention import StackedSlidingWindowEncoder
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask
 
-@torch.compile
+# @torch.compile
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
