@@ -190,7 +190,7 @@ class HierarchicalAutoencoder(nn.Module):
             all_compressor_input_kpms_list.append(current_kpm) # Store KPM for aux LM loss
 
             if current_kpm is not None:
-                input_seq_len = (~current_kpm).sum(dim=1).float().mean().item()
+                input_seq_len = (~current_kpm).sum(dim=1).float().mean()
             else:
                 input_seq_len = float(current_input_tokens.size(1))
             all_input_seq_lengths.append(input_seq_len)
@@ -215,7 +215,7 @@ class HierarchicalAutoencoder(nn.Module):
             if valid_mask_for_output_segments is not None:
                 # Effective output length based on valid segments * num_queries
                 output_seq_len = (valid_mask_for_output_segments.sum(
-                    dim=1) * num_q_this_level).float().mean().item()
+                    dim=1) * num_q_this_level).float().mean()
             else:
                 output_seq_len = float(output_codes.size(1))
             all_output_seq_lengths.append(output_seq_len)
@@ -235,8 +235,13 @@ class HierarchicalAutoencoder(nn.Module):
             else:
                 current_kpm = None
 
-        compression_ratios = [(out_len / in_len) if in_len > 0 else 0.0 for in_len, out_len in
-                              zip(all_input_seq_lengths, all_output_seq_lengths)]
+        compression_ratios: List[torch.Tensor] = []
+        for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths):
+            ratio = torch.where(in_len > 0, out_len / in_len, out_len.new_tensor(0.0))
+            compression_ratios.append(ratio)
+            # compression_ratios.append(float((out_len / in_len).cpu()) if in_len.item() > 0 else 0.0)
+        # compression_ratios = [(out_len / in_len) if in_len > 0 else 0.0 for in_len, out_len in
+        #                       zip(all_input_seq_lengths, all_output_seq_lengths)]
 
         return {
             'top_codes': all_codes_list[-1] if all_codes_list else torch.empty(0,

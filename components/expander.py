@@ -155,7 +155,8 @@ class SimpleDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 # CodeExpander: Sequence-to-Sequence model using the custom Transformer blocks
 # ---------------------------------------------------------------------------
-@torch.compile
+
+# @torch.compile
 class CodeExpander(nn.Module):
     def __init__(
         self,
