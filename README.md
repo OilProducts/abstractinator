@@ -65,7 +65,18 @@ Key modules under `components/` include:
 - **HierarchicalAELM** – Adapter that exposes trained autoencoder checkpoints as
   language models for evaluation with the LM harness.
 
+
 See `notes.md` for additional design thoughts.
+
+## Generation
+
+The `generate_bytes` method performs end‑to‑end text generation. A prompt is
+first compressed to top‑level codes. These codes seed the
+`CodeSequenceTransformer`, which autoregressively predicts one new code at a
+time. After each prediction the expander stack decodes the updated code
+sequence back into bytes so the output can grow beyond the original compressed
+length. Generation stops when an EOS code is produced or when a maximum length
+is reached.
 
 ## Evaluation
 
