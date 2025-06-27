@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Dict
 from .expander import EncoderBlock
 
-@torch.compile
+# Disable torch.compile on this module to keep unit tests lightweight
 class CodeSequenceTransformer(nn.Module):
     """
     A standard Transformer encoder stack to process sequences of codes.
@@ -63,3 +63,35 @@ class CodeSequenceTransformer(nn.Module):
             output_dict['logits'] = logits
 
         return output_dict
+
+    @torch.no_grad()
+    def generate_codes(
+        self,
+        prefix: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        sample: bool = False,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Generate a single next code given a prefix.
+
+        Args:
+            prefix: Previously generated codes ``(B, S)``.
+            key_padding_mask: Optional mask for ``prefix``.
+            sample: If ``True`` sample from the distribution instead of greedy
+                argmax.
+            temperature: Sampling temperature when ``sample`` is ``True``.
+
+        Returns:
+            Tensor of shape ``(B, 1)`` containing the next predicted code.
+        """
+        out = self.forward(prefix, key_padding_mask=key_padding_mask)
+        if "logits" not in out:
+            raise RuntimeError("CodeSequenceTransformer was initialized without lm logits")
+        logits = out["logits"][:, -1, :]  # (B, V)
+
+        if sample:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            next_codes = torch.multinomial(probs, num_samples=1)
+        else:
+            next_codes = logits.argmax(dim=-1, keepdim=True)
+        return next_codes
