@@ -24,14 +24,23 @@ class VectorQuantizer(nn.Module):
                  reset_interval: int = 2000,
                  max_codes_to_reset_pct: float = 0.1,
                  replacement_buffer_size: int = 65536,
-                 vectors_per_step_to_buffer: int = 1024):  # New: Controls update overhead
+                 vectors_per_step_to_buffer: int = 1024,  # New: Controls update overhead
+                 bos_token_id: int = 0,
+                 eos_token_id: int = 1):
         super().__init__()
+        if K <= max(bos_token_id, eos_token_id):
+            raise ValueError("K must be greater than max(bos_token_id, eos_token_id)")
+
         self.K = K
         self.D = D
         self.beta = beta
         self.ema = ema
         self.decay = decay
         self.eps = eps
+
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.register_buffer("special_token_ids", torch.tensor([bos_token_id, eos_token_id], dtype=torch.long))
 
         self.reset_codes = reset_codes
         if self.reset_codes:
@@ -88,11 +97,15 @@ class VectorQuantizer(nn.Module):
         num_available_replacements = source_vectors.size(0)
 
         dead_code_candidates_indices = (self.ema_cluster_size < self.min_usage_threshold).nonzero(as_tuple=True)[0]
+        # Exclude reserved tokens from consideration
+        mask = ~torch.isin(dead_code_candidates_indices, self.special_token_ids.to(dead_code_candidates_indices.device))
+        dead_code_candidates_indices = dead_code_candidates_indices[mask]
         num_dead_candidates = dead_code_candidates_indices.size(0)
         if num_dead_candidates == 0:
             return
 
-        max_resettable_by_pct = int(self.K * self.max_codes_to_reset_pct)
+        effective_K = self.K - len(self.special_token_ids)
+        max_resettable_by_pct = int(effective_K * self.max_codes_to_reset_pct)
         num_to_reset = min(num_dead_candidates, num_available_replacements, max_resettable_by_pct)
         if num_to_reset == 0:
             return
@@ -115,6 +128,11 @@ class VectorQuantizer(nn.Module):
     # _ema_update method remains the same...
     @torch.no_grad()
     def _ema_update(self, encodings: torch.Tensor, flat_input: torch.Tensor):
+        # Ignore reserved tokens when updating EMA statistics
+        if self.special_token_ids.numel() > 0:
+            encodings = encodings.clone()
+            encodings[:, self.special_token_ids] = 0
+
         dw = encodings.T @ flat_input
         cluster_size = encodings.sum(0)
         self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
@@ -155,9 +173,12 @@ class VectorQuantizer(nn.Module):
                     self.steps_since_last_reset.zero_()
 
         if self.ema:
-            counts = self.ema_cluster_size.clamp(min=self.eps)
+            counts = self.ema_cluster_size.clone()
         else:
-            counts = torch.bincount(indices, minlength=self.K).float().clamp(min=self.eps)
+            counts = torch.bincount(indices, minlength=self.K).float()
+
+        counts[self.special_token_ids] = 0
+        counts = counts.clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
         entropy = -(probs.double() * probs.double().log()).sum()
         perplexity = entropy.exp().float()
