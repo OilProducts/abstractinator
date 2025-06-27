@@ -609,10 +609,48 @@ class HierarchicalAutoencoder(nn.Module):
         top_codes = compression_results['top_codes']
         kpm_for_top_expander_input = compression_results['final_key_padding_mask']
 
-        decompression_results = self.decompress(
+        # Decode the prefix produced by the compressors
+        decomp = self.decompress(
             top_codes=top_codes,
             top_codes_key_padding_mask=kpm_for_top_expander_input,
-            targets_for_teacher_forcing=None,  # Inference mode
-            max_len_override=max_len_override
+            targets_for_teacher_forcing=None,
+            max_len_override=max_len_override,
         )
-        return decompression_results['final_reconstructed_tokens']
+        reconstructed = decomp['final_reconstructed_tokens']
+
+        if self.code_sequence_transformer is None:
+            return reconstructed
+
+        generated_top_codes = top_codes
+        generated_kpm = kpm_for_top_expander_input
+        prev_len = reconstructed.size(1)
+
+        # Continue generating top codes one by one
+        while True:
+            if max_len_override is not None and generated_top_codes.size(1) >= max_len_override:
+                break
+
+            next_code = self.code_sequence_transformer.generate_codes(
+                prefix=generated_top_codes,
+                key_padding_mask=generated_kpm,
+            )
+            generated_top_codes = torch.cat([generated_top_codes, next_code], dim=1)
+            if generated_kpm is not None:
+                pad = torch.zeros(generated_kpm.size(0), 1, dtype=generated_kpm.dtype, device=generated_kpm.device)
+                generated_kpm = torch.cat([generated_kpm, pad], dim=1)
+
+            decomp = self.decompress(
+                top_codes=generated_top_codes,
+                top_codes_key_padding_mask=generated_kpm,
+                targets_for_teacher_forcing=None,
+                max_len_override=max_len_override,
+            )
+            new_tokens = decomp['final_reconstructed_tokens']
+            reconstructed = torch.cat([reconstructed, new_tokens[:, prev_len:]], dim=1)
+            prev_len = new_tokens.size(1)
+
+            # Stop if EOS code generated
+            if (next_code == self.expander_eos_id).all():
+                break
+
+        return reconstructed
