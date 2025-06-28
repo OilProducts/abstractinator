@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from .byte_segment_compressor import ByteSegmentCompressor
 from .expander import CodeExpander
@@ -182,6 +182,8 @@ class HierarchicalAutoencoder(nn.Module):
         all_perplexities_list: List[torch.Tensor] = []
         all_smoothed_perplexities_list: List[Optional[torch.Tensor]] = []
 
+        all_patch_end_masks: List[Optional[torch.Tensor]] = []
+
         current_input_tokens = tokens
         current_kpm = key_padding_mask
 
@@ -197,6 +199,7 @@ class HierarchicalAutoencoder(nn.Module):
 
             comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
             output_codes = comp_out['codes']
+            all_patch_end_masks.append(comp_out.get('patch_end_mask'))
             encoder_logits_level_i = comp_out['encoder_logits']
             all_perplexities_list.append(comp_out['current_codebook_perplexity'])
             all_smoothed_perplexities_list.append(comp_out.get('smoothed_codebook_perplexity'))
@@ -245,7 +248,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         return {
             'top_codes': all_codes_list[-1] if all_codes_list else torch.empty(0,
-                                                                               device=tokens.device),
+                                                                              device=tokens.device),
             'all_codes': all_codes_list,
             'all_continuous': all_continuous_list,
             'vq_loss': total_vq_loss,
@@ -258,7 +261,8 @@ class HierarchicalAutoencoder(nn.Module):
             'all_compressor_input_tokens': all_compressor_input_tokens_list,
             'all_compressor_input_kpms': all_compressor_input_kpms_list,
             'all_codebook_perplexities': all_perplexities_list,
-            'all_smoothed_perplexities': all_smoothed_perplexities_list
+            'all_smoothed_perplexities': all_smoothed_perplexities_list,
+            'all_patch_end_masks': all_patch_end_masks
         }
 
 
@@ -368,6 +372,7 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_level_valid_masks = compression_results['all_compressor_level_valid_masks']
         all_codebook_perplexities = compression_results['all_codebook_perplexities']
         all_smoothed_perplexities = compression_results['all_smoothed_perplexities']
+        all_patch_end_masks = compression_results.get('all_patch_end_masks', [])
 
         # For auxiliary LM loss
         all_encoder_logits = compression_results['all_encoder_logits']
@@ -426,6 +431,30 @@ class HierarchicalAutoencoder(nn.Module):
         targets_for_expander_stack: List[torch.Tensor] = []
         target_kpms_for_expander_stack: List[Optional[torch.Tensor]] = []
 
+        def insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
+                       kpm: Optional[torch.Tensor], eop_id: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            B, S = seq.shape
+            lengths = S + end_mask.sum(dim=1)
+            max_len = int(lengths.max().item())
+            out = seq.new_full((B, max_len), eop_id)
+            out_kpm = None
+            if kpm is not None:
+                out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
+
+            for b in range(B):
+                idx = 0
+                for t in range(S):
+                    out[b, idx] = seq[b, t]
+                    if out_kpm is not None:
+                        out_kpm[b, idx] = kpm[b, t]
+                    idx += 1
+                    if end_mask[b, t]:
+                        out[b, idx] = eop_id
+                        if out_kpm is not None:
+                            out_kpm[b, idx] = False
+                        idx += 1
+            return out, out_kpm
+
         for j in range(self.num_levels):  # j is index for self.expanders list
             target_compressor_input_level_idx = self.num_levels - 1 - j
             target_kpm = None
@@ -442,6 +471,13 @@ class HierarchicalAutoencoder(nn.Module):
                     if valid_mask_for_target_segments is not None:
                         num_q = self.compressors[target_code_idx].num_queries_per_segment
                         target_kpm = ~valid_mask_for_target_segments.repeat_interleave(num_q, dim=1)
+
+            patch_mask = None
+            if target_compressor_input_level_idx < len(all_patch_end_masks):
+                patch_mask = all_patch_end_masks[target_compressor_input_level_idx]
+            if patch_mask is not None and target_compressor_input_level_idx > 0:
+                eop_id = self.compressors[target_compressor_input_level_idx - 1].vq.eop_token_id
+                target, target_kpm = insert_eop(target, patch_mask, target_kpm, eop_id)
 
             targets_for_expander_stack.append(target)
             target_kpms_for_expander_stack.append(target_kpm)
