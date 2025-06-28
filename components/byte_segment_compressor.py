@@ -112,6 +112,10 @@ class ByteSegmentCompressor(nn.Module):
             entropy = token_entropy(logits)  # (B,S)
             seg_id = entropy_segments(entropy) # (B,S), integer segment IDs
         # seg_id now maps each token position to a segment index.
+        patch_end_mask = torch.zeros_like(seg_id, dtype=torch.bool)
+        if seg_id.size(1) > 0:
+            patch_end_mask[:, :-1] = seg_id[:, 1:] != seg_id[:, :-1]
+            patch_end_mask[:, -1] = True
 
         # Build queries and attention mask for segment-restricted pooling.
         # `self.pooler.query_template` are the L learned base queries (L,D).
@@ -173,6 +177,7 @@ class ByteSegmentCompressor(nn.Module):
             'codes': codebook_indices,
             'vq_loss': vq_loss,
             'valid_mask': valid_segments_mask,  # (B, S_hat_segments)
+            'patch_end_mask': patch_end_mask,
             'encoder_logits': logits,
             'current_codebook_perplexity': codebook_perplexity,
             'smoothed_codebook_perplexity': perplexity
