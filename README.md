@@ -3,7 +3,8 @@
 An experimental hierarchical autoencoder for compressing and reconstructing raw
 text at the byte level. The project explores whether long sequences can be
 represented with a compact set of discrete codes while still allowing faithful
-recovery. Training and dataset parameters are configured in `config.py`.
+recovery. Training and dataset parameters are configured in a Python config file
+(`config.py` by default).
 
 ## Overview
 
@@ -31,7 +32,13 @@ Run the training loop:
 python train.py
 ```
 
-All experiment settings live in the `exp_config` dictionary within `config.py`.  Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
+Specify a different config file with `--config`:
+
+```bash
+python train.py --config tiny_config.py
+```
+
+All experiment settings live in the `exp_config` dictionary within your chosen config file. Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
 
 Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps.  To resume training, set `exp_config['resume_from_checkpoint']` to the path of a saved checkpoint.
 
