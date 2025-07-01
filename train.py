@@ -82,6 +82,23 @@ model = torch.compile(model, mode="default", dynamic=True)
 num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable parameters.")
 
+# --- Parameter counts for individual components ---
+component_counts = {}
+for idx, compressor in enumerate(model.compressors):
+    comp_params = sum(p.numel() for p in compressor.parameters() if p.requires_grad)
+    component_counts[f"Compressor_{idx}"] = comp_params
+for idx, expander in enumerate(model.expanders):
+    exp_params = sum(p.numel() for p in expander.parameters() if p.requires_grad)
+    component_counts[f"Expander_{idx}"] = exp_params
+if getattr(model, "code_sequence_transformer", None) is not None:
+    cst_params = sum(
+        p.numel() for p in model.code_sequence_transformer.parameters() if p.requires_grad
+    )
+    component_counts["CodeSequenceTransformer"] = cst_params
+
+for name, count in component_counts.items():
+    print(f"  {name} parameters: {short_num(count)}")
+
 optimizer = optim.AdamW(model.parameters(), lr=exp_config["learning_rate"])
 print(f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}")
 
