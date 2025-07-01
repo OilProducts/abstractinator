@@ -3,6 +3,8 @@ import math
 import sys
 import time
 from collections import defaultdict
+import argparse
+import importlib.util
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
@@ -16,7 +18,26 @@ import mlflow  # Logging with MLflow
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
 from components.utils import short_num
-from config import DEVICE, N_CPU, exp_config
+
+parser = argparse.ArgumentParser(description="Training script for HierarchicalAutoencoder")
+parser.add_argument(
+    "--config",
+    type=str,
+    default="config.py",
+    help="Path to the configuration Python file",
+)
+args = parser.parse_args()
+
+def load_config(path: str):
+    spec = importlib.util.spec_from_file_location("config_module", path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    return config_module
+
+config = load_config(args.config)
+DEVICE = config.DEVICE
+N_CPU = config.N_CPU
+exp_config = config.exp_config
 
 torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
@@ -27,7 +48,7 @@ torch._dynamo.config.recompile_limit = 128
 print(f"Using device: {DEVICE}")
 
 # --- Experiment Configuration ---
-# Loaded from config.py
+# Loaded from the provided config file
 
 # --- MLflow Setup ---
 # See https://mlflow.org/docs/latest/python_api/mlflow.html for API details
