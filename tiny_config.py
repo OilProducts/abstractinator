@@ -48,7 +48,7 @@ exp_config = {
     "max_steps": None,
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
-    "gradient_accumulation_steps": 16,
+    "gradient_accumulation_steps": 2,
     "scheduler_type": "cosine_with_min_lr",
     "warmup_steps": 1000,
     "scheduler_specific_kwargs": {
