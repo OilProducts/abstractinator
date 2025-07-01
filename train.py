@@ -79,8 +79,20 @@ model = HierarchicalAutoencoder(
 
 model = torch.compile(model, mode="default", dynamic=True)
 
-num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+def _count_params(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+num_params = _count_params(model)
 print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable parameters.")
+
+# Print parameter counts for major components
+compressor_params = _count_params(model.compressors)
+expander_params = _count_params(model.expanders)
+print(f"  Compressors: {short_num(compressor_params)} parameters")
+print(f"  Expanders: {short_num(expander_params)} parameters")
+if getattr(model, "code_sequence_transformer", None) is not None:
+    cst_params = _count_params(model.code_sequence_transformer)
+    print(f"  CodeSequenceTransformer: {short_num(cst_params)} parameters")
 
 optimizer = optim.AdamW(model.parameters(), lr=exp_config["learning_rate"])
 print(f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}")
