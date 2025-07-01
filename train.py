@@ -77,7 +77,7 @@ model = HierarchicalAutoencoder(
     top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0)
 ).to(DEVICE)
 
-model = torch.compile(model, mode="default", dynamic=True)
+# model = torch.compile(model, mode="default", dynamic=True)
 
 def _count_params(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)

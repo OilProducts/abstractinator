@@ -16,7 +16,7 @@ exp_config = {
     "num_levels": 1,
     "initial_vocab_size": 259,
     "compressor_level_configs": [
-        {"dim": 64, "heads": 4, "window": 512,
+        {"dim": 128, "heads": 4, "window": 512,
          "num_encoder_layers": 4,
          'encoder_ffn_dim_multiplier': 4,
          'max_seq_len_encoder': 4096,
@@ -34,9 +34,9 @@ exp_config = {
     "aux_lm_loss_weight": 1.0,
     "top_lm_loss_weight": 0.2,
     "top_transformer_config": {
-        "dim": 128,
+        "dim": 256,
         "num_layers": 8,
-        "num_heads": 4,
+        "num_heads": 8,
         "ffn_dim_multiplier": 4,
         "max_seq_len": 2048,
         "output_lm_logits": True
@@ -48,7 +48,7 @@ exp_config = {
     "max_steps": None,
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
-    "gradient_accumulation_steps": 2,
+    "gradient_accumulation_steps": 8,
     "scheduler_type": "cosine_with_min_lr",
     "warmup_steps": 1000,
     "scheduler_specific_kwargs": {
