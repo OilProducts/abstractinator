@@ -44,6 +44,17 @@ Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['check
 
 Training metrics and sample outputs are logged with [MLflow](https://mlflow.org/docs/latest/python_api/mlflow.html). If `exp_config['project_name']` is set, logs are stored under `./mlruns/<project_name>`.
 
+## Loss Components
+
+The autoencoder optimizes a `total_loss` that combines several terms:
+
+1. **Reconstruction loss** – Cross-entropy between each expander's output and the target sequence from the level below (or the original bytes). The result is averaged across all levels.
+2. **Vector-quantization loss** – Commitment and codebook losses from each `VectorQuantizer`.
+3. **Auxiliary LM loss** – Optional next-token prediction loss on each compressor's input sequence, scaled by `aux_lm_loss_weight`.
+4. **Top-level LM loss** – Optional language-modeling loss on the top-level codes when a `CodeSequenceTransformer` is used, scaled by `top_lm_loss_weight`.
+
+These terms are summed to form `total_loss`, which is used for the backward pass.
+
 ## Components
 
 Key modules under `components/` include:
