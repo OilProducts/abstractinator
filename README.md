@@ -72,11 +72,10 @@ See `notes.md` for additional design thoughts.
 
 The `generate_bytes` method performs end‑to‑end text generation. A prompt is
 first compressed to top‑level codes. These codes seed the
-`CodeSequenceTransformer`, which autoregressively predicts one new code at a
-time. After each prediction the expander stack decodes the updated code
-sequence back into bytes so the output can grow beyond the original compressed
-length. Generation stops when an EOS code is produced or when a maximum length
-is reached.
+`CodeSequenceTransformer`, which autoregressively predicts additional codes
+until an EOS token is produced or a maximum length is reached. Once the full
+code sequence is ready, the expander stack decodes it in a single pass back
+into bytes.
 
 ## Evaluation
 
