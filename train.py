@@ -156,7 +156,6 @@ print(f"Tokenizer initialized. BOS ID: {tokenizer.bos_id}, EOS ID: {tokenizer.eo
 # --- Data Processing Function ---
 def tokenize_and_process_examples(
         examples: Dict[str, List[str]],
-        tokenizer_instance: ByteLevelTokenizer,  # Renamed for clarity
         sequence_length: int,  # From exp_config
         text_column="text"
 ) -> Dict[str, List[torch.Tensor]]:
@@ -170,31 +169,31 @@ def tokenize_and_process_examples(
             text_content = str(text_content) if text_content is not None else ""
 
         # Encode tokens (BOS/EOS added by tokenizer based on its settings)
-        encoded_tokens = tokenizer_instance.encode(text_content)
+        encoded_tokens = tokenizer.encode(text_content)
         current_length = len(encoded_tokens)
         final_tokens: torch.Tensor
 
         if current_length == 0 and sequence_length == 0:
             final_tokens = torch.tensor([], dtype=torch.int16)
         elif current_length == 0 and sequence_length > 0:
-            final_tokens = torch.full((sequence_length,), tokenizer_instance.pad_id,
+            final_tokens = torch.full((sequence_length,), tokenizer.pad_id,
                                       dtype=torch.int16)
         elif sequence_length == 0 and current_length > 0:  # Truncate to empty
             final_tokens = torch.tensor([], dtype=torch.int16)
         elif current_length > sequence_length:
             # Truncate and ensure EOS if tokenizer adds it and there's space
-            if tokenizer_instance.add_eos:
+            if tokenizer.add_eos:
                 # Truncate to sequence_length - 1 to make space for EOS
                 final_tokens = encoded_tokens[:sequence_length - 1]
                 final_tokens = torch.cat(
-                    (final_tokens, torch.tensor([tokenizer_instance.eos_id], dtype=torch.int16))
+                    (final_tokens, torch.tensor([tokenizer.eos_id], dtype=torch.int16))
                 )
             else:
                 final_tokens = encoded_tokens[:sequence_length]
         elif current_length < sequence_length:
             # Pad
             padding_needed = sequence_length - current_length
-            padding_tensor = torch.full((padding_needed,), tokenizer_instance.pad_id,
+            padding_tensor = torch.full((padding_needed,), tokenizer.pad_id,
                                         dtype=torch.int16)
             final_tokens = torch.cat((encoded_tokens, padding_tensor))
         else:  # current_length == sequence_length
@@ -207,11 +206,11 @@ def tokenize_and_process_examples(
             else:  # len < sequence_length
                 padding_needed = sequence_length - len(final_tokens)
                 final_tokens = torch.cat((final_tokens,
-                                          torch.full((padding_needed,), tokenizer_instance.pad_id,
+                                          torch.full((padding_needed,), tokenizer.pad_id,
                                                      dtype=torch.int16)))
 
         # Generate key_padding_mask (True for padded tokens)
-        key_padding_mask = (final_tokens == tokenizer_instance.pad_id)
+        key_padding_mask = (final_tokens == tokenizer.pad_id)
 
         processed_input_ids_list.append(final_tokens)
         # processed_labels_list.append(final_tokens.clone()) # Labels are same as input
@@ -244,7 +243,6 @@ tokenized_dataset = raw_dataset.map(
     tokenize_and_process_examples,
     batched=True,
     fn_kwargs={
-        "tokenizer_instance": tokenizer,  # Pass the instantiated tokenizer
         "sequence_length": exp_config["sequence_length"],
         "text_column": exp_config["text_column_name"]
     },
