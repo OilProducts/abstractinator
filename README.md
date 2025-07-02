@@ -73,8 +73,8 @@ Key modules under `components/` include:
 - **CodeExpander** – A sequence‑to‑sequence transformer that learns to map a
   sequence of higher-level codes back into the lower-level sequence from which
   they were produced. During generation it autoregressively expands codes.
-- **CodeSequenceTransformer** – Optional encoder stack for modeling the top-level
-  codes themselves.  It can predict the next code and provide contextual
+- **CodeSequenceTransformer** – Optional causal encoder stack for modeling the
+  top-level codes themselves.  It predicts the next code and provides contextual
   embeddings for the decoder.
 - **HierarchicalAutoencoder** – Orchestrates multiple compressors and expanders.
   Each level compresses further than the last, and decompression reverses the
