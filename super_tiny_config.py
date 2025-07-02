@@ -46,7 +46,7 @@ exp_config = {
     "learning_rate": 5e-4,
     "batch_size": 16,
     "sequence_length": 1024,
-    "num_epochs": 10,
+    "num_epochs": 1,
     "max_steps": None,
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
