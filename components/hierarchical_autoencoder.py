@@ -433,26 +433,42 @@ class HierarchicalAutoencoder(nn.Module):
 
         def insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
                        kpm: Optional[torch.Tensor], eop_id: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            """Insert ``eop_id`` after positions indicated by ``end_mask``.
+
+            This vectorized implementation avoids Python loops by computing
+            insertion indices with cumulative sums of ``end_mask``.
+            """
             B, S = seq.shape
-            lengths = S + end_mask.sum(dim=1)
+
+            if S == 0:
+                lengths = end_mask.sum(dim=1)
+                max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+                out = seq.new_full((B, max_len), eop_id)
+                out_kpm = None if kpm is None else torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
+                return out, out_kpm
+
+            end_cumsum = torch.cumsum(end_mask, dim=1)
+            lengths = S + end_cumsum[:, -1]
             max_len = int(lengths.max().item())
+
             out = seq.new_full((B, max_len), eop_id)
             out_kpm = None
             if kpm is not None:
                 out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
 
-            for b in range(B):
-                idx = 0
-                for t in range(S):
-                    out[b, idx] = seq[b, t]
-                    if out_kpm is not None:
-                        out_kpm[b, idx] = kpm[b, t]
-                    idx += 1
-                    if end_mask[b, t]:
-                        out[b, idx] = eop_id
-                        if out_kpm is not None:
-                            out_kpm[b, idx] = False
-                        idx += 1
+            shift = end_cumsum - end_mask
+            token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
+            batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
+
+            out[batch_idx, token_pos] = seq
+            if out_kpm is not None:
+                out_kpm[batch_idx, token_pos] = kpm
+
+            eop_pos = token_pos + 1
+            mask = end_mask.bool()
+            if out_kpm is not None:
+                out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
+
             return out, out_kpm
 
         for j in range(self.num_levels):  # j is index for self.expanders list
