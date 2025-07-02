@@ -32,6 +32,7 @@ exp_config = {
     "expander_heads_scale": 1.0,
     "expander_eos_id": 1,
     "expander_max_len": 2048,
+    "use_decoder_only_expander": False,
     "propagate_key_padding_mask": True,
     "aux_lm_loss_weight": 1.0,
     "top_lm_loss_weight": 0.2,
