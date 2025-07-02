@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .utils import safe_softmax
 from torch.nn.attention.flex_attention import (
     flex_attention,           # fused kernel
     create_block_mask         # helper to build sparse mask
@@ -326,7 +327,7 @@ class SlidingWindowCrossAttention(nn.Module):
             combined_mask = combined_mask | expanded_kpm
 
         attn_scores = attn_scores.masked_fill(combined_mask, float('-inf'))
-        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = safe_softmax(attn_scores, combined_mask, dim=-1)
         output = torch.matmul(attn_probs, v)
         output = output.transpose(1, 2).contiguous().view(B, S_q, self.embed_dim)
         output = self.out_proj(output)
