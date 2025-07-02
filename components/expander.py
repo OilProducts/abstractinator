@@ -9,6 +9,20 @@ from .swiglu import SwiGLU
 from .sliding_window_attention import SlidingWindowCrossAttention
 
 
+def _cached_causal_mask(length: int, device: torch.device) -> torch.Tensor:
+    """Return a causal mask of ``length`` on ``device``, reusing cached tensors."""
+    cache_key = (length, device.index if device.type == "cuda" else -1)
+    cache = _cached_causal_mask.__dict__.setdefault("cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    mask = torch.triu(
+        torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1
+    )
+    cache[cache_key] = mask
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Multi-Head Attention with RoPE
 # ---------------------------------------------------------------------------
@@ -236,7 +250,7 @@ class CodeExpander(nn.Module):
         self.out_proj = nn.Linear(D, K_lo)
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+        return _cached_causal_mask(length, device)
 
     def forward(
         self,
@@ -329,7 +343,7 @@ class DecoderOnlyExpander(nn.Module):
         self.out_proj = nn.Linear(D, K_lo)
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+        return _cached_causal_mask(length, device)
 
     def forward(
         self,
