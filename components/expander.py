@@ -74,10 +74,10 @@ class MultiHeadAttentionRoPE(nn.Module):
 # Transformer Blocks
 # ---------------------------------------------------------------------------
 class EncoderBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, ffn_dim: int):
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int, causal: bool = False):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
-        self.attn = MultiHeadAttentionRoPE(d_model, num_heads)
+        self.attn = MultiHeadAttentionRoPE(d_model, num_heads, causal=causal)
         self.norm2 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, ffn_dim)
 
