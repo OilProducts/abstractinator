@@ -42,13 +42,13 @@ exp_config = {
         "output_lm_logits": True
     },
     "learning_rate": 1e-4,
-    "batch_size": 16,
+    "batch_size": 64,
     "sequence_length": 1024,
     "num_epochs": 10,
     "max_steps": None,
     "log_interval": 1,
     "gradient_clip_norm": 1.0,
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 2,
     "scheduler_type": "cosine_with_min_lr",
     "warmup_steps": 1000,
     "scheduler_specific_kwargs": {

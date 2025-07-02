@@ -21,7 +21,7 @@ class VectorQuantizer(nn.Module):
                  decay: float = 0.999,
                  eps: float = 1e-5,
                  reset_codes: bool = True,
-                 reset_interval: int = 2000,
+                 reset_interval: int = 250,
                  max_codes_to_reset_pct: float = 0.1,
                  replacement_buffer_size: int = 65536,
                  vectors_per_step_to_buffer: int = 1024,  # Controls update overhead
