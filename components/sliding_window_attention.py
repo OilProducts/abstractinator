@@ -263,6 +263,76 @@ class SlidingWindowAttention(nn.Module):
 
         return output
 
+
+class SlidingWindowCrossAttention(nn.Module):
+    """Sliding-window cross attention with separate query and key/value sequences."""
+
+    def __init__(self, embed_dim: int, num_heads: int, window_size: int,
+                 bias: bool = True) -> None:
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+            )
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.window_size = window_size
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def _cross_window_mask(self, q_len: int, kv_len: int,
+                           device: torch.device) -> torch.Tensor:
+        """Mask restricting queries to attend within a retrospective window."""
+        q_idx = torch.arange(q_len, device=device)[:, None]
+        kv_idx = torch.arange(kv_len, device=device)[None, :]
+        rel_pos = kv_idx - q_idx
+        mask = (rel_pos > 0) | (rel_pos < -self.window_size)
+        return mask
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, S_q, D = query.shape
+        if D != self.embed_dim or key.size(2) != self.embed_dim or value.size(2) != self.embed_dim:
+            raise ValueError("embed_dim mismatch")
+        S_k = key.size(1)
+
+        q = self.q_proj(query).view(B, S_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = apply_rope(q)
+        k = apply_rope(k)
+        q = q * (self.head_dim ** -0.5)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1))
+
+        combined_mask = self._cross_window_mask(S_q, S_k, query.device)
+
+        if attn_mask is not None:
+            combined_mask = combined_mask | attn_mask.to(device=query.device, dtype=torch.bool)
+
+        combined_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+
+        if key_padding_mask is not None:
+            expanded_kpm = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            combined_mask = combined_mask | expanded_kpm
+
+        attn_scores = attn_scores.masked_fill(combined_mask, float('-inf'))
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_probs, v)
+        output = output.transpose(1, 2).contiguous().view(B, S_q, self.embed_dim)
+        output = self.out_proj(output)
+
+        return output
+
 # @torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
