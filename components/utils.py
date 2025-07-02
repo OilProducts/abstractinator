@@ -46,6 +46,36 @@ def short_num(n):
         formatted = f"{scaled:.0f}"
     return f"{formatted}{millnames[millidx]}"
 
+
+def format_duration(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+
+    # Compute days, hours, minutes, and seconds.
+    days, remainder = divmod(total_seconds, 86400)  # 86400 seconds in a day
+    hours, remainder = divmod(remainder, 3600)  # 3600 seconds in an hour
+    minutes, secs = divmod(remainder, 60)  # 60 seconds in a minute
+
+    parts = []
+    # If there are days, show days, hours, and minutes (ignore seconds)
+    if days > 0:
+        parts.append(f"{days}d")
+        parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+    # If there are hours but no days, show hours and minutes (ignore seconds)
+    elif hours > 0:
+        parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+    # If it's less than one hour, show minutes and seconds (or only seconds if under a minute)
+    else:
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+            parts.append(f"{secs}s")
+        else:
+            parts.append(f"{secs}s")
+
+    return " ".join(parts)
+
+
 def token_entropy(logits: torch.Tensor) -> torch.Tensor:
     """
     Calculates the Shannon entropy for each token's predictive distribution.
