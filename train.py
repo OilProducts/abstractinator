@@ -17,7 +17,7 @@ import mlflow  # Logging with MLflow
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
-from components.utils import short_num
+from components.utils import short_num, format_duration
 
 parser = argparse.ArgumentParser(description="Training script for HierarchicalAutoencoder")
 parser.add_argument(
@@ -332,6 +332,10 @@ print("\nStarting training loop...")
 model.train()  # Set model to training mode
 optimizer.zero_grad()  # Reset gradients before training
 
+# Track overall training time and total bytes processed
+training_start_time = time.time()
+total_bytes_processed = 0
+
 # --- Metric Accumulators ---
 def reset_accumulators(num_levels):
     accumulators = {
@@ -433,6 +437,16 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
             tokens_processed_this_window = accumulators["non_padded_tokens"]
             tokens_per_second = tokens_processed_this_window / duration_accumulation_window
 
+            # Update global byte count and compute ETAs
+            total_bytes_processed += tokens_processed_this_window
+            epoch_progress = (i + 1) / total_minibatches_in_epoch
+            epoch_elapsed = current_time - epoch_start_time
+            epoch_eta_sec = (epoch_elapsed / epoch_progress - epoch_elapsed) if epoch_progress > 0 else 0
+
+            total_progress = (global_step + 1) / exp_config["num_training_steps"]
+            total_elapsed = current_time - training_start_time
+            total_eta_sec = (total_elapsed / total_progress - total_elapsed) if total_progress > 0 else 0
+
             steps_accumulated = accumulators["count"]
 
             if steps_accumulated > 0:  # Ensure there's something to log
@@ -444,7 +458,10 @@ for epoch in range(start_epoch, exp_config["num_epochs"]):
                     f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
                     f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}",
                     f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                    f"Tok/s {short_num(tokens_per_second)}"
+                    f"Tok/s {short_num(tokens_per_second)}",
+                    f"Bytes {short_num(total_bytes_processed)}",
+                    f"ETAe {format_duration(epoch_eta_sec)}",
+                    f"ETAt {format_duration(total_eta_sec)}"
                 ]
 
                 # Mimicking the original postfix_dict logic for specific items
