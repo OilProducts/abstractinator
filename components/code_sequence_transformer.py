@@ -6,8 +6,9 @@ from .expander import EncoderBlock
 # Disable torch.compile on this module to keep unit tests lightweight
 class CodeSequenceTransformer(nn.Module):
     """
-    A standard Transformer encoder stack to process sequences of codes.
-    Can be used for language modeling on codes or extracting contextual representations.
+    A causal Transformer encoder stack to process sequences of codes.
+    It can be used for language modeling on codes or extracting contextual
+    representations.
     """
 
     def __init__(self,
@@ -25,7 +26,7 @@ class CodeSequenceTransformer(nn.Module):
 
         self.token_embedding = nn.Embedding(code_vocab_size, dim)
         self.encoder = nn.ModuleList([
-            EncoderBlock(dim, num_heads, dim * ffn_dim_multiplier)
+            EncoderBlock(dim, num_heads, dim * ffn_dim_multiplier, causal=True)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.RMSNorm(dim)
