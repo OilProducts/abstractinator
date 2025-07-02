@@ -10,6 +10,27 @@ from .rope import apply_rope
 from .swiglu import SwiGLU
 from typing import Optional, Tuple
 
+
+def _cached_cross_window_mask(q_len: int, kv_len: int, window: int,
+                              device: torch.device) -> torch.Tensor:
+    """Return a cached cross-window mask on ``device``."""
+    cache_key = (
+        q_len,
+        kv_len,
+        window,
+        device.index if device.type == "cuda" else -1,
+    )
+    cache = _cached_cross_window_mask.__dict__.setdefault("cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    q_idx = torch.arange(q_len, device=device)[:, None]
+    kv_idx = torch.arange(kv_len, device=device)[None, :]
+    rel_pos = kv_idx - q_idx
+    mask = (rel_pos > 0) | (rel_pos < -window)
+    cache[cache_key] = mask
+    return mask
+
 # @torch.compile
 class LocalSlidingWindowAttention(nn.Module):
     """
@@ -288,11 +309,7 @@ class SlidingWindowCrossAttention(nn.Module):
     def _cross_window_mask(self, q_len: int, kv_len: int,
                            device: torch.device) -> torch.Tensor:
         """Mask restricting queries to attend within a retrospective window."""
-        q_idx = torch.arange(q_len, device=device)[:, None]
-        kv_idx = torch.arange(kv_len, device=device)[None, :]
-        rel_pos = kv_idx - q_idx
-        mask = (rel_pos > 0) | (rel_pos < -self.window_size)
-        return mask
+        return _cached_cross_window_mask(q_len, kv_len, self.window_size, device)
 
     def forward(self,
                 query: torch.Tensor,
