@@ -41,9 +41,13 @@ class ByteSegmentCompressor(nn.Module):
                  encoder_ffn_dim_multiplier: int = 4,
                  num_queries: int = 1, # L: Number of queries per segment for the pooler
                  codebook_size: int = 512,    # K: Number of codes in VQ codebook
-                 beta: float = 0.25):          # Beta for VQ commitment loss
+                 beta: float = 0.25,          # Beta for VQ commitment loss
+                 entropy_delta: float = 0.2,
+                 entropy_abs_threshold: float | None = None):
         super().__init__()
         self.num_queries_per_segment = num_queries # Store L for convenience
+        self.entropy_delta = entropy_delta
+        self.entropy_abs_threshold = entropy_abs_threshold
 
         # Initialize the token encoder
         # Uses StackedSlidingWindowEncoder for token encoding
@@ -110,7 +114,11 @@ class ByteSegmentCompressor(nn.Module):
         with torch.no_grad():
             # token_entropy and entropy_segments are assumed to be defined elsewhere
             entropy = token_entropy(logits)  # (B,S)
-            seg_id = entropy_segments(entropy) # (B,S), integer segment IDs
+            seg_id = entropy_segments(
+                entropy,
+                increase_delta=self.entropy_delta,
+                abs_threshold=self.entropy_abs_threshold,
+            )
         # seg_id now maps each token position to a segment index.
         patch_end_mask = torch.zeros_like(seg_id, dtype=torch.bool)
         if seg_id.size(1) > 0:
