@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import List, Dict, Any, Optional, Tuple
 
 from .byte_segment_compressor import ByteSegmentCompressor
-from .expander import CodeExpander
+from .expander import CodeExpander, DecoderOnlyExpander
 from .code_sequence_transformer import CodeSequenceTransformer
 
 class HierarchicalAutoencoder(nn.Module):
@@ -29,6 +29,8 @@ class HierarchicalAutoencoder(nn.Module):
         expander_heads_scale: Multiplier for attention heads in expanders.
         expander_eos_id: Token used as EOS/BOS for expanders.
         expander_max_len: Maximum length an expander may generate.
+        use_decoder_only_expander: If ``True`` use :class:`DecoderOnlyExpander`
+            instead of the default :class:`CodeExpander`.
         propagate_key_padding_mask: Whether to propagate padding masks between
             levels.
         aux_lm_loss_weight: Weight of auxiliary language-modeling losses on
@@ -48,6 +50,7 @@ class HierarchicalAutoencoder(nn.Module):
                  expander_heads_scale: float = 1.0,
                  expander_eos_id: int = 1,
                  expander_max_len: int = 2048,
+                 use_decoder_only_expander: bool = False,
                  propagate_key_padding_mask: bool = True,
                  aux_lm_loss_weight: float = 0.1,
                  top_transformer_config: Optional[Dict[str, Any]] = None,
@@ -64,6 +67,7 @@ class HierarchicalAutoencoder(nn.Module):
         self.expander_eos_id = expander_eos_id  # Used as BOS in CodeExpander
         self.propagate_key_padding_mask = propagate_key_padding_mask
         self.aux_lm_loss_weight = aux_lm_loss_weight  # Weight for auxiliary LM loss
+        self.use_decoder_only_expander = use_decoder_only_expander
 
         self.top_transformer_config = top_transformer_config
         self.top_lm_loss_weight = top_lm_loss_weight
@@ -139,12 +143,28 @@ class HierarchicalAutoencoder(nn.Module):
             exp_dim = int(base_comp_config['dim'] * expander_dim_scale)
             exp_heads = max(1, int(base_comp_config['heads'] * expander_heads_scale))
 
-            expander = CodeExpander(  # Using updated CodeExpander
-                K_hi=k_hi, K_lo=k_lo, D=exp_dim,
-                N_enc=expander_num_enc_layers, N_dec=expander_num_dec_layers,
-                H=exp_heads,
-                eos_id=expander_eos_id, max_len=expander_max_len
-            )
+            if self.use_decoder_only_expander:
+                expander = DecoderOnlyExpander(
+                    K_hi=k_hi,
+                    K_lo=k_lo,
+                    D=exp_dim,
+                    N_dec=expander_num_dec_layers,
+                    H=exp_heads,
+                    cross_window=base_comp_config.get('window', 128),
+                    eos_id=expander_eos_id,
+                    max_len=expander_max_len,
+                )
+            else:
+                expander = CodeExpander(
+                    K_hi=k_hi,
+                    K_lo=k_lo,
+                    D=exp_dim,
+                    N_enc=expander_num_enc_layers,
+                    N_dec=expander_num_dec_layers,
+                    H=exp_heads,
+                    eos_id=expander_eos_id,
+                    max_len=expander_max_len,
+                )
             self.expanders.append(expander)
 
     def compress(self, tokens: torch.Tensor,

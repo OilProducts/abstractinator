@@ -73,6 +73,7 @@ if __name__ == "__main__":
         expander_heads_scale=exp_config["expander_heads_scale"],
         expander_eos_id=exp_config["expander_eos_id"],
         expander_max_len=exp_config["expander_max_len"],  # Pass expander_max_len
+        use_decoder_only_expander=exp_config.get("use_decoder_only_expander", False),
         propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
         aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
         top_transformer_config=exp_config.get("top_transformer_config", None),  # <<< ADDED
