@@ -51,6 +51,20 @@ def test_entropy_segments_basic_increase():
     assert torch.equal(seg, expected)
 
 
+def test_entropy_segments_with_threshold():
+    ent = torch.tensor([[0.5, 1.1, 1.2, 0.9, 1.3]])
+    seg = entropy_segments(ent, abs_threshold=1.0)
+    expected = torch.tensor([[0, 1, 2, 2, 3]])
+    assert torch.equal(seg, expected)
+
+
+def test_entropy_segments_custom_delta():
+    ent = torch.tensor([[1.0, 1.1, 1.4, 1.45]])
+    seg = entropy_segments(ent, increase_delta=0.3)
+    expected = torch.tensor([[0, 0, 0, 0]])
+    assert torch.equal(seg, expected)
+
+
 def test_entropy_segments_edge_cases():
     # No increase -> single segment
     ent = torch.tensor([[1.0, 0.9, 0.8]])

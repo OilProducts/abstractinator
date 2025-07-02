@@ -75,13 +75,18 @@ class HierarchicalAutoencoder(nn.Module):
 
         for i in range(num_levels):
             config = compressor_level_configs[i]
-            compressor = ByteSegmentCompressor(  # Assuming ByteSegmentCompressor is defined
+            compressor = ByteSegmentCompressor(
                 vocab_size=current_input_vocab_size,
-                dim=config['dim'], heads=config['heads'], window=config['window'],
+                dim=config['dim'],
+                heads=config['heads'],
+                window=config['window'],
                 num_encoder_layers=config.get('num_encoder_layers', 3),
                 encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4),
                 num_queries=config['num_queries'],
-                codebook_size=config['codebook_size'], beta=config['beta']
+                codebook_size=config['codebook_size'],
+                beta=config['beta'],
+                entropy_delta=config.get('entropy_delta', 0.2),
+                entropy_abs_threshold=config.get('entropy_abs_threshold'),
             )
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])

@@ -69,7 +69,9 @@ Key modules under `components/` include:
 - **ByteSegmentCompressor** – Encodes a byte sequence with a local sliding-window
   transformer, divides it into variable‑length segments using token entropy, and
   pools each segment with learned queries before vector quantization.  The
-  result is a shorter sequence of discrete codes.
+  segmentation behaviour can be tuned with ``entropy_delta`` and
+  ``entropy_abs_threshold`` in ``compressor_level_configs``. The result is a
+  shorter sequence of discrete codes.
 - **CodeExpander** – A sequence‑to‑sequence transformer that learns to map a
   sequence of higher-level codes back into the lower-level sequence from which
   they were produced. During generation it autoregressively expands codes.

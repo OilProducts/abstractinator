@@ -112,22 +112,31 @@ def token_entropy(logits: torch.Tensor) -> torch.Tensor:
 
     return entropy
 
-def entropy_segments(ent: torch.Tensor) -> torch.Tensor:
-    """
-    Generates segment IDs for sequences based on increasing per-token entropy.
+def entropy_segments(
+    ent: torch.Tensor,
+    *,
+    increase_delta: float = 0.2,
+    abs_threshold: float | None = None,
+) -> torch.Tensor:
+    """Generate segment IDs based on token entropy.
 
-    A new segment is initiated whenever the entropy of the current token is
-    strictly greater than the entropy of the immediately preceding token.
-    The first token of any sequence always starts segment 0.
+    A new segment begins when either:
+
+    1. The current token's entropy exceeds ``abs_threshold`` (if provided).
+    2. The entropy increased by more than ``increase_delta`` compared to the
+       previous token.
+
+    The first token of each sequence always starts segment ``0``.
 
     Args:
-        ent (torch.Tensor): A tensor of per-token entropies.
-            Expected shape: (batch_size, sequence_length).
+        ent: Tensor of per-token entropies ``(B, S)``.
+        increase_delta: Minimum increase from the previous token required to
+            start a new segment.
+        abs_threshold: Optional absolute entropy level that also triggers a new
+            segment when crossed.
 
     Returns:
-        torch.Tensor: A tensor of segment IDs assigned to each token.
-            Segment IDs are 0-indexed and increment within each sequence in the batch.
-            Shape: (batch_size, sequence_length).
+        Integer tensor of segment IDs ``(B, S)``.
     """
     if ent.ndim != 2:
         raise ValueError(f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}")
@@ -139,7 +148,9 @@ def entropy_segments(ent: torch.Tensor) -> torch.Tensor:
     # Determine where entropy increases compared to the previous token.
     # ent[:, 1:] compares ent[t] with ent[t-1] for t from 1 to S-1.
     # Shape: (batch_size, sequence_length - 1)
-    entropy_increased = (ent[:, 1:] > ent[:, :-1] + .2)
+    entropy_increased = ent[:, 1:] > ent[:, :-1] + increase_delta
+    if abs_threshold is not None:
+        entropy_increased |= ent[:, 1:] > abs_threshold
 
     # Convert boolean to integer (True -> 1, False -> 0)
     # These are indicators for starting a new segment (incrementing segment ID).
