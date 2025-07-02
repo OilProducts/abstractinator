@@ -179,7 +179,7 @@ class VectorQuantizer(nn.Module):
 
         counts = counts.clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
-        entropy = -(probs.double() * probs.double().log()).sum()
+        entropy = -(probs.float() * probs.float().log()).sum()
         perplexity = entropy.exp().float()
 
         return z_q_ste, vq_loss, indices.view(B, Q), perplexity.detach()

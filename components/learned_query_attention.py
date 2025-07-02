@@ -6,7 +6,7 @@ import math
 
 from .utils import safe_softmax
 
-@torch.compile
+# @torch.compile
 class LearnedQueryAttention(nn.Module):
     """
     Multi-Head Attention where queries are derived from a set of learned vectors.

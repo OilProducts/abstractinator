@@ -109,7 +109,7 @@ class LocalSlidingWindowAttention(nn.Module):
         out = self.o_proj(out)
         return out
 
-@torch.compile
+# @torch.compile
 class SlidingWindowAttention(nn.Module):
     """Multi-head scaled-dot-product attention restricted to a fixed retrospective window.
 
@@ -263,7 +263,7 @@ class SlidingWindowAttention(nn.Module):
 
         return output
 
-@torch.compile
+# @torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
     A single Transformer block using SlidingWindowAttention (Pre-LN variant).
@@ -326,7 +326,7 @@ class SlidingWindowTransformerBlock(nn.Module):
 
         return x
 
-@torch.compile
+# @torch.compile
 class StackedSlidingWindowEncoder(nn.Module):
     """
     A Transformer-style encoder composed of a stack of SlidingWindowTransformerBlock layers.

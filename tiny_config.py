@@ -16,7 +16,7 @@ exp_config = {
     "num_levels": 1,
     "initial_vocab_size": 259,
     "compressor_level_configs": [
-        {"dim": 128, "heads": 4, "window": 512,
+        {"dim": 128, "heads": 4, "window": 128,
          "num_encoder_layers": 4,
          'encoder_ffn_dim_multiplier': 4,
          'max_seq_len_encoder': 4096,
