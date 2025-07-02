@@ -442,9 +442,6 @@ if __name__ == "__main__":
 
                 # Update global byte count and compute ETAs
                 total_bytes_processed += tokens_processed_this_window
-                epoch_progress = (i + 1) / total_minibatches_in_epoch
-                epoch_elapsed = current_time - epoch_start_time
-                epoch_eta_sec = (epoch_elapsed / epoch_progress - epoch_elapsed) if epoch_progress > 0 else 0
 
                 total_progress = (global_step + 1) / exp_config["num_training_steps"]
                 total_elapsed = current_time - training_start_time
@@ -463,7 +460,6 @@ if __name__ == "__main__":
                         f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
                         f"Tok/s {short_num(tokens_per_second)}",
                         f"Bytes {short_num(total_bytes_processed)}",
-                        f"ETAe {format_duration(epoch_eta_sec)}",
                         f"ETAt {format_duration(total_eta_sec)}"
                     ]
 
