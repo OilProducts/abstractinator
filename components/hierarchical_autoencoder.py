@@ -97,39 +97,21 @@ class HierarchicalAutoencoder(nn.Module):
             current_input_vocab_size = config['codebook_size']
 
         if self.top_transformer_config and self.num_levels > 0:
-            if not self.actual_codebook_sizes:
-                raise ValueError(
-                    "Compressor stack must be configured before top_transformer (actual_codebook_sizes is empty).")
-
-            top_code_vocab_size = self.actual_codebook_sizes[-1]  # Vocab of the highest level codes
-
-            # The dimension for the CodeSequenceTransformer can be independent or related to
-            # the last compressor's dimension. Let's assume it's specified in its config.
-            # If top_transformer_config['dim'] is not set, it could default to last compressor's dim.
-            # For simplicity, assume top_transformer_config contains all necessary args for CodeSequenceTransformer.
-
-            transformer_dim = self.top_transformer_config.get('dim')
-            if transformer_dim is None:
-                # Default to the dimension of the codes it will process (output dim of last compressor)
-                # This assumes the codes themselves are indices, and CST will embed them.
-                # The 'dim' of the last compressor config is the dim of its *continuous vectors* before VQ.
-                # For CodeSequenceTransformer, its 'dim' is its internal model dimension.
-                # It's better if top_transformer_config explicitly defines its 'dim'.
-                # Let's raise an error if not explicitly set, or define a clear default logic.
-                # For this example, let's assume it's in the config:
-                if 'dim' not in self.top_transformer_config:
-                    raise ValueError("'dim' must be specified in top_transformer_config")
+            embed_dim = compressor_level_configs[-1]["dim"]
+            cfg = self.top_transformer_config
+            transformer_dim = cfg.get("dim", embed_dim)
 
             self.code_sequence_transformer = CodeSequenceTransformer(
-                code_vocab_size=top_code_vocab_size,
-                dim=self.top_transformer_config['dim'],
-                num_layers=self.top_transformer_config.get('num_layers', 4),
-                num_heads=self.top_transformer_config.get('num_heads', 8),
-                ffn_dim_multiplier=self.top_transformer_config.get('ffn_dim_multiplier', 4),
-                output_lm_logits=self.top_transformer_config.get('output_lm_logits', True)
+                embed_dim=embed_dim,
+                dim=transformer_dim,
+                num_layers=cfg.get("num_layers", 4),
+                num_heads=cfg.get("num_heads", 8),
+                ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", 4),
+                vq=self.compressors[-1].vq,
             )
             print(
-                f"Initialized CodeSequenceTransformer for top codes (vocab: {top_code_vocab_size}, dim: {self.top_transformer_config['dim']})")
+                f"Initialized CodeSequenceTransformer for continuous codes (embed_dim: {embed_dim}, dim: {transformer_dim})"
+            )
 
         else:
             self.code_sequence_transformer = None
@@ -413,44 +395,35 @@ class HierarchicalAutoencoder(nn.Module):
         avg_top_code_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
         top_code_lm_loss_details: Dict[str, torch.Tensor] = {}  # For consistency, though only one level here
 
-        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and top_codes.numel() > 0:
-            cst_output_dict = self.code_sequence_transformer(
-                input_codes=top_codes,
-                key_padding_mask=kpm_for_top_codes
+        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and compression_results['all_continuous'][-1].numel() > 0:
+            cont = compression_results['all_continuous'][-1]
+            cst_out = self.code_sequence_transformer(
+                input_embeddings=cont,
+                key_padding_mask=kpm_for_top_codes,
             )
-            top_code_lm_logits = cst_output_dict.get('logits')
+            preds = cst_out['predictions']
+            vq_loss_top = cst_out['vq_loss']
 
-            if top_code_lm_logits is not None:
-                # Calculate LM loss: predict next top_code
-                if top_codes.size(1) <= 1:  # Not enough length for next token prediction
-                    current_top_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-                else:
-                    logits_for_pred = top_code_lm_logits[:, :-1, :]  # (B, S_top-1, V_top)
-                    targets_for_pred = top_codes[:, 1:]  # (B, S_top-1)
-
-                    kpm_for_shifted_targets = None
-                    if kpm_for_top_codes is not None:
-                        kpm_for_shifted_targets = kpm_for_top_codes[:, 1:]
-
-                    loss_per_token = F.cross_entropy(
-                        logits_for_pred.reshape(-1, logits_for_pred.size(-1)),
-                        targets_for_pred.reshape(-1),
-                        reduction='none'
-                    ).view_as(targets_for_pred)
-
-                    if kpm_for_shifted_targets is not None:
-                        loss_mask = ~kpm_for_shifted_targets
-                        valid_targets_count = loss_mask.sum()
-                        if valid_targets_count > 0:
-                            current_top_lm_loss = (loss_per_token * loss_mask).sum() / valid_targets_count.clamp(
-                                min=1e-9)
-                        else:
-                            current_top_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+            if cont.size(1) <= 1:
+                mse_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+            else:
+                pred = preds[:, :-1, :]
+                target = cont[:, 1:, :]
+                mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
+                per_tok = F.mse_loss(pred, target, reduction='none').mean(dim=-1)
+                if mask is not None:
+                    loss_mask = ~mask
+                    valid_targets = loss_mask.sum()
+                    if valid_targets > 0:
+                        mse_loss = (per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
                     else:
-                        current_top_lm_loss = loss_per_token.mean()
+                        mse_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                else:
+                    mse_loss = per_tok.mean()
 
-                avg_top_code_lm_loss = current_top_lm_loss  # Since it's a single loss term, not averaged over levels
-                top_code_lm_loss_details["top_code_lm_loss"] = avg_top_code_lm_loss
+            avg_top_code_lm_loss = mse_loss + vq_loss_top
+            top_code_lm_loss_details["top_code_mse"] = mse_loss
+            top_code_lm_loss_details["top_code_vq_loss"] = vq_loss_top
 
         # 2. Prepare targets and their KPMs for the expander stack (teacher forcing)
         targets_for_expander_stack: List[torch.Tensor] = []
@@ -683,32 +656,34 @@ class HierarchicalAutoencoder(nn.Module):
         """
         self.eval()
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
-        top_codes = compression_results['top_codes']
+        top_cont = compression_results['all_continuous'][-1]
         kpm_for_top_expander_input = compression_results['final_key_padding_mask']
 
-        generated_top_codes = top_codes
+        generated_cont = top_cont
         generated_kpm = kpm_for_top_expander_input
 
         if self.code_sequence_transformer is not None:
-            # Autoregressively extend the sequence of top codes
+            # Autoregressively extend using continuous predictions
             while True:
-                if max_len_override is not None and generated_top_codes.size(1) >= max_len_override:
+                if max_len_override is not None and generated_cont.size(1) >= max_len_override:
                     break
 
-                next_code = self.code_sequence_transformer.generate_codes(
-                    prefix=generated_top_codes,
+                out = self.code_sequence_transformer(
+                    input_embeddings=generated_cont,
                     key_padding_mask=generated_kpm,
                 )
-                generated_top_codes = torch.cat([generated_top_codes, next_code], dim=1)
+                next_vec = out["predictions"][:, -1, :]
+                next_idx = out["indices"][:, -1] if out["indices"] is not None else None
+                generated_cont = torch.cat([generated_cont, next_vec.unsqueeze(1)], dim=1)
                 if generated_kpm is not None:
                     pad = torch.zeros(generated_kpm.size(0), 1, dtype=generated_kpm.dtype, device=generated_kpm.device)
                     generated_kpm = torch.cat([generated_kpm, pad], dim=1)
 
-                if (next_code == self.expander_eos_id).all():
+                if next_idx is not None and (next_idx == self.expander_eos_id).all():
                     break
 
         decomp = self.decompress(
-            top_codes=generated_top_codes,
+            top_codes=generated_cont,
             top_codes_key_padding_mask=generated_kpm,
             targets_for_teacher_forcing=None,
             max_len_override=max_len_override,

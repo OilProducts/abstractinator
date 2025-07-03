@@ -37,12 +37,12 @@ exp_config = {
     "aux_lm_loss_weight": 1.0,
     "top_lm_loss_weight": 0.2,
     "top_transformer_config": {
+        "embed_dim": 768,
         "dim": 768,
         "num_layers": 16,
         "num_heads": 12,
         "ffn_dim_multiplier": 4,
-        "max_seq_len": 2048,
-        "output_lm_logits": True
+        "continuous": True,
     },
     "learning_rate": 1e-4,
     "batch_size": 16,
