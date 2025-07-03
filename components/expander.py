@@ -259,12 +259,16 @@ class CodeExpander(nn.Module):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        B, L_hi = codes_hi.shape
+        if codes_hi.is_floating_point():
+            B, L_hi, _ = codes_hi.shape
+            memory_input = codes_hi
+        else:
+            B, L_hi = codes_hi.shape
+            memory_input = self.emb_hi(codes_hi)
         _, L_lo = codes_lo.shape
         device = codes_hi.device
 
-        enc_inp = self.emb_hi(codes_hi)
-        memory = self.encoder(enc_inp, key_padding_mask=src_key_padding_mask)
+        memory = self.encoder(memory_input, key_padding_mask=src_key_padding_mask)
 
         decoder_input_ids = F.pad(codes_lo[:, :-1], (1, 0), value=self.eos_id)
         dec_inp = self.emb_lo(decoder_input_ids)
@@ -290,11 +294,16 @@ class CodeExpander(nn.Module):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         max_len: Optional[int] = None,
     ) -> torch.Tensor:
-        B, L_hi = codes_hi.shape
+        if codes_hi.is_floating_point():
+            B, L_hi, _ = codes_hi.shape
+            memory_input = codes_hi
+        else:
+            B, L_hi = codes_hi.shape
+            memory_input = self.emb_hi(codes_hi)
         device = codes_hi.device
         current_max_len = max_len if max_len is not None else self.max_len
 
-        memory = self.encoder(self.emb_hi(codes_hi), key_padding_mask=src_key_padding_mask)
+        memory = self.encoder(memory_input, key_padding_mask=src_key_padding_mask)
 
         generated_ids = torch.full((B, 1), self.eos_id, dtype=torch.long, device=device)
 
@@ -353,7 +362,10 @@ class DecoderOnlyExpander(nn.Module):
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = codes_hi.device
-        memory = self.emb_hi(codes_hi)
+        if codes_hi.is_floating_point():
+            memory = codes_hi
+        else:
+            memory = self.emb_hi(codes_hi)
 
         decoder_input_ids = F.pad(codes_lo[:, :-1], (1, 0), value=self.eos_id)
         dec_inp = self.emb_lo(decoder_input_ids)
@@ -382,7 +394,10 @@ class DecoderOnlyExpander(nn.Module):
         device = codes_hi.device
         current_max_len = max_len if max_len is not None else self.max_len
 
-        memory = self.emb_hi(codes_hi)
+        if codes_hi.is_floating_point():
+            memory = codes_hi
+        else:
+            memory = self.emb_hi(codes_hi)
 
         generated_ids = torch.full((codes_hi.size(0), 1), self.eos_id, dtype=torch.long, device=device)
 
