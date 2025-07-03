@@ -11,23 +11,20 @@ from .swiglu import SwiGLU
 from typing import Optional, Tuple
 
 
-def _cached_cross_window_mask(q_len: int, kv_len: int, window: int,
-                              device: torch.device) -> torch.Tensor:
-    """Return a cached cross-window mask on ``device``."""
-    cache_key = (
-        q_len,
-        kv_len,
-        window,
-        device.index if device.type == "cuda" else -1,
-    )
+def _cached_cross_window_mask(
+    q_len: int, kv_len: int, window: int, device: torch.device
+) -> torch.Tensor:
+    """Return a cached mask for the usable slice of each query position."""
+
+    cache_key = (q_len, kv_len, window, device.index if device.type == "cuda" else -1)
     cache = _cached_cross_window_mask.__dict__.setdefault("cache", {})
     if cache_key in cache:
         return cache[cache_key]
 
-    q_idx = torch.arange(q_len, device=device)[:, None]
-    kv_idx = torch.arange(kv_len, device=device)[None, :]
-    rel_pos = kv_idx - q_idx
-    mask = (rel_pos > 0) | (rel_pos < -window)
+    # Indices of keys for each query's window: [q-window, q]
+    idx = torch.arange(-window, kv_len, device=device)
+    idx = idx.unfold(0, window + 1, step=1)[:q_len]
+    mask = (idx < 0) | (idx >= kv_len)
     cache[cache_key] = mask
     return mask
 
@@ -311,45 +308,58 @@ class SlidingWindowCrossAttention(nn.Module):
         """Mask restricting queries to attend within a retrospective window."""
         return _cached_cross_window_mask(q_len, kv_len, self.window_size, device)
 
-    def forward(self,
-                query: torch.Tensor,
-                key: torch.Tensor,
-                value: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None,
-                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, S_q, D = query.shape
         if D != self.embed_dim or key.size(2) != self.embed_dim or value.size(2) != self.embed_dim:
             raise ValueError("embed_dim mismatch")
         S_k = key.size(1)
 
-        q = self.q_proj(query).view(B, S_q, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(key).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(value).view(B, S_k, self.num_heads, self.head_dim).transpose(1, 2)
+        H, d = self.num_heads, self.head_dim
+
+        q = self.q_proj(query).view(B, S_q, H, d).transpose(1, 2)
+        k = self.k_proj(key).view(B, S_k, H, d).transpose(1, 2)
+        v = self.v_proj(value).view(B, S_k, H, d).transpose(1, 2)
 
         q = apply_rope(q)
         k = apply_rope(k)
-        q = q * (self.head_dim ** -0.5)
+        q = q * (d ** -0.5)
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1))
+        # --- gather sliding windows for K and V ---
+        pad_left = self.window_size
+        k_pad = F.pad(k, (0, 0, pad_left, 0))
+        v_pad = F.pad(v, (0, 0, pad_left, 0))
+        k_win = k_pad.unfold(2, pad_left + 1, 1).permute(0, 1, 2, 4, 3)[:, :, :S_q]
+        v_win = v_pad.unfold(2, pad_left + 1, 1).permute(0, 1, 2, 4, 3)[:, :, :S_q]
 
-        combined_mask = self._cross_window_mask(S_q, S_k, query.device)
+        # Attention scores only over local windows
+        attn_scores = (q.unsqueeze(-2) * k_win).sum(-1)
 
-        if attn_mask is not None:
-            combined_mask = combined_mask | attn_mask.to(device=query.device, dtype=torch.bool)
-
-        combined_mask = combined_mask.unsqueeze(0).unsqueeze(0)
-
+        # Build mask for positions outside the valid kv range
+        local_mask = self._cross_window_mask(S_q, S_k, query.device)
+        mask = local_mask.unsqueeze(0).expand(B, -1, -1)
         if key_padding_mask is not None:
-            expanded_kpm = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            combined_mask = combined_mask | expanded_kpm
+            idx = torch.arange(-self.window_size, S_k, device=query.device)
+            idx = idx.unfold(0, self.window_size + 1, 1)[:S_q]
+            gather_idx = idx.clamp(min=0, max=S_k - 1)
+            kpm = key_padding_mask[:, gather_idx]
+            mask = mask | kpm
 
-        attn_scores = attn_scores.masked_fill(combined_mask, float('-inf'))
-        attn_probs = safe_softmax(attn_scores, combined_mask, dim=-1)
-        output = torch.matmul(attn_probs, v)
-        output = output.transpose(1, 2).contiguous().view(B, S_q, self.embed_dim)
-        output = self.out_proj(output)
+        mask = mask.unsqueeze(1)  # (B,1,S_q,w)
 
-        return output
+        attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+        attn_probs = safe_softmax(attn_scores, mask, dim=-1)
+
+        ctx = (attn_probs.unsqueeze(-1) * v_win).sum(-2)
+        ctx = ctx.transpose(1, 2).contiguous().view(B, S_q, self.embed_dim)
+        ctx = self.out_proj(ctx)
+        return ctx
 
 # @torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
