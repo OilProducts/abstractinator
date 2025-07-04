@@ -356,6 +356,9 @@ if __name__ == "__main__":
             "non_padded_tokens": 0,  # For tokens/sec
             "count": 0, # To track number of batches accumulated
             "avg_top_code_lm_loss": 0.0,
+            "top_code_lm_loss_details": defaultdict(float),
+            "top_code_mse": 0.0,
+            "top_code_vq_loss": 0.0,
         }
         return accumulators
 
@@ -407,6 +410,12 @@ if __name__ == "__main__":
 
             if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
                 accumulators["avg_top_code_lm_loss"] += output_dict['avg_top_code_lm_loss'].item()
+                for key, value in output_dict['top_code_lm_loss_details'].items():
+                    accumulators["top_code_lm_loss_details"][key] += value.item()
+                    if key == 'top_code_mse':
+                        accumulators['top_code_mse'] += value.item()
+                    elif key == 'top_code_vq_loss':
+                        accumulators['top_code_vq_loss'] += value.item()
 
             if 'compression_ratios' in output_dict:
                 for level_idx, ratio in enumerate(output_dict['compression_ratios']):
@@ -467,6 +476,12 @@ if __name__ == "__main__":
                     if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
                         # TQDM showed the last batch's value for this
                         console_log_parts.append(f"TopLM {output_dict['avg_top_code_lm_loss'].item():.4f}")
+                        if 'top_code_lm_loss_details' in output_dict:
+                            tcld = output_dict['top_code_lm_loss_details']
+                            if 'top_code_mse' in tcld:
+                                console_log_parts.append(f"TopMSE {tcld['top_code_mse'].item():.4f}")
+                            if 'top_code_vq_loss' in tcld:
+                                console_log_parts.append(f"TopVQ {tcld['top_code_vq_loss'].item():.4f}")
 
                     if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config[
                         "num_levels"]:
@@ -496,6 +511,10 @@ if __name__ == "__main__":
                         mlflow.log_metric('loss/reconstruction_avg_accum', accumulators["avg_reconstruction_loss"] / steps_accumulated, step=global_step)
                         mlflow.log_metric('performance/tokens_per_sec', tokens_per_second, step=global_step)
                         mlflow.log_metric('loss/top_code_lm_avg_accum', accumulators["avg_top_code_lm_loss"] / steps_accumulated, step=global_step)
+                        mlflow.log_metric('loss/top_code_mse_avg_accum', accumulators['top_code_mse'] / steps_accumulated, step=global_step)
+                        mlflow.log_metric('loss/top_code_vq_avg_accum', accumulators['top_code_vq_loss'] / steps_accumulated, step=global_step)
+                        for key, value in accumulators["top_code_lm_loss_details"].items():
+                            mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
 
                         for key, value in accumulators["reconstruction_loss_details"].items():
                             mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
