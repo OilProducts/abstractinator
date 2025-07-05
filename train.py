@@ -77,7 +77,8 @@ if __name__ == "__main__":
         propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
         aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
         top_transformer_config=exp_config.get("top_transformer_config", None),  # <<< ADDED
-        top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0)
+        top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0),
+        use_continuous_expander_inputs=exp_config.get("use_continuous_expander_inputs", False)
     ).to(DEVICE)
 
     # model = torch.compile(model, mode="default", dynamic=True)
