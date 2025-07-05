@@ -188,6 +188,7 @@ class ByteSegmentCompressor(nn.Module):
             'patch_end_mask': patch_end_mask,
             'encoder_logits': logits,
             'current_codebook_perplexity': codebook_perplexity,
-            'smoothed_codebook_perplexity': perplexity
+            'smoothed_codebook_perplexity': perplexity,
+            'pre_vq_embeddings': pooled_embeddings,
         }
         return return_dict

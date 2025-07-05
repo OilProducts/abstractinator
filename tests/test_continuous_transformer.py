@@ -14,6 +14,7 @@ def test_continuous_transformer_forward():
     model = CodeSequenceTransformer(embed_dim=4, dim=8, num_layers=1, num_heads=1, vq=vq)
     x = torch.randn(2, 3, 4)
     out = model(x)
+    assert out["predictions_pre_vq"].shape == x.shape
     assert out["predictions"].shape == x.shape
     assert out["indices"].shape == (2, 3)
     assert out["vq_loss"].requires_grad
