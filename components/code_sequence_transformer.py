@@ -53,14 +53,16 @@ class CodeSequenceTransformer(nn.Module):
             x = layer(x, key_padding_mask=key_padding_mask)
         hidden_states = self.final_norm(x)
 
-        preds = self.out_proj(hidden_states)
+        preds_pre_vq = self.out_proj(hidden_states)
+        preds = preds_pre_vq
         vq_loss = torch.tensor(0.0, device=preds.device)
         indices = None
         if self.vq is not None:
-            preds, vq_loss, indices, _ = self.vq(preds)
+            preds, vq_loss, indices, _ = self.vq(preds_pre_vq)
 
         return {
             "hidden_states": hidden_states,
+            "predictions_pre_vq": preds_pre_vq,
             "predictions": preds,
             "indices": indices,
             "vq_loss": vq_loss,
@@ -83,7 +85,7 @@ class CodeSequenceTransformer(nn.Module):
 
         for _ in range(max_steps):
             out = self.forward(generated, key_padding_mask=kpm)
-            next_vec = out["predictions"][:, -1, :]
+            next_vec = out["predictions_pre_vq"][:, -1, :]
             next_idx = out["indices"][:, -1] if out["indices"] is not None else None
 
             generated = torch.cat([generated, next_vec.unsqueeze(1)], dim=1)

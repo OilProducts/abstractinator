@@ -163,8 +163,8 @@ class HierarchicalAutoencoder(nn.Module):
             Dictionary with keys:
                 ``'top_codes'`` – output of the last compressor;
                 ``'all_codes'`` – list of code tensors from each level;
-                ``'all_continuous'`` – list of continuous embeddings before
-                quantization;
+                ``'all_continuous'`` – list of quantized segment embeddings;
+                ``'all_pre_vq'`` – list of embeddings prior to vector quantization;
                 ``'vq_loss'`` – accumulated vector‑quantization loss;
                 ``'final_key_padding_mask'`` – padding mask for ``top_codes``;
                 ``'compression_ratios'`` – ratio of output length to input length
@@ -175,6 +175,7 @@ class HierarchicalAutoencoder(nn.Module):
         """
         all_codes_list: List[torch.Tensor] = []
         all_continuous_list: List[torch.Tensor] = []
+        all_pre_vq_list: List[torch.Tensor] = []
         all_input_seq_lengths: List[float] = []
         all_output_seq_lengths: List[float] = []
         # Stores valid_masks (per segment) from each compressor to reconstruct KPMs later.
@@ -213,6 +214,7 @@ class HierarchicalAutoencoder(nn.Module):
 
             all_codes_list.append(output_codes)
             all_continuous_list.append(comp_out['continuous'])
+            all_pre_vq_list.append(comp_out['pre_vq_embeddings'])
             all_encoder_logits_list.append(encoder_logits_level_i)
             total_vq_loss += comp_out['vq_loss']
 
@@ -258,6 +260,7 @@ class HierarchicalAutoencoder(nn.Module):
                                                                               device=tokens.device),
             'all_codes': all_codes_list,
             'all_continuous': all_continuous_list,
+            'all_pre_vq': all_pre_vq_list,
             'vq_loss': total_vq_loss,
             'final_key_padding_mask': current_kpm,  # KPM for top_codes
             'compression_ratios': compression_ratios,
@@ -395,19 +398,19 @@ class HierarchicalAutoencoder(nn.Module):
         avg_top_code_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
         top_code_lm_loss_details: Dict[str, torch.Tensor] = {}  # For consistency, though only one level here
 
-        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and compression_results['all_continuous'][-1].numel() > 0:
-            cont = compression_results['all_continuous'][-1]
+        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and compression_results['all_pre_vq'][-1].numel() > 0:
+            cont = compression_results['all_pre_vq'][-1]
             cst_out = self.code_sequence_transformer(
                 input_embeddings=cont,
                 key_padding_mask=kpm_for_top_codes,
             )
-            preds = cst_out['predictions']
+            preds_pre_vq = cst_out['predictions_pre_vq']
             vq_loss_top = cst_out['vq_loss']
 
             if cont.size(1) <= 1:
                 mse_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
             else:
-                pred = preds[:, :-1, :]
+                pred = preds_pre_vq[:, :-1, :]
                 target = cont[:, 1:, :]
                 mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
                 per_tok = F.mse_loss(pred, target, reduction='none').mean(dim=-1)
@@ -656,7 +659,7 @@ class HierarchicalAutoencoder(nn.Module):
         """
         self.eval()
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
-        top_cont = compression_results['all_continuous'][-1]
+        top_cont = compression_results['all_pre_vq'][-1]
         kpm_for_top_expander_input = compression_results['final_key_padding_mask']
 
         generated_cont = top_cont
@@ -672,7 +675,7 @@ class HierarchicalAutoencoder(nn.Module):
                     input_embeddings=generated_cont,
                     key_padding_mask=generated_kpm,
                 )
-                next_vec = out["predictions"][:, -1, :]
+                next_vec = out["predictions_pre_vq"][:, -1, :]
                 next_idx = out["indices"][:, -1] if out["indices"] is not None else None
                 generated_cont = torch.cat([generated_cont, next_vec.unsqueeze(1)], dim=1)
                 if generated_kpm is not None:
