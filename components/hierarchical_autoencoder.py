@@ -54,7 +54,8 @@ class HierarchicalAutoencoder(nn.Module):
                  propagate_key_padding_mask: bool = True,
                  aux_lm_loss_weight: float = 0.1,
                  top_transformer_config: Optional[Dict[str, Any]] = None,
-                 top_lm_loss_weight: float=1.0,):
+                 top_lm_loss_weight: float = 1.0,
+                 use_continuous_expander_inputs: bool = False,):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -71,6 +72,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         self.top_transformer_config = top_transformer_config
         self.top_lm_loss_weight = top_lm_loss_weight
+        self.use_continuous_expander_inputs = use_continuous_expander_inputs
 
         # ---- Configure Compressor Stack ----
         self.compressors = nn.ModuleList()
@@ -276,13 +278,15 @@ class HierarchicalAutoencoder(nn.Module):
         }
 
 
-    def decompress(self,
-                   top_codes: torch.Tensor,
-                   top_codes_key_padding_mask: Optional[torch.Tensor] = None,
-                   targets_for_teacher_forcing: Optional[List[torch.Tensor]] = None,
-                   target_key_padding_masks: Optional[List[Optional[torch.Tensor]]] = None,
-                   max_len_override: Optional[int] = None
-                   ) -> Dict[str, Any]:
+    def decompress(
+        self,
+        top_codes: torch.Tensor,
+        top_codes_key_padding_mask: Optional[torch.Tensor] = None,
+        targets_for_teacher_forcing: Optional[List[torch.Tensor]] = None,
+        target_key_padding_masks: Optional[List[Optional[torch.Tensor]]] = None,
+        max_len_override: Optional[int] = None,
+        teacher_forcing_embeddings: Optional[List[torch.Tensor]] = None,
+    ) -> Dict[str, Any]:
         """Decode a sequence of top-level codes back to bytes.
 
         Args:
@@ -294,6 +298,10 @@ class HierarchicalAutoencoder(nn.Module):
                 ``targets_for_teacher_forcing``.
             max_len_override: Optional length limit used when generating
                 autoregressively.
+            teacher_forcing_embeddings: Optional list of continuous embeddings
+                corresponding to the targets. When provided and teacher forcing
+                is active, these are fed as the high-level inputs for the next
+                expander.
 
         Returns:
             If ``targets_for_teacher_forcing`` is given, returns a dictionary
@@ -316,6 +324,9 @@ class HierarchicalAutoencoder(nn.Module):
             if target_key_padding_masks and len(target_key_padding_masks) != self.num_levels:
                 raise ValueError(
                     "Length of target_key_padding_masks must match num_levels if provided.")
+            if teacher_forcing_embeddings is not None and len(teacher_forcing_embeddings) != self.num_levels - 1:
+                raise ValueError(
+                    "Length of teacher_forcing_embeddings must be num_levels - 1 when provided.")
 
         for i in range(self.num_levels):  # From TopExpander to BottomExpander
             expander = self.expanders[i]
@@ -336,7 +347,10 @@ class HierarchicalAutoencoder(nn.Module):
                 all_output_logits_list.append(exp_out_dict['logits'])
 
                 if i < self.num_levels - 1:
-                    current_input_codes_hi = target_sequence_for_this_level
+                    if teacher_forcing_embeddings is not None:
+                        current_input_codes_hi = teacher_forcing_embeddings[i]
+                    else:
+                        current_input_codes_hi = target_sequence_for_this_level
                     # The KPM for the next expander's input is the KPM of the current target
                     current_src_kpm = tgt_kpm_for_this_level
             else:  # Autoregressive generation
@@ -376,6 +390,7 @@ class HierarchicalAutoencoder(nn.Module):
         # 1. Compress
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
         all_compressed_codes = compression_results['all_codes']
+        all_pre_vq = compression_results['all_pre_vq']
         top_codes = compression_results['top_codes']
         vq_loss = compression_results['vq_loss']
         kpm_for_top_codes = compression_results['final_key_padding_mask']
@@ -499,12 +514,23 @@ class HierarchicalAutoencoder(nn.Module):
             targets_for_expander_stack.append(target)
             target_kpms_for_expander_stack.append(target_kpm)
 
+        if self.use_continuous_expander_inputs:
+            top_codes_for_decompress = all_pre_vq[-1]
+            tf_continuous = [
+                all_pre_vq[self.num_levels - 2 - i]
+                for i in range(self.num_levels - 1)
+            ]
+        else:
+            top_codes_for_decompress = top_codes
+            tf_continuous = None
+
         # 3. Decompress with teacher forcing
         decompression_results = self.decompress(
-            top_codes=top_codes,
+            top_codes=top_codes_for_decompress,
             top_codes_key_padding_mask=kpm_for_top_codes,
             targets_for_teacher_forcing=targets_for_expander_stack,
-            target_key_padding_masks=target_kpms_for_expander_stack
+            target_key_padding_masks=target_kpms_for_expander_stack,
+            teacher_forcing_embeddings=tf_continuous,
         )
         all_reconstruction_logits = decompression_results['all_logits']
 
@@ -690,6 +716,7 @@ class HierarchicalAutoencoder(nn.Module):
             top_codes_key_padding_mask=generated_kpm,
             targets_for_teacher_forcing=None,
             max_len_override=max_len_override,
+            teacher_forcing_embeddings=None,
         )
 
         return decomp['final_reconstructed_tokens']
