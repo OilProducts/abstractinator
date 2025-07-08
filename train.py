@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 import argparse
 import importlib.util
+from dataclasses import asdict
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
@@ -18,7 +19,11 @@ import mlflow  # Logging with MLflow
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
 from components.utils import short_num, format_duration
-from base_config import DEVICE as DEFAULT_DEVICE, N_CPU as DEFAULT_N_CPU
+from base_config import (
+    DEVICE as DEFAULT_DEVICE,
+    N_CPU as DEFAULT_N_CPU,
+    ExpConfig,
+)
 
 
 def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
@@ -64,14 +69,18 @@ if __name__ == "__main__":
         config = load_config(args.config)
         DEVICE = config.DEVICE
         N_CPU = config.N_CPU
-        exp_config = config.exp_config
+        exp_config: ExpConfig = config.exp_config
     else:
         if not args.resume_from_checkpoint:
             raise ValueError("--config or --resume_from_checkpoint must be provided")
         ckpt = torch.load(args.resume_from_checkpoint, map_location="cpu")
         if "exp_config" not in ckpt:
             raise ValueError("Checkpoint missing exp_config; provide --config")
-        exp_config = ckpt["exp_config"]
+        cfg = ckpt["exp_config"]
+        if isinstance(cfg, dict):
+            exp_config = ExpConfig(**cfg)
+        else:
+            exp_config = cfg
         DEVICE = DEFAULT_DEVICE
         N_CPU = DEFAULT_N_CPU
 
@@ -88,31 +97,41 @@ if __name__ == "__main__":
 
     # --- MLflow Setup ---
     # See https://mlflow.org/docs/latest/python_api/mlflow.html for API details
-    print(f"Initializing MLflow run: {exp_config.get('run_name', 'DefaultRun')}")
-    if exp_config.get("project_name"):
-        mlflow.set_tracking_uri(f"file:./mlruns/{exp_config['project_name']}")
-        print(f"MLflow tracking URI set to: file:./mlruns/{exp_config['project_name']}")
-    mlflow.set_experiment(exp_config.get("project_name", "DefaultExperiment"))
-    mlflow_run = mlflow.start_run(run_name=exp_config.get("run_name", "DefaultRun"))
+    print(
+        f"Initializing MLflow run: {getattr(exp_config, 'run_name', 'DefaultRun')}"
+    )
+    if getattr(exp_config, "project_name", None):
+        mlflow.set_tracking_uri(f"file:./mlruns/{exp_config.project_name}")
+        print(
+            f"MLflow tracking URI set to: file:./mlruns/{exp_config.project_name}"
+        )
+    mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
+    mlflow_run = mlflow.start_run(
+        run_name=getattr(exp_config, "run_name", "DefaultRun")
+    )
 
     # --- Model, Optimizer ---
     print("Initializing HierarchicalAutoencoder model...")
     model = HierarchicalAutoencoder(
-        num_levels=exp_config["num_levels"],
-        compressor_level_configs=exp_config["compressor_level_configs"],
-        initial_vocab_size=exp_config["initial_vocab_size"],
-        expander_dim_scale=exp_config["expander_dim_scale"],
-        expander_num_enc_layers=exp_config["expander_num_enc_layers"],
-        expander_num_dec_layers=exp_config["expander_num_dec_layers"],
-        expander_heads_scale=exp_config["expander_heads_scale"],
-        expander_eos_id=exp_config["expander_eos_id"],
-        expander_max_len=exp_config["expander_max_len"],  # Pass expander_max_len
-        use_decoder_only_expander=exp_config.get("use_decoder_only_expander", False),
-        propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
-        aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
-        top_transformer_config=exp_config.get("top_transformer_config", None),  # <<< ADDED
-        top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0),
-        use_continuous_expander_inputs=exp_config.get("use_continuous_expander_inputs", False)
+        num_levels=exp_config.num_levels,
+        compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
+        initial_vocab_size=exp_config.initial_vocab_size,
+        expander_dim_scale=exp_config.expander_dim_scale,
+        expander_num_enc_layers=exp_config.expander_num_enc_layers,
+        expander_num_dec_layers=exp_config.expander_num_dec_layers,
+        expander_heads_scale=exp_config.expander_heads_scale,
+        expander_eos_id=exp_config.expander_eos_id,
+        expander_max_len=exp_config.expander_max_len,  # Pass expander_max_len
+        use_decoder_only_expander=exp_config.use_decoder_only_expander,
+        propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
+        aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
+        top_transformer_config=(
+            asdict(exp_config.top_transformer_config)
+            if exp_config.top_transformer_config
+            else None
+        ),
+        top_lm_loss_weight=exp_config.top_lm_loss_weight,
+        use_continuous_expander_inputs=exp_config.use_continuous_expander_inputs,
     ).to(DEVICE)
 
     # model = torch.compile(model, mode="default", dynamic=True)
@@ -143,9 +162,9 @@ if __name__ == "__main__":
         print(f"  CodeSequenceTransformer: {short_num(cst_params)} parameters")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=exp_config["learning_rate"])
+    optimizer = optim.AdamW(trainable_params, lr=exp_config.learning_rate)
     print(
-        f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}"
+        f"Optimizer AdamW initialized with learning rate: {exp_config.learning_rate:.0e}"
         f" and {short_num(sum(p.numel() for p in trainable_params))} trainable params"
     )
 
@@ -164,7 +183,7 @@ if __name__ == "__main__":
 
     start_epoch = 0
     global_step = 0
-    resume_path = args.resume_from_checkpoint or exp_config.get("resume_from_checkpoint")
+    resume_path = args.resume_from_checkpoint or exp_config.resume_from_checkpoint
     if resume_path:
         if os.path.isfile(resume_path):
             ckpt = torch.load(resume_path, map_location=DEVICE)
@@ -377,7 +396,7 @@ if __name__ == "__main__":
 
     # --- Track final hyperparameters with MLflow ---
     print("Tracking hyperparameters with MLflow...")
-    mlflow.log_params(exp_config)
+    mlflow.log_params(exp_config.as_dict())
     print("Hyperparameters tracked.")
 
     # --- Training Loop ---
