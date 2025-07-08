@@ -6,19 +6,25 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from dataclasses import asdict
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval import utils
 
 from train import ByteLevelTokenizer
 from components import HierarchicalAutoencoder
+from base_config import ExpConfig
 
 
-def _load_config(config: Union[str, Dict]):
-    """Return (exp_config, device) from a config path or dict."""
-    if isinstance(config, dict):
+def _load_config(config: Union[str, Dict, ExpConfig]):
+    """Return (exp_config, device) from a config path, dict or ExpConfig."""
+    if isinstance(config, ExpConfig):
         exp_config = config
-        device = exp_config.get("DEVICE")  # allow device passed in dict
+        device = getattr(config, "DEVICE", None)
+    elif isinstance(config, dict):
+        device = config.get("DEVICE")
+        cfg = {k: v for k, v in config.items() if k != "DEVICE"}
+        exp_config = ExpConfig(**cfg)
     elif isinstance(config, str):
         spec = importlib.util.spec_from_file_location("config_module", config)
         module = importlib.util.module_from_spec(spec)
@@ -26,7 +32,7 @@ def _load_config(config: Union[str, Dict]):
         exp_config = module.exp_config
         device = getattr(module, "DEVICE", None)
     else:
-        raise TypeError("config must be a dict or path to a python file")
+        raise TypeError("config must be a dict, ExpConfig instance or path to a python file")
 
     return exp_config, device
 
@@ -43,21 +49,25 @@ class HierarchicalAELM(LM):
 
         self.tokenizer = ByteLevelTokenizer(add_bos=True, add_eos=True)
         self.model = HierarchicalAutoencoder(
-            num_levels=exp_config["num_levels"],
-            compressor_level_configs=exp_config["compressor_level_configs"],
-            initial_vocab_size=exp_config["initial_vocab_size"],
-            expander_dim_scale=exp_config["expander_dim_scale"],
-            expander_num_enc_layers=exp_config["expander_num_enc_layers"],
-            expander_num_dec_layers=exp_config["expander_num_dec_layers"],
-            expander_heads_scale=exp_config["expander_heads_scale"],
-            expander_eos_id=exp_config["expander_eos_id"],
-            expander_max_len=exp_config["expander_max_len"],
-            use_decoder_only_expander=exp_config.get("use_decoder_only_expander", False),
-            propagate_key_padding_mask=exp_config["propagate_key_padding_mask"],
-            aux_lm_loss_weight=exp_config["aux_lm_loss_weight"],
-            top_transformer_config=exp_config.get("top_transformer_config"),
-            top_lm_loss_weight=exp_config.get("top_lm_loss_weight", 0.0),
-            use_continuous_expander_inputs=exp_config.get("use_continuous_expander_inputs", False),
+            num_levels=exp_config.num_levels,
+            compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
+            initial_vocab_size=exp_config.initial_vocab_size,
+            expander_dim_scale=exp_config.expander_dim_scale,
+            expander_num_enc_layers=exp_config.expander_num_enc_layers,
+            expander_num_dec_layers=exp_config.expander_num_dec_layers,
+            expander_heads_scale=exp_config.expander_heads_scale,
+            expander_eos_id=exp_config.expander_eos_id,
+            expander_max_len=exp_config.expander_max_len,
+            use_decoder_only_expander=exp_config.use_decoder_only_expander,
+            propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
+            aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
+            top_transformer_config=(
+                asdict(exp_config.top_transformer_config)
+                if exp_config.top_transformer_config
+                else None
+            ),
+            top_lm_loss_weight=exp_config.top_lm_loss_weight,
+            use_continuous_expander_inputs=exp_config.use_continuous_expander_inputs,
         ).to(self.device)
         ckpt = torch.load(checkpoint, map_location=self.device)
         self.model.load_state_dict(ckpt["model_state"])
