@@ -1,41 +1,21 @@
-import os
-import torch
+from copy import deepcopy
+from base_config import DEVICE, N_CPU, exp_config as _base_exp_config
 
-# Determine CPU count for data loading and processing
-N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least one worker
+exp_config = deepcopy(_base_exp_config)
 
-# Determine the preferred device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.backends.mps.is_available() and DEVICE == "cpu":
-    DEVICE = torch.device("mps")
-
-# Experiment configuration dictionary
-exp_config = {
-    "run_name": "HierarchicalAE_KPM_Run_v2",
-    "project_name": "TemporalAutoencodedLanguageModelling",
-    "num_levels": 1,
-    "initial_vocab_size": 259,
+# Overrides for smaller toy experiments
+exp_config.update({
     "compressor_level_configs": [
         {"dim": 128, "heads": 4, "window": 128,
          "num_encoder_layers": 4,
-         'encoder_ffn_dim_multiplier': 4,
-         'max_seq_len_encoder': 4096,
+         "encoder_ffn_dim_multiplier": 4,
+         "max_seq_len_encoder": 4096,
          "num_queries": 1,
-        "codebook_size": 1024,
+         "codebook_size": 1024,
          "beta": 1.0,
          "entropy_delta": 0.2,
          "entropy_abs_threshold": None},
     ],
-    "expander_dim_scale": 1.0,
-    "expander_num_enc_layers": 2,
-    "expander_num_dec_layers": 4,
-    "expander_heads_scale": 1.0,
-    "expander_eos_id": 1,
-    "expander_max_len": 2048,
-    "use_decoder_only_expander": True,
-    "propagate_key_padding_mask": True,
-    "aux_lm_loss_weight": 1.0,
-    "top_lm_loss_weight": 0.2,
     "top_transformer_config": {
         "embed_dim": 128,
         "dim": 256,
@@ -44,28 +24,9 @@ exp_config = {
         "ffn_dim_multiplier": 4,
         "continuous": True,
     },
-    "learning_rate": 1e-4,
     "batch_size": 64,
-    "sequence_length": 1024,
-    "num_epochs": 1,
-    "max_steps": None,
-    "log_interval": 1,
-    "gradient_clip_norm": 1.0,
     "gradient_accumulation_steps": 2,
-    "scheduler_type": "cosine_with_min_lr",
-    "warmup_steps": 1000,
-    "scheduler_specific_kwargs": {
-        "min_lr": 1e-6,  # Minimum learning rate for cosine scheduler
-    },
     "dataset_name": "roneneldan/TinyStories",
-    # "dataset_config": "sample-10BT",
-    "dataset_train_split": "train",
-    "text_column_name": "text",
-    "generation_interval": 50,
+    "dataset_config": None,
     "sample_prompt_for_generation": "Once upon a time, in a land far, far away,",
-    "generation_max_len_override": 512,
-    "checkpoint_interval": 1000,
-    "checkpoint_dir": "./checkpoints",
-    "resume_from_checkpoint": None,
-    "save_base_components_path": None,
-}
+})
