@@ -1,4 +1,6 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union, Dict
+
+import importlib.util
 
 import torch
 import torch.nn.functional as F
@@ -8,18 +10,37 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval import utils
 
-from config import exp_config, DEVICE
 from train import ByteLevelTokenizer
 from components import HierarchicalAutoencoder
+
+
+def _load_config(config: Union[str, Dict]):
+    """Return (exp_config, device) from a config path or dict."""
+    if isinstance(config, dict):
+        exp_config = config
+        device = exp_config.get("DEVICE")  # allow device passed in dict
+    elif isinstance(config, str):
+        spec = importlib.util.spec_from_file_location("config_module", config)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        exp_config = module.exp_config
+        device = getattr(module, "DEVICE", None)
+    else:
+        raise TypeError("config must be a dict or path to a python file")
+
+    return exp_config, device
 
 
 @register_model("hier_ae")
 class HierarchicalAELM(LM):
     """LM-Eval adapter for HierarchicalAutoencoder checkpoints."""
 
-    def __init__(self, checkpoint: str, device: Optional[str] = None) -> None:
+    def __init__(self, checkpoint: str, config: Union[str, Dict], device: Optional[str] = None) -> None:
         super().__init__()
-        self.device = device or DEVICE
+        exp_config, cfg_device = _load_config(config)
+        self.exp_config = exp_config
+        self.device = device or cfg_device or ("cuda" if torch.cuda.is_available() else "cpu")
+
         self.tokenizer = ByteLevelTokenizer(add_bos=True, add_eos=True)
         self.model = HierarchicalAutoencoder(
             num_levels=exp_config["num_levels"],
@@ -49,7 +70,8 @@ class HierarchicalAELM(LM):
         device = args.get("device")
         if checkpoint is None:
             raise ValueError("checkpoint path must be provided")
-        return cls(checkpoint=checkpoint, device=device)
+        config = args.get("config", "config.py")
+        return cls(checkpoint=checkpoint, config=config, device=device)
 
     def tok_encode(self, string: str):
         return self.tokenizer.encode(string, add_bos=True, add_eos=False).tolist()
@@ -59,7 +81,7 @@ class HierarchicalAELM(LM):
 
     @property
     def max_length(self) -> int:
-        return exp_config.get("expander_max_len", 2048)
+        return self.exp_config.get("expander_max_len", 2048)
 
     def _tokens_logprobs(self, tokens: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
