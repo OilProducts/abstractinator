@@ -18,6 +18,7 @@ import mlflow  # Logging with MLflow
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
 from components.utils import short_num, format_duration
+from base_config import DEVICE as DEFAULT_DEVICE, N_CPU as DEFAULT_N_CPU
 
 
 def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
@@ -35,8 +36,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="config.py",
-        help="Path to the configuration Python file",
+        default=None,
+        help=("Path to the configuration Python file. If omitted, the config "
+              "saved in a checkpoint will be used when resuming"),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to resume training from",
     )
     parser.add_argument(
         "--load_base_from",
@@ -52,10 +60,20 @@ if __name__ == "__main__":
         spec.loader.exec_module(config_module)
         return config_module
 
-    config = load_config(args.config)
-    DEVICE = config.DEVICE
-    N_CPU = config.N_CPU
-    exp_config = config.exp_config
+    if args.config:
+        config = load_config(args.config)
+        DEVICE = config.DEVICE
+        N_CPU = config.N_CPU
+        exp_config = config.exp_config
+    else:
+        if not args.resume_from_checkpoint:
+            raise ValueError("--config or --resume_from_checkpoint must be provided")
+        ckpt = torch.load(args.resume_from_checkpoint, map_location="cpu")
+        if "exp_config" not in ckpt:
+            raise ValueError("Checkpoint missing exp_config; provide --config")
+        exp_config = ckpt["exp_config"]
+        DEVICE = DEFAULT_DEVICE
+        N_CPU = DEFAULT_N_CPU
 
     torch.set_float32_matmul_precision("high")
     torch.set_default_dtype(torch.bfloat16)
@@ -140,12 +158,13 @@ if __name__ == "__main__":
             "optimizer_state": optimizer.state_dict(),
             "epoch": epoch,
             "global_step": step,
+            "exp_config": exp_config,
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
 
     start_epoch = 0
     global_step = 0
-    resume_path = exp_config.get("resume_from_checkpoint")
+    resume_path = args.resume_from_checkpoint or exp_config.get("resume_from_checkpoint")
     if resume_path:
         if os.path.isfile(resume_path):
             ckpt = torch.load(resume_path, map_location=DEVICE)

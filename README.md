@@ -40,7 +40,7 @@ python train.py --config tiny_config.py
 
 All experiment settings live in the `exp_config` dictionary within your chosen config file. Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
 
-Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps.  To resume training, set `exp_config['resume_from_checkpoint']` to the path of a saved checkpoint.
+Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps and include a copy of `exp_config`.  To resume training you can either set `exp_config['resume_from_checkpoint']` in the config file or pass `--resume_from_checkpoint <path>` on the command line.  If no `--config` is given, the configuration embedded in the checkpoint will be used.
 
 Training metrics and sample outputs are logged with [MLflow](https://mlflow.org/docs/latest/python_api/mlflow.html). If `exp_config['project_name']` is set, logs are stored under `./mlruns/<project_name>`.
 You can monitor a run locally by launching the MLflow UI:
@@ -155,5 +155,6 @@ To test a model you've trained with `train.py`, point the harness at the saved
 checkpoint using the `hier_ae` model type:
 
 ```bash
-python evaluate.py --model hier_ae --model_args checkpoint=./checkpoints/checkpoint_step1000.pt --config config.py
+python evaluate.py --model hier_ae --model_args checkpoint=./checkpoints/checkpoint_step1000.pt
 ```
+The `--config` flag is optional when the checkpoint was created with `train.py` since the file stores the configuration used during training.
