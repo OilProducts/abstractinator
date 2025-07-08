@@ -27,8 +27,9 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="config.py",
-        help="Path to configuration file for hier_ae models",
+        default=None,
+        help=("Path to configuration file for hier_ae models. If omitted, the "
+              "checkpoint's stored config is used"),
     )
     parser.add_argument(
         "--tasks",
@@ -48,17 +49,23 @@ def main():
     args = parser.parse_args()
 
     if args.model == "hier_ae":
-        # Load configuration for HierarchicalAELM
-        spec = importlib.util.spec_from_file_location("config_module", args.config)
-        config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(config_module)
-        exp_config = config_module.exp_config
-        device = args.device or getattr(config_module, "DEVICE", None)
-
         model_args = utils.simple_parse_args_string(args.model_args or "")
         checkpoint = model_args.get("checkpoint")
         if checkpoint is None:
             raise ValueError("model_args must include 'checkpoint' for hier_ae model")
+
+        if args.config:
+            spec = importlib.util.spec_from_file_location("config_module", args.config)
+            config_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(config_module)
+            exp_config = config_module.exp_config
+            device = args.device or getattr(config_module, "DEVICE", None)
+        else:
+            ckpt = torch.load(checkpoint, map_location="cpu")
+            if "exp_config" not in ckpt:
+                raise ValueError("Checkpoint missing exp_config; provide --config")
+            exp_config = ckpt["exp_config"]
+            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         lm = components.hae_lm.HierarchicalAELM(
             checkpoint=checkpoint,
