@@ -155,5 +155,5 @@ To test a model you've trained with `train.py`, point the harness at the saved
 checkpoint using the `hier_ae` model type:
 
 ```bash
-python evaluate.py --model hier_ae --model_args checkpoint=./checkpoints/checkpoint_step1000.pt
+python evaluate.py --model hier_ae --model_args checkpoint=./checkpoints/checkpoint_step1000.pt --config config.py
 ```
