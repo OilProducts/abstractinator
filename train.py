@@ -19,6 +19,16 @@ import mlflow  # Logging with MLflow
 from components import HierarchicalAutoencoder
 from components.utils import short_num, format_duration
 
+
+def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
+    """Save only the compressor and expander weights."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({
+        "compressors": model.compressors.state_dict(),
+        "expanders": model.expanders.state_dict(),
+    }, path)
+    print(f"Base components saved to {path}")
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Training script for HierarchicalAutoencoder")
@@ -27,6 +37,12 @@ if __name__ == "__main__":
         type=str,
         default="config.py",
         help="Path to the configuration Python file",
+    )
+    parser.add_argument(
+        "--load_base_from",
+        type=str,
+        default=None,
+        help="Load pretrained compressor/expander checkpoint",
     )
     args = parser.parse_args()
 
@@ -83,6 +99,16 @@ if __name__ == "__main__":
 
     # model = torch.compile(model, mode="default", dynamic=True)
 
+    if args.load_base_from:
+        ckpt = torch.load(args.load_base_from, map_location=DEVICE)
+        model.compressors.load_state_dict(ckpt.get("compressors", {}), strict=False)
+        model.expanders.load_state_dict(ckpt.get("expanders", {}), strict=False)
+        model.compressors.requires_grad_(False)
+        model.expanders.requires_grad_(False)
+        model.compressors.eval()
+        model.expanders.eval()
+        print(f"Loaded base components from {args.load_base_from}")
+
     def _count_params(module: torch.nn.Module) -> int:
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
@@ -98,8 +124,12 @@ if __name__ == "__main__":
         cst_params = _count_params(model.code_sequence_transformer)
         print(f"  CodeSequenceTransformer: {short_num(cst_params)} parameters")
 
-    optimizer = optim.AdamW(model.parameters(), lr=exp_config["learning_rate"])
-    print(f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}")
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=exp_config["learning_rate"])
+    print(
+        f"Optimizer AdamW initialized with learning rate: {exp_config['learning_rate']:.0e}"
+        f" and {short_num(sum(p.numel() for p in trainable_params))} trainable params"
+    )
 
     # --- Checkpoint Utilities ---
     def save_checkpoint(model, optimizer, epoch, step, checkpoint_dir):
@@ -608,6 +638,8 @@ if __name__ == "__main__":
             break
 
     print("Training finished.")
+    if exp_config.get("save_base_components_path"):
+        save_base_components(model, exp_config["save_base_components_path"])
     mlflow.end_run()
 
     # Example of saving the model (optional)
