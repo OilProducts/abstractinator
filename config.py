@@ -67,4 +67,5 @@ exp_config = {
     "checkpoint_interval": 1000,
     "checkpoint_dir": "./checkpoints",
     "resume_from_checkpoint": None,
+    "save_base_components_path": None,
 }
