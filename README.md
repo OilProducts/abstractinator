@@ -51,6 +51,41 @@ mlflow ui --backend-store-uri ./mlruns/<project_name>
 
 Then open the shown URL in your browser to view metrics and artifacts as training progresses.
 
+## Two-Stage Workflow
+
+For large experiments it can be helpful to pretrain the compressor and expander
+stack first and then freeze it while training a top-level language model.
+
+**Stage 1: Pretrain compressors/expanders**
+
+```python
+exp_config = {
+    # no top transformer during pretraining
+    'top_transformer_config': None,
+    'top_lm_loss_weight': 0.0,
+    'save_base_components_path': './stage1_base.pt',
+}
+```
+
+Run `python train.py --config stage1.py` and a file at
+`save_base_components_path` will contain the compressor and expander weights.
+
+**Stage 2: Train the top LM**
+
+```python
+exp_config = {
+    'top_transformer_config': {...},
+    'top_lm_loss_weight': 1.0,
+}
+```
+
+```bash
+python train.py --config stage2.py --load_base_from ./stage1_base.pt
+```
+
+Only the top transformer parameters remain trainable while reconstruction loss
+continues to flow through the frozen expanders.
+
 ## Loss Components
 
 The autoencoder optimizes a `total_loss` that combines several terms:
