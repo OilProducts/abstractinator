@@ -1,6 +1,7 @@
 import argparse
 import json
 import importlib.util
+from base_config import ExpConfig
 
 from lm_eval import evaluator, utils
 import components.hae_lm  # registers HierarchicalAELM with lm_eval
@@ -64,7 +65,11 @@ def main():
             ckpt = torch.load(checkpoint, map_location="cpu")
             if "exp_config" not in ckpt:
                 raise ValueError("Checkpoint missing exp_config; provide --config")
-            exp_config = ckpt["exp_config"]
+            cfg = ckpt["exp_config"]
+            if isinstance(cfg, dict):
+                exp_config = ExpConfig(**cfg)
+            else:
+                exp_config = cfg
             device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         lm = components.hae_lm.HierarchicalAELM(
