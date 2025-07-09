@@ -1,7 +1,7 @@
 import argparse
 import json
 import importlib.util
-from base_config import ExpConfig
+from configs.base_config import ExpConfig
 
 from lm_eval import evaluator, utils
 import components.hae_lm  # registers HierarchicalAELM with lm_eval

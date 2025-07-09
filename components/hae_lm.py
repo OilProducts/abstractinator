@@ -13,7 +13,7 @@ from lm_eval import utils
 
 from train import ByteLevelTokenizer
 from components import HierarchicalAutoencoder
-from base_config import ExpConfig
+from configs.base_config import ExpConfig
 
 
 def _load_config(config: Union[str, Dict, ExpConfig]):

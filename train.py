@@ -19,7 +19,7 @@ import mlflow  # Logging with MLflow
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
 from components.utils import short_num, format_duration
-from base_config import (
+from configs.base_config import (
     DEVICE as DEFAULT_DEVICE,
     N_CPU as DEFAULT_N_CPU,
     ExpConfig,

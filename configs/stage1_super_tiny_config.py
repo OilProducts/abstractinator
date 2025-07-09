@@ -1,11 +1,10 @@
 from copy import deepcopy
-from base_config import (
+from configs.base_config import (
     DEVICE,
     N_CPU,
     exp_config as _base_exp_config,
     ExpConfig,
     CompressorLevelConfig,
-    TopTransformerConfig,
 )
 
 exp_config: ExpConfig = deepcopy(_base_exp_config)
@@ -29,15 +28,9 @@ exp_config.compressor_level_configs = [
 exp_config.expander_num_enc_layers = 1
 exp_config.expander_num_dec_layers = 1
 exp_config.aux_lm_loss_weight = 0.1
-exp_config.top_lm_loss_weight = 1.0
-exp_config.top_transformer_config = TopTransformerConfig(
-    embed_dim=128,
-    dim=128,
-    num_layers=8,
-    num_heads=8,
-    ffn_dim_multiplier=4,
-    continuous=True,
-)
+exp_config.top_lm_loss_weight = 0.0
+exp_config.top_transformer_config = None
+exp_config.save_base_components_path = "./stage1_base.pt"
 exp_config.learning_rate = 5e-4
 exp_config.gradient_accumulation_steps = 2
 exp_config.dataset_name = "roneneldan/TinyStories"
