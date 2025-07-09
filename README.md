@@ -4,7 +4,7 @@ An experimental hierarchical autoencoder for compressing and reconstructing raw
 text at the byte level. The project explores whether long sequences can be
 represented with a compact set of discrete codes while still allowing faithful
 recovery. Training and dataset parameters are configured in a Python config file
-(`config.py` by default).
+(`configs/config.py` by default).
 
 ## Overview
 
@@ -26,16 +26,16 @@ pip install -r requirements.txt
 
 ## Training
 
-Run the training loop:
+Run the training loop with the default config:
 
 ```bash
-python train.py
+python train.py --config configs/config.py
 ```
 
 Specify a different config file with `--config`:
 
 ```bash
-python train.py --config tiny_config.py
+python train.py --config configs/tiny_config.py
 ```
 
 All experiment settings live in the `exp_config` dictionary within your chosen config file. Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
@@ -67,7 +67,7 @@ exp_config = {
 }
 ```
 
-Run `python train.py --config stage1.py` and a file at
+Run `python train.py --config configs/stage1_super_tiny_config.py` and a file at
 `save_base_components_path` will contain the compressor and expander weights.
 
 **Stage 2: Train the top LM**
@@ -80,8 +80,13 @@ exp_config = {
 ```
 
 ```bash
-python train.py --config stage2.py --load_base_from ./stage1_base.pt
+python train.py --config configs/stage2_super_tiny_config.py --load_base_from ./stage1_base.pt
 ```
+
+The `configs` folder includes these stage 1 and stage 2 files so you can try the
+two-step workflow with the tiny model. Run the stage 1 command first to create
+`stage1_base.pt`, then launch stage 2 using `--load_base_from` to continue
+training the top transformer while the lower layers remain frozen.
 
 Only the top transformer parameters remain trainable while reconstruction loss
 continues to flow through the frozen expanders.
