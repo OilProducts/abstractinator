@@ -18,6 +18,8 @@ import mlflow  # Logging with MLflow
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
+from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
+from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.utils import short_num, format_duration
 from configs.base_config import (
     DEVICE as DEFAULT_DEVICE,
@@ -445,6 +447,9 @@ if __name__ == "__main__":
 
     for epoch in range(start_epoch, exp_config.num_epochs):
         print(f"\n--- Epoch {epoch + 1}/{exp_config.num_epochs} ---")
+        # Clear cached attention masks to avoid GPU memory buildup
+        _cached_cross_window_mask_cpu.cache_clear()
+        _cached_causal_mask_cpu.cache_clear()
         epoch_start_time = time.time()
         model.train() # Ensure model is in train mode at start of epoch
 

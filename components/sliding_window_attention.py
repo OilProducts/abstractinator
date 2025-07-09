@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import lru_cache
 from .utils import safe_softmax
 from torch.nn.attention.flex_attention import (
     flex_attention,           # fused kernel
@@ -11,25 +12,23 @@ from .swiglu import SwiGLU
 from typing import Optional, Tuple
 
 
-def _cached_cross_window_mask(q_len: int, kv_len: int, window: int,
-                              device: torch.device) -> torch.Tensor:
-    """Return a cached cross-window mask on ``device``."""
-    cache_key = (
-        q_len,
-        kv_len,
-        window,
-        device.index if device.type == "cuda" else -1,
-    )
-    cache = _cached_cross_window_mask.__dict__.setdefault("cache", {})
-    if cache_key in cache:
-        return cache[cache_key]
-
-    q_idx = torch.arange(q_len, device=device)[:, None]
-    kv_idx = torch.arange(kv_len, device=device)[None, :]
+@lru_cache(maxsize=64)
+def _cached_cross_window_mask(q_len: int, kv_len: int, window: int) -> torch.Tensor:
+    """Return a cross-window mask computed on CPU."""
+    q_idx = torch.arange(q_len, device="cpu")[:, None]
+    kv_idx = torch.arange(kv_len, device="cpu")[None, :]
     rel_pos = kv_idx - q_idx
     mask = (rel_pos > 0) | (rel_pos < -window)
-    cache[cache_key] = mask
     return mask
+
+def get_cross_window_mask(
+    q_len: int,
+    kv_len: int,
+    window: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the cached mask on ``device``."""
+    return _cached_cross_window_mask(q_len, kv_len, window).to(device)
 
 # @torch.compile
 class LocalSlidingWindowAttention(nn.Module):
@@ -309,7 +308,7 @@ class SlidingWindowCrossAttention(nn.Module):
     def _cross_window_mask(self, q_len: int, kv_len: int,
                            device: torch.device) -> torch.Tensor:
         """Mask restricting queries to attend within a retrospective window."""
-        return _cached_cross_window_mask(q_len, kv_len, self.window_size, device)
+        return get_cross_window_mask(q_len, kv_len, self.window_size, device)
 
     def forward(self,
                 query: torch.Tensor,
