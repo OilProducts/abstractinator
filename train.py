@@ -2,7 +2,7 @@ import os
 import math
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 import argparse
 import importlib.util
 from dataclasses import asdict
@@ -410,6 +410,8 @@ if __name__ == "__main__":
     optimizer.zero_grad()  # Reset gradients before training
 
     # Track overall training time and total bytes processed
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
     training_start_time = time.time()
     total_bytes_processed = 0
 
@@ -437,7 +439,8 @@ if __name__ == "__main__":
         return accumulators
 
     accumulators = reset_accumulators(exp_config.num_levels)
-    time_of_last_optimizer_step_event = time.time() # Initialize timer for tokens/sec
+    tok_s_deque = deque(maxlen=10)  # For moving average of tok/s
+    time_of_last_optimizer_step_event = training_start_time # Initialize timer for tokens/sec
     total_minibatches_in_epoch = len(train_dataloader)
 
     for epoch in range(start_epoch, exp_config.num_epochs):
@@ -448,15 +451,14 @@ if __name__ == "__main__":
         for i, batch in enumerate(train_dataloader):
             tokens = batch["input_ids"].to(DEVICE)
             # KPM is already boolean, just move to device
-            kpm = (
-                batch["key_padding_mask"].to(DEVICE)
-                if exp_config.propagate_key_padding_mask
-                else None
+            key_padding_mask = batch["key_padding_mask"].to(DEVICE)
+            model_kpm = (
+                key_padding_mask if exp_config.propagate_key_padding_mask else None
             )
 
             # HierarchicalAutoencoder.forward now handles loss calculation internally
             # and expects KPM for the initial tokens.
-            output_dict = model(tokens, key_padding_mask=kpm)
+            output_dict = model(tokens, key_padding_mask=model_kpm)
             total_loss = output_dict['total_loss']
 
             # Normalize loss to account for accumulation
@@ -471,10 +473,8 @@ if __name__ == "__main__":
             accumulators["avg_reconstruction_loss"] += output_dict['avg_reconstruction_loss'].item()
             accumulators["count"] += 1
 
-            if kpm is not None:
-                accumulators["non_padded_tokens"] += (~kpm).sum().item() # Add count of non-padded tokens
-            else:
-                accumulators["non_padded_tokens"] += tokens.numel() # All tokens are considered valid
+            # For tokens/sec calculation, always use the actual number of non-padded tokens.
+            accumulators["non_padded_tokens"] += (~key_padding_mask).sum().item()
 
 
             for key, value in output_dict['reconstruction_loss_details'].items():
@@ -520,15 +520,18 @@ if __name__ == "__main__":
                 optimizer.zero_grad()  # Reset gradients after accumulation
 
                 # Calculate metrics for the completed accumulation window
+                if DEVICE == "cuda":
+                    torch.cuda.synchronize()
                 current_time = time.time()
                 duration_accumulation_window = current_time - time_of_last_optimizer_step_event
 
                 tokens_processed_this_window = accumulators["non_padded_tokens"]
                 tokens_per_second = tokens_processed_this_window / duration_accumulation_window
+                tok_s_deque.append(tokens_per_second)
+                avg_tok_s = sum(tok_s_deque) / len(tok_s_deque)
 
                 # Update global byte count and compute ETAs
                 total_bytes_processed += tokens_processed_this_window
-
                 total_progress = (global_step + 1) / exp_config.num_training_steps
                 total_elapsed = current_time - training_start_time
                 total_eta_sec = (total_elapsed / total_progress - total_elapsed) if total_progress > 0 else 0
@@ -537,14 +540,16 @@ if __name__ == "__main__":
 
                 if steps_accumulated > 0:  # Ensure there's something to log
                     # --- Console Logging (replaces tqdm postfix and description updates) ---
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                     console_log_parts = [
+                        f"{timestamp}",
                         f"Epoch {epoch + 1}/{exp_config.num_epochs}",
                         f"OptStep {global_step}",
                         f"MB {i + 1}/{total_minibatches_in_epoch}",  # Minibatch progress
                         f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
                         f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}",
                         f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                        f"Tok/s {short_num(tokens_per_second)}",
+                        f"Tok/s {short_num(avg_tok_s)}",
                         f"Bytes {short_num(total_bytes_processed)}",
                         f"ETAt {format_duration(total_eta_sec)}"
                     ]
@@ -630,7 +635,7 @@ if __name__ == "__main__":
                 # Reset accumulators for the next window
                 accumulators = reset_accumulators(exp_config.num_levels)
                 # Update the timer to mark the start of the next accumulation window's measurement period
-                time_of_last_optimizer_step_event = time.time()
+                time_of_last_optimizer_step_event = current_time
 
                 # --- End Logging ---
 
