@@ -23,6 +23,8 @@ exp_config.compressor_level_configs = [
         beta=1.0,
         entropy_delta=0.2,
         entropy_abs_threshold=None,
+        target_compression_ratio=None,
+        compression_loss_weight=1.0,
     )
 ]
 exp_config.expander_num_enc_layers = 1

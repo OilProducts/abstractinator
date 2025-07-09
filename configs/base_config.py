@@ -26,6 +26,8 @@ class CompressorLevelConfig:
     beta: float = 1.0
     entropy_delta: float = 0.2
     entropy_abs_threshold: Optional[float] = None
+    target_compression_ratio: Optional[List[float]] = None
+    compression_loss_weight: float = 1.0
 
 
 @dataclass
