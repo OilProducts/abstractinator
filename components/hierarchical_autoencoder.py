@@ -74,6 +74,9 @@ class HierarchicalAutoencoder(nn.Module):
         self.top_lm_loss_weight = top_lm_loss_weight
         self.use_continuous_expander_inputs = use_continuous_expander_inputs
 
+        self.target_compression_ratios: List[Optional[float]] = []
+        self.compression_loss_weights: List[float] = []
+
         # ---- Configure Compressor Stack ----
         self.compressors = nn.ModuleList()
         self.actual_codebook_sizes: List[int] = []
@@ -97,6 +100,12 @@ class HierarchicalAutoencoder(nn.Module):
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])
             current_input_vocab_size = config['codebook_size']
+
+            target_ratio = config.get('target_compression_ratio')
+            if isinstance(target_ratio, list):
+                target_ratio = target_ratio[0] if target_ratio else None
+            self.target_compression_ratios.append(target_ratio)
+            self.compression_loss_weights.append(config.get('compression_loss_weight', 1.0))
 
         if self.top_transformer_config and self.num_levels > 0:
             embed_dim = compressor_level_configs[-1]["dim"]
@@ -409,6 +418,20 @@ class HierarchicalAutoencoder(nn.Module):
         input_seq_lengths_c = compression_results['input_seq_lengths']
         output_seq_lengths_c = compression_results['output_seq_lengths']
 
+        total_compression_loss_unweighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+        total_compression_loss_weighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+        compression_loss_details: Dict[str, torch.Tensor] = {}
+        for i, ratio in enumerate(compression_ratios):
+            tgt = self.target_compression_ratios[i] if i < len(self.target_compression_ratios) else None
+            loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+            if tgt is not None:
+                loss = (ratio.mean() - tgt) ** 2
+                total_compression_loss_weighted += self.compression_loss_weights[i] * loss
+            total_compression_loss_unweighted += loss
+            compression_loss_details[f"compression_loss_L{i}"] = loss
+
+        avg_compression_loss = total_compression_loss_unweighted / self.num_levels if self.num_levels > 0 else torch.tensor(0.)
+
         # --- 1.5 Process top_codes with CodeSequenceTransformer (if it exists) ---
         avg_top_code_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
         top_code_lm_loss_details: Dict[str, torch.Tensor] = {}  # For consistency, though only one level here
@@ -648,7 +671,8 @@ class HierarchicalAutoencoder(nn.Module):
                 avg_reconstruction_loss +
                 vq_loss +
                 (self.aux_lm_loss_weight * avg_aux_lm_loss) +
-                (self.top_lm_loss_weight * avg_top_code_lm_loss)  # <<< ADDED
+                (self.top_lm_loss_weight * avg_top_code_lm_loss) +
+                total_compression_loss_weighted
         )
         return {
             'total_loss': final_total_loss, 'vq_loss': vq_loss,
@@ -658,6 +682,8 @@ class HierarchicalAutoencoder(nn.Module):
             'aux_lm_loss_details': aux_lm_loss_details,  # For logging
             'avg_top_code_lm_loss': avg_top_code_lm_loss,  # <<< ADDED for logging
             'top_code_lm_loss_details': top_code_lm_loss_details,  # <<< ADDED for logging
+            'avg_compression_loss': avg_compression_loss,
+            'compression_loss_details': compression_loss_details,
             'final_reconstructed_logits': decompression_results['final_reconstructed_logits'],
             'compression_ratios': compression_ratios,
             'input_seq_lengths_compressors': input_seq_lengths_c,
