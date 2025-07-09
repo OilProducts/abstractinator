@@ -351,19 +351,19 @@ class SlidingWindowCrossAttention(nn.Module):
 
         return output
 
-# @torch.compile
+@torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
-    A single Transformer block using SlidingWindowAttention (Pre-LN variant).
+    A single Transformer block using LocalSlidingWindowAttention (Pre-LN variant).
 
     The block consists of two main sub-layers:
-    1. Multi-Head Self-Attention (SlidingWindowAttention) with Pre-RMSNorm.
+    1. Multi-Head Self-Attention (LocalSlidingWindowAttention) with Pre-RMSNorm.
     2. Feed-Forward Network (FFN) with Pre-RMSNorm.
     Residual connections are applied after each sub-layer.
 
     Attributes:
         norm1 (nn.RMSNorm): RMS normalization before the attention layer.
-        attn (SlidingWindowAttention): The sliding window self-attention mechanism.
+        attn (LocalSlidingWindowAttention): The sliding window self-attention mechanism.
         norm2 (nn.RMSNorm): RMS normalization before the FFN.
         ffn (nn.Sequential): The feed-forward network.
     """
@@ -373,7 +373,7 @@ class SlidingWindowTransformerBlock(nn.Module):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
         self.norm1 = nn.RMSNorm(dim)
-        self.attn = SlidingWindowAttention(
+        self.attn = LocalSlidingWindowAttention(
             embed_dim=dim,
             num_heads=num_heads,
             window_size=window_size,
