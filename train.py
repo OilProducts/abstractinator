@@ -225,9 +225,11 @@ if __name__ == "__main__":
             # Ensure initial_vocab_size in exp_config matches this.
             # vocab_size here would be max(bos,eos,pad) + 1 = 259 for defaults.
             self.vocab_size = max(bos_id, eos_id, pad_id) + 1
-            if self.vocab_size != exp_config["initial_vocab_size"]:
-                print(f"Warning: Tokenizer vocab_size ({self.vocab_size}) does not match "
-                      f"exp_config['initial_vocab_size'] ({exp_config['initial_vocab_size']}).")
+            if self.vocab_size != exp_config.initial_vocab_size:
+                print(
+                    f"Warning: Tokenizer vocab_size ({self.vocab_size}) does not match "
+                    f"exp_config.initial_vocab_size ({exp_config.initial_vocab_size})."
+                )
 
         def encode(self, text: str, add_bos: bool | None = None,
                    add_eos: bool | None = None) -> torch.Tensor:
@@ -329,27 +331,28 @@ if __name__ == "__main__":
 
 
     # --- Dataset Loading and Processing ---
-    print(f"\nLoading dataset '{exp_config['dataset_name']}'...")
+    print(f"\nLoading dataset '{exp_config.dataset_name}'...")
     raw_dataset = None
     try:
         raw_dataset = load_dataset(
-            exp_config["dataset_name"],
-            name=exp_config.get("dataset_config"),  # Use .get() for optional config name
-            split=exp_config["dataset_train_split"]
+            exp_config.dataset_name,
+            name=exp_config.dataset_config,
+            split=exp_config.dataset_train_split,
         )
         print(f"Dataset loaded. Number of examples: {len(raw_dataset)}")
     except Exception as e:
-        print(f"Error loading dataset '{exp_config['dataset_name']}': {e}")
+        print(f"Error loading dataset '{exp_config.dataset_name}': {e}")
         sys.exit()
 
     print(
-        f"\nTokenizing and processing dataset with sequence length {exp_config['sequence_length']}...")
+        f"\nTokenizing and processing dataset with sequence length {exp_config.sequence_length}..."
+    )
     tokenized_dataset = raw_dataset.map(
         tokenize_and_process_examples,
         batched=True,
         fn_kwargs={
-            "sequence_length": exp_config["sequence_length"],
-            "text_column": exp_config["text_column_name"]
+            "sequence_length": exp_config.sequence_length,
+            "text_column": exp_config.text_column_name,
         },
         remove_columns=raw_dataset.column_names,
         num_proc=N_CPU  # Use multiple processes for mapping
@@ -364,10 +367,10 @@ if __name__ == "__main__":
     print("Dataset format set.")
 
     # --- DataLoader ---
-    print(f"\nCreating PyTorch DataLoader with batch size {exp_config['batch_size']}...")
+    print(f"\nCreating PyTorch DataLoader with batch size {exp_config.batch_size}...")
     train_dataloader = DataLoader(
         tokenized_dataset,
-        batch_size=exp_config["batch_size"],
+        batch_size=exp_config.batch_size,
         # shuffle=True,
         num_workers=N_CPU,  # Use N_CPU for DataLoader workers
         pin_memory=True if DEVICE == "cuda" else False  # pin_memory if using CUDA
@@ -377,21 +380,23 @@ if __name__ == "__main__":
 
     # --- Scheduler Setup --- # <<< ADDED SECTION
     # Calculate the total number of training (optimizer) steps
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config["gradient_accumulation_steps"])
-    if exp_config.get("max_steps") is not None:
-        exp_config["num_training_steps"] = int(exp_config["max_steps"])
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / exp_config.gradient_accumulation_steps
+    )
+    if exp_config.max_steps is not None:
+        exp_config.num_training_steps = int(exp_config.max_steps)
     else:
-        exp_config["num_training_steps"] = exp_config["num_epochs"] * num_update_steps_per_epoch
+        exp_config.num_training_steps = exp_config.num_epochs * num_update_steps_per_epoch
 
     print(
-        f"Creating learning rate scheduler: {exp_config['scheduler_type']} with {exp_config['warmup_steps']} warmup steps and {exp_config['num_training_steps']} total steps."
+        f"Creating learning rate scheduler: {exp_config.scheduler_type} with {exp_config.warmup_steps} warmup steps and {exp_config.num_training_steps} total steps."
     )
     lr_scheduler = get_scheduler(
-        name=exp_config['scheduler_type'],
+        name=exp_config.scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=exp_config['warmup_steps'],
-        num_training_steps=exp_config['num_training_steps'],
-        scheduler_specific_kwargs=exp_config["scheduler_specific_kwargs"] if "scheduler_specific_kwargs" in exp_config else {}
+        num_warmup_steps=exp_config.warmup_steps,
+        num_training_steps=exp_config.num_training_steps,
+        scheduler_specific_kwargs=exp_config.scheduler_specific_kwargs if hasattr(exp_config, "scheduler_specific_kwargs") else {}
     )
 
     # --- Track final hyperparameters with MLflow ---
@@ -431,20 +436,23 @@ if __name__ == "__main__":
         }
         return accumulators
 
-    accumulators = reset_accumulators(exp_config["num_levels"])
+    accumulators = reset_accumulators(exp_config.num_levels)
     time_of_last_optimizer_step_event = time.time() # Initialize timer for tokens/sec
     total_minibatches_in_epoch = len(train_dataloader)
 
-    for epoch in range(start_epoch, exp_config["num_epochs"]):
-        print(f"\n--- Epoch {epoch + 1}/{exp_config['num_epochs']} ---") # MODIFIED: Epoch start print
+    for epoch in range(start_epoch, exp_config.num_epochs):
+        print(f"\n--- Epoch {epoch + 1}/{exp_config.num_epochs} ---")
         epoch_start_time = time.time()
         model.train() # Ensure model is in train mode at start of epoch
 
         for i, batch in enumerate(train_dataloader):
             tokens = batch["input_ids"].to(DEVICE)
             # KPM is already boolean, just move to device
-            kpm = batch["key_padding_mask"].to(DEVICE) if exp_config[
-                "propagate_key_padding_mask"] else None
+            kpm = (
+                batch["key_padding_mask"].to(DEVICE)
+                if exp_config.propagate_key_padding_mask
+                else None
+            )
 
             # HierarchicalAutoencoder.forward now handles loss calculation internally
             # and expects KPM for the initial tokens.
@@ -454,7 +462,7 @@ if __name__ == "__main__":
             # Normalize loss to account for accumulation
             # Each batch contributes 1/N to the total gradient, so scale loss by 1/N
             # This ensures that the magnitude of the gradients is similar to non-accumulated training
-            loss_for_backward = total_loss / exp_config["gradient_accumulation_steps"]
+            loss_for_backward = total_loss / exp_config.gradient_accumulation_steps
             loss_for_backward.backward()
 
             # --- Accumulate Metrics ---
@@ -504,9 +512,9 @@ if __name__ == "__main__":
 
             # --- End Accumulate Metrics ---
 
-            if (i + 1) % exp_config["gradient_accumulation_steps"] == 0:
-                if exp_config.get("gradient_clip_norm"):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config["gradient_clip_norm"])
+            if (i + 1) % exp_config.gradient_accumulation_steps == 0:
+                if exp_config.gradient_clip_norm:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config.gradient_clip_norm)
                 optimizer.step()
                 lr_scheduler.step()  # Step the scheduler after optimizer step
                 optimizer.zero_grad()  # Reset gradients after accumulation
@@ -521,7 +529,7 @@ if __name__ == "__main__":
                 # Update global byte count and compute ETAs
                 total_bytes_processed += tokens_processed_this_window
 
-                total_progress = (global_step + 1) / exp_config["num_training_steps"]
+                total_progress = (global_step + 1) / exp_config.num_training_steps
                 total_elapsed = current_time - training_start_time
                 total_eta_sec = (total_elapsed / total_progress - total_elapsed) if total_progress > 0 else 0
 
@@ -530,7 +538,7 @@ if __name__ == "__main__":
                 if steps_accumulated > 0:  # Ensure there's something to log
                     # --- Console Logging (replaces tqdm postfix and description updates) ---
                     console_log_parts = [
-                        f"Epoch {epoch + 1}/{exp_config['num_epochs']}",
+                        f"Epoch {epoch + 1}/{exp_config.num_epochs}",
                         f"OptStep {global_step}",
                         f"MB {i + 1}/{total_minibatches_in_epoch}",  # Minibatch progress
                         f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
@@ -552,14 +560,12 @@ if __name__ == "__main__":
                             if 'top_code_vq_loss' in tcld:
                                 console_log_parts.append(f"TopVQ {tcld['top_code_vq_loss'].item():.4f}")
 
-                    if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config[
-                        "num_levels"]:
+                    if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config.num_levels:
                         # TQDM showed accumulated average for ratios
                         ratios_str = ", ".join([f"{r / steps_accumulated:.2f}" for r in accumulators['compression_ratios']])
                         console_log_parts.append(f"Ratios [{ratios_str}]")
 
-                    if 'all_smoothed_perplexities' in accumulators and len(accumulators["all_smoothed_perplexities"]) == \
-                            exp_config["num_levels"]:
+                    if 'all_smoothed_perplexities' in accumulators and len(accumulators["all_smoothed_perplexities"]) == exp_config.num_levels:
                         # TQDM showed accumulated average for smooth perplexities
                         ppl_str = ", ".join(
                             [f"{p / steps_accumulated:.4f}" for p in accumulators['all_smoothed_perplexities']])
@@ -573,7 +579,7 @@ if __name__ == "__main__":
 
 
                     # --- Logging to MLflow (occurs every optimizer step) ---
-                    if global_step % exp_config["log_interval"] == 0 and accumulators["count"] > 0:
+                    if global_step % exp_config.log_interval == 0 and accumulators["count"] > 0:
 
                         mlflow.log_metric('loss/total_avg_accum', accumulators["total_loss"] / steps_accumulated, step=global_step)
                         mlflow.log_metric('loss/vq_avg_accum', accumulators["vq_loss"] / steps_accumulated, step=global_step)
@@ -594,7 +600,7 @@ if __name__ == "__main__":
                                 mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
 
                         if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
-                            for level_idx in range(exp_config["num_levels"]):
+                            for level_idx in range(exp_config.num_levels):
                                 mlflow.log_metric(f'compression_avg/ratio_L{level_idx}',
                                                   accumulators["compression_ratios"][level_idx] / steps_accumulated,
                                                   step=global_step)
@@ -608,46 +614,45 @@ if __name__ == "__main__":
                         mlflow.log_metric('learning_rate', optimizer.param_groups[0]['lr'], step=global_step)
 
                         if 'all_codebook_perplexities' in output_dict:
-                            for level_idx in range(exp_config["num_levels"]):
+                            for level_idx in range(exp_config.num_levels):
                                 mlflow.log_metric(f'vq_metrics_avg/perplexity_L{level_idx}',
                                                   accumulators["all_codebook_perplexities"][level_idx] / steps_accumulated,
                                                   step=global_step)
-                                codebook_size_L_i = exp_config["compressor_level_configs"][level_idx][
-                                    "codebook_size"]
+                                codebook_size_L_i = exp_config.compressor_level_configs[level_idx].codebook_size
                                 mlflow.log_metric(f'vq_metrics/codebook_size_L{level_idx}', codebook_size_L_i, step=global_step)
 
                         if 'all_smoothed_perplexities' in output_dict:
-                            for level_idx in range(exp_config["num_levels"]):
+                            for level_idx in range(exp_config.num_levels):
                                 mlflow.log_metric(f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
                                                   accumulators["all_smoothed_perplexities"][level_idx] / steps_accumulated,
                                                   step=global_step)
 
                 # Reset accumulators for the next window
-                accumulators = reset_accumulators(exp_config["num_levels"])
+                accumulators = reset_accumulators(exp_config.num_levels)
                 # Update the timer to mark the start of the next accumulation window's measurement period
                 time_of_last_optimizer_step_event = time.time()
 
                 # --- End Logging ---
 
                 # --- Generation During Training ---
-                if global_step > 0 and global_step % exp_config["generation_interval"] == 0:
+                if global_step > 0 and global_step % exp_config.generation_interval == 0:
                     print(f"\nStep {global_step}: Generating sample...")
                     model.eval()  # Switch to evaluation mode for generation
                     with torch.no_grad():
-                        sample_text = exp_config["sample_prompt_for_generation"]
+                        sample_text = exp_config.sample_prompt_for_generation
                         # Encode the prompt without padding to a fixed length
                         # BOS/EOS will be added by tokenizer.encode if configured
                         input_gen_tokens = tokenizer.encode(sample_text).unsqueeze(0).to(DEVICE)
 
                         # For unpadded, variable-length input to generate_bytes, KPM is all False
                         input_gen_kpm = None
-                        if exp_config["propagate_key_padding_mask"]:
+                        if exp_config.propagate_key_padding_mask:
                             input_gen_kpm = torch.zeros_like(input_gen_tokens, dtype=torch.bool).to(DEVICE)
 
                         reconstructed_tokens = model.generate_bytes(
                             tokens=input_gen_tokens,
                             key_padding_mask=input_gen_kpm,  # Pass KPM if propagation is on
-                            max_len_override=exp_config["generation_max_len_override"]
+                            max_len_override=exp_config.generation_max_len_override
                         )
                         reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu(),
                                                               cut_at_eos=True)
@@ -662,22 +667,22 @@ if __name__ == "__main__":
                         mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
 
                     model.train()  # Switch back to training mode
-                if global_step > 0 and global_step % exp_config["checkpoint_interval"] == 0:
-                    save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
+                if global_step > 0 and global_step % exp_config.checkpoint_interval == 0:
+                    save_checkpoint(model, optimizer, epoch, global_step, exp_config.checkpoint_dir)
                 global_step += 1
-                if exp_config.get("max_steps") is not None and global_step >= exp_config["max_steps"]:
-                    print(f"Reached max_steps {exp_config['max_steps']}. Stopping training.")
+                if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
+                    print(f"Reached max_steps {exp_config.max_steps}. Stopping training.")
                     break
         epoch_duration = time.time() - epoch_start_time
         print(f"--- Epoch {epoch + 1} finished. Duration: {epoch_duration:.2f}s ---") # MODIFIED: Epoch end print
-        save_checkpoint(model, optimizer, epoch, global_step, exp_config["checkpoint_dir"])
+        save_checkpoint(model, optimizer, epoch, global_step, exp_config.checkpoint_dir)
 
-        if exp_config.get("max_steps") is not None and global_step >= exp_config["max_steps"]:
+        if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
             break
 
     print("Training finished.")
-    if exp_config.get("save_base_components_path"):
-        save_base_components(model, exp_config["save_base_components_path"])
+    if exp_config.save_base_components_path:
+        save_base_components(model, exp_config.save_base_components_path)
     mlflow.end_run()
 
     # Example of saving the model (optional)
