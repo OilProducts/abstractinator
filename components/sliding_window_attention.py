@@ -85,7 +85,8 @@ class LocalSlidingWindowAttention(nn.Module):
             KV_LEN=seq_len,
             BLOCK_SIZE=128,
             _compile=False,           # pre‑compile sparse metadata
-        ).to(device)
+            device=device,
+        )
 
         if is_training:
             cache[cache_key] = blk
@@ -105,9 +106,9 @@ class LocalSlidingWindowAttention(nn.Module):
             raise ValueError("embed_dim mismatch")
 
         # project and reshape -------------------------------------------------
-        q = self.q_proj(x).view(B, S, H, d).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, H, d).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, H, d).transpose(1, 2)
+        q = self.q_proj(x).view(B, S, H, d).transpose(1, 2).contiguous()
+        k = self.k_proj(x).view(B, S, H, d).transpose(1, 2).contiguous()
+        v = self.v_proj(x).view(B, S, H, d).transpose(1, 2).contiguous()
         q = apply_rope(q)
         k = apply_rope(k)
         q = q * (d ** -0.5)
