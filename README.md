@@ -127,7 +127,9 @@ Key modules under `components/` include:
   vectors used by the compressors to pool variable-length segments into fixed
   representations.
 - **VectorQuantizer** – Discretizes segment embeddings with an EMA-updated
-  codebook and provides the VQ loss used during training.
+  codebook and provides the VQ loss used during training. The
+  frequency of dead-code resets is controlled by the
+  `vq_reset_interval` value in each compressor's config.
 - **SlidingWindowAttention** – Provides efficient local attention kernels for the
   token encoder used inside each compressor.
 - **HierarchicalAELM** – Adapter that exposes trained autoencoder checkpoints as
