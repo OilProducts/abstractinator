@@ -48,6 +48,7 @@ class ByteSegmentCompressor(nn.Module):
         num_queries: int = 1,  # L: Number of queries per segment for the pooler
         codebook_size: int = 512,  # K: Number of codes in VQ codebook
         beta: float = 0.25,  # Beta for VQ commitment loss
+        vq_reset_interval: int = 250,
         entropy_delta: float = 0.2,
         entropy_abs_threshold: float | None = None,
     ):
@@ -111,7 +112,12 @@ class ByteSegmentCompressor(nn.Module):
             num_heads=heads,
         )
 
-        self.vq = VectorQuantizer(K=codebook_size, D=dim, beta=beta)
+        self.vq = VectorQuantizer(
+            K=codebook_size,
+            D=dim,
+            beta=beta,
+            reset_interval=vq_reset_interval,
+        )
 
     def forward(self, token_ids: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None
