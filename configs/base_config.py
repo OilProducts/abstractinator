@@ -19,6 +19,9 @@ class CompressorLevelConfig:
     heads: int = 12
     window: int = 512
     num_encoder_layers: int = 6
+    num_shared_encoder_layers: int = 0
+    num_lm_encoder_layers: Optional[int] = None
+    num_compression_encoder_layers: Optional[int] = None
     encoder_ffn_dim_multiplier: int = 4
     max_seq_len_encoder: int = 4096
     num_queries: int = 1
