@@ -455,7 +455,7 @@ class HierarchicalAutoencoder(nn.Module):
                 pred = preds_pre_vq[:, :-1, :]
                 target = cont[:, 1:, :]
                 mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
-                per_tok = F.mse_loss(pred, target, reduction='none').mean(dim=-1)
+                per_tok = F.mse_loss(pred, target, reduction='none').sum(dim=-1)
                 if mask is not None:
                     loss_mask = ~mask
                     valid_targets = loss_mask.sum()
