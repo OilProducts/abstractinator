@@ -368,15 +368,23 @@ class SlidingWindowTransformerBlock(nn.Module):
     """
 
     def __init__(self, dim: int, num_heads: int, window_size: int,
-                 ffn_dim_multiplier: int = 4):
+                 ffn_dim_multiplier: int = 4,
+                 use_flex_attention: bool = True):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
         self.norm1 = nn.RMSNorm(dim)
-        self.attn = LocalSlidingWindowAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-        )
+        if use_flex_attention:
+            self.attn = LocalSlidingWindowAttention(
+                embed_dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+            )
+        else:
+            self.attn = SlidingWindowAttention(
+                embed_dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+            )
 
         # Second sub-block: Feed-Forward Network
         self.norm2 = nn.RMSNorm(dim)
@@ -427,9 +435,13 @@ class StackedSlidingWindowEncoder(nn.Module):
         final_norm (nn.RMSNorm): RMS normalization applied to the output of the
                                  last Transformer block before logit projection.
         logit_proj (nn.Linear): Linear layer to project Transformer output to vocabulary logits.
+        use_flex_attention (bool): If True, uses the FlexAttention implementation
+            for sliding window attention. Should typically be True only when CUDA
+            is available.
     """
     def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
-                 num_layers: int, ffn_dim_multiplier: int = 4):
+                 num_layers: int, ffn_dim_multiplier: int = 4,
+                 use_flex_attention: bool = True):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, dim)
 
@@ -438,7 +450,8 @@ class StackedSlidingWindowEncoder(nn.Module):
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
-                ffn_dim_multiplier=ffn_dim_multiplier
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                use_flex_attention=use_flex_attention
             ) for _ in range(num_layers)
         ])
 
