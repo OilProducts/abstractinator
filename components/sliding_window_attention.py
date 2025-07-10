@@ -5,7 +5,8 @@ from functools import lru_cache
 from .utils import safe_softmax
 from torch.nn.attention.flex_attention import (
     flex_attention,           # fused kernel
-    create_block_mask         # helper to build sparse mask
+    create_block_mask,        # helper to build sparse mask
+    and_masks
 )
 from .rope import apply_rope
 from .swiglu import SwiGLU
@@ -116,7 +117,23 @@ class LocalSlidingWindowAttention(nn.Module):
         # block mask ----------------------------------------------------------
         block_mask = self._sliding_block(S, self.window, x.device, self.training)
         if key_padding_mask is not None:
-            block_mask = block_mask.add_padding_mask(key_padding_mask)
+            # Recreate the mask with padding info since BlockMask.add_padding_mask
+            # is not implemented in PyTorch.
+            pad_mask = key_padding_mask.to(torch.bool)
+
+            def _kpm_mod(b, h, q, k):
+                return ~pad_mask[b, k]
+
+            combined = and_masks(block_mask.mask_mod, _kpm_mod)
+            block_mask = create_block_mask(
+                combined,
+                B=pad_mask.size(0),
+                H=None,
+                Q_LEN=block_mask.seq_lengths[0],
+                KV_LEN=block_mask.seq_lengths[1],
+                BLOCK_SIZE=block_mask.BLOCK_SIZE,
+                device=pad_mask.device,
+            )
 
         # fused attention -----------------------------------------------------
         ctx = flex_attention(
