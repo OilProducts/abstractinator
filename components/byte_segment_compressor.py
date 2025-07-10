@@ -50,14 +50,15 @@ class ByteSegmentCompressor(nn.Module):
         self.entropy_abs_threshold = entropy_abs_threshold
 
         # Initialize the token encoder
-        # Uses StackedSlidingWindowEncoder for token encoding
+        # Use FlexAttention only when CUDA is available
         self.encoder = StackedSlidingWindowEncoder(
             vocab_size=vocab_size,
             dim=dim,
             num_heads=heads,
             window_size=window,
             num_layers=num_encoder_layers,
-            ffn_dim_multiplier=encoder_ffn_dim_multiplier
+            ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+            use_flex_attention=torch.cuda.is_available()
         )
 
         # Initialize the attention pooler that uses learned queries per segment

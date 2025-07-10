@@ -260,7 +260,8 @@ class HierarchicalAutoencoder(nn.Module):
 
         compression_ratios: List[torch.Tensor] = []
         for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths):
-            ratio = torch.where(in_len > 0, out_len / in_len, out_len.new_tensor(0.0))
+            in_len_t = out_len.new_tensor(in_len)
+            ratio = torch.where(in_len_t > 0, out_len / in_len_t, out_len.new_tensor(0.0))
             compression_ratios.append(ratio)
             # compression_ratios.append(float((out_len / in_len).cpu()) if in_len.item() > 0 else 0.0)
         # compression_ratios = [(out_len / in_len) if in_len > 0 else 0.0 for in_len, out_len in
