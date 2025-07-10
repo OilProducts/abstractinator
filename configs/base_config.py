@@ -15,17 +15,17 @@ if torch.backends.mps.is_available() and DEVICE == "cpu":
 
 @dataclass
 class CompressorLevelConfig:
-    dim: int = 768
-    heads: int = 12
-    window: int = 512
-    num_encoder_layers: int = 6
-    num_shared_encoder_layers: int = 0
-    num_lm_encoder_layers: Optional[int] = None
-    num_compression_encoder_layers: Optional[int] = None
+    dim: int = 256
+    heads: int = 8
+    window: int = 128
+    num_encoder_layers: int = 0
+    num_shared_encoder_layers: int = 2
+    num_lm_encoder_layers: Optional[int] = 2
+    num_compression_encoder_layers: Optional[int] = 2
     encoder_ffn_dim_multiplier: int = 4
     max_seq_len_encoder: int = 4096
     num_queries: int = 1
-    codebook_size: int = 49404
+    codebook_size: int = 4096
     beta: float = 1.0
     entropy_delta: float = 0.2
     entropy_abs_threshold: Optional[float] = None
@@ -35,9 +35,9 @@ class CompressorLevelConfig:
 
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 768
-    dim: int = 768
-    num_layers: int = 16
+    embed_dim: int = 256
+    dim: int = 384
+    num_layers: int = 8
     num_heads: int = 12
     ffn_dim_multiplier: int = 4
     continuous: bool = True
@@ -61,7 +61,7 @@ class ExpConfig:
     use_decoder_only_expander: bool = True
     propagate_key_padding_mask: bool = True
     aux_lm_loss_weight: float = 1.0
-    top_lm_loss_weight: float = 0.2
+    top_lm_loss_weight: float = 1.0
     top_transformer_config: Optional[TopTransformerConfig] = field(
         default_factory=TopTransformerConfig
     )
