@@ -43,6 +43,7 @@ All experiment settings live in the `exp_config` dictionary within your chosen c
 Checkpoints are saved to `exp_config['checkpoint_dir']` every `exp_config['checkpoint_interval']` steps and include a copy of `exp_config`.  To resume training you can either set `exp_config['resume_from_checkpoint']` in the config file or pass `--resume_from_checkpoint <path>` on the command line.  If no `--config` is given, the configuration embedded in the checkpoint will be used.
 
 Training metrics and sample outputs are logged with [MLflow](https://mlflow.org/docs/latest/python_api/mlflow.html). If `exp_config['project_name']` is set, logs are stored under `./mlruns/<project_name>`.
+Logging to MLflow occurs in batches controlled by `exp_config['mlflow_batch_interval']`.
 You can monitor a run locally by launching the MLflow UI:
 
 ```bash
