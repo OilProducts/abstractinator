@@ -97,6 +97,7 @@ class HierarchicalAutoencoder(nn.Module):
                 num_queries=config['num_queries'],
                 codebook_size=config['codebook_size'],
                 beta=config['beta'],
+                vq_reset_interval=config.get('vq_reset_interval', 250),
                 entropy_delta=config.get('entropy_delta', 0.2),
                 entropy_abs_threshold=config.get('entropy_abs_threshold'),
             )
