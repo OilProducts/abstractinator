@@ -87,6 +87,7 @@ class ExpConfig:
     resume_from_checkpoint: Optional[str] = None
     save_base_components_path: Optional[str] = None
     use_continuous_expander_inputs: bool = False
+    mlflow_batch_interval: int = 1
 
     def as_dict(self) -> Dict[str, Any]:
         """Return the configuration as a plain dictionary."""
