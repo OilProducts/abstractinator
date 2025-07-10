@@ -557,17 +557,19 @@ if __name__ == "__main__":
                         f"OptStep {global_step}",
                         f"MB {i + 1}/{total_minibatches_in_epoch}",  # Minibatch progress
                         f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
-                        f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}",
                         f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                        f"Tok/s {short_num(avg_tok_s)}",
-                        f"Bytes {short_num(total_bytes_processed)}",
-                        f"ETAt {format_duration(total_eta_sec)}"
+                        f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}"
                     ]
 
-                    # Mimicking the original postfix_dict logic for specific items
+                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0 and "avg_aux_lm_loss" in accumulators:
+                        console_log_parts.append(
+                            f"AuxLM {accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}"
+                        )
+
                     if 'avg_top_code_lm_loss' in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
-                        # TQDM showed the last batch's value for this
-                        console_log_parts.append(f"TopLM {output_dict['avg_top_code_lm_loss'].item():.4f}")
+                        console_log_parts.append(
+                            f"TopLM {output_dict['avg_top_code_lm_loss'].item():.4f}"
+                        )
                         if 'top_code_lm_loss_details' in output_dict:
                             tcld = output_dict['top_code_lm_loss_details']
                             if 'top_code_mse' in tcld:
@@ -575,6 +577,13 @@ if __name__ == "__main__":
                             if 'top_code_vq_loss' in tcld:
                                 console_log_parts.append(f"TopVQ {tcld['top_code_vq_loss'].item():.4f}")
 
+                    console_log_parts.extend([
+                        f"Tok/s {short_num(avg_tok_s)}",
+                        f"Bytes {short_num(total_bytes_processed)}",
+                        f"ETAt {format_duration(total_eta_sec)}",
+                    ])
+
+                    # Additional metrics appended after the loss components
                     if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config.num_levels:
                         # TQDM showed accumulated average for ratios
                         ratios_str = ", ".join([f"{r / steps_accumulated:.2f}" for r in accumulators['compression_ratios']])
@@ -585,10 +594,6 @@ if __name__ == "__main__":
                         ppl_str = ", ".join(
                             [f"{p / steps_accumulated:.4f}" for p in accumulators['all_smoothed_perplexities']])
                         console_log_parts.append(f"SmoothPPL [{ppl_str}]")
-
-                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0 and "avg_aux_lm_loss" in accumulators:
-                        # TQDM showed accumulated average for auxLM
-                        console_log_parts.append(f"AuxLM {accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}")
 
                     print(" | ".join(console_log_parts), flush=True)
 
