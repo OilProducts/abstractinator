@@ -15,6 +15,8 @@ from typing import List, Dict, Any
 from transformers.optimization import get_scheduler
 
 import mlflow  # Logging with MLflow
+from mlflow.tracking import MlflowClient
+from mlflow.entities import Metric
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
@@ -111,6 +113,9 @@ if __name__ == "__main__":
     mlflow_run = mlflow.start_run(
         run_name=getattr(exp_config, "run_name", "DefaultRun")
     )
+    mlflow_client = MlflowClient()
+    mlflow_run_id = mlflow_run.info.run_id
+    mlflow_metric_buffer = []
 
     # --- Model, Optimizer ---
     print("Initializing HierarchicalAutoencoder model...")
@@ -590,52 +595,64 @@ if __name__ == "__main__":
 
                     # --- Logging to MLflow (occurs every optimizer step) ---
                     if global_step % exp_config.log_interval == 0 and accumulators["count"] > 0:
-
-                        mlflow.log_metric('loss/total_avg_accum', accumulators["total_loss"] / steps_accumulated, step=global_step)
-                        mlflow.log_metric('loss/vq_avg_accum', accumulators["vq_loss"] / steps_accumulated, step=global_step)
-                        mlflow.log_metric('loss/reconstruction_avg_accum', accumulators["avg_reconstruction_loss"] / steps_accumulated, step=global_step)
-                        mlflow.log_metric('performance/tokens_per_sec', tokens_per_second, step=global_step)
-                        mlflow.log_metric('loss/top_code_lm_avg_accum', accumulators["avg_top_code_lm_loss"] / steps_accumulated, step=global_step)
-                        mlflow.log_metric('loss/top_code_mse_avg_accum', accumulators['top_code_mse'] / steps_accumulated, step=global_step)
-                        mlflow.log_metric('loss/top_code_vq_avg_accum', accumulators['top_code_vq_loss'] / steps_accumulated, step=global_step)
+                        metrics_dict = {
+                            'loss/total_avg_accum': accumulators["total_loss"] / steps_accumulated,
+                            'loss/vq_avg_accum': accumulators["vq_loss"] / steps_accumulated,
+                            'loss/reconstruction_avg_accum': accumulators["avg_reconstruction_loss"] / steps_accumulated,
+                            'performance/tokens_per_sec': tokens_per_second,
+                            'loss/top_code_lm_avg_accum': accumulators["avg_top_code_lm_loss"] / steps_accumulated,
+                            'loss/top_code_mse_avg_accum': accumulators['top_code_mse'] / steps_accumulated,
+                            'loss/top_code_vq_avg_accum': accumulators['top_code_vq_loss'] / steps_accumulated,
+                            'learning_rate': optimizer.param_groups[0]['lr'],
+                        }
                         for key, value in accumulators["top_code_lm_loss_details"].items():
-                            mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
+                            metrics_dict[f'loss_detail_avg_accum/{key}'] = value / steps_accumulated
 
                         for key, value in accumulators["reconstruction_loss_details"].items():
-                            mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
+                            metrics_dict[f'loss_detail_avg_accum/{key}'] = value / steps_accumulated
 
                         if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                            mlflow.log_metric('loss/aux_lm_avg_accum', accumulators["avg_aux_lm_loss"] / steps_accumulated, step=global_step)
+                            metrics_dict['loss/aux_lm_avg_accum'] = accumulators["avg_aux_lm_loss"] / steps_accumulated
                             for key, value in accumulators["aux_lm_loss_details"].items():
-                                mlflow.log_metric(f'loss_detail_avg_accum/{key}', value / steps_accumulated, step=global_step)
+                                metrics_dict[f'loss_detail_avg_accum/{key}'] = value / steps_accumulated
 
                         if 'compression_ratios' in output_dict:  # Check if key exists in output_dict to ensure lists are correct length
                             for level_idx in range(exp_config.num_levels):
-                                mlflow.log_metric(f'compression_avg/ratio_L{level_idx}',
-                                                  accumulators["compression_ratios"][level_idx] / steps_accumulated,
-                                                  step=global_step)
-                                mlflow.log_metric(f'compression_avg/input_len_L{level_idx}',
-                                                  accumulators["input_seq_lengths_compressors"][level_idx] / steps_accumulated,
-                                                  step=global_step)
-                                mlflow.log_metric(f'compression_avg/output_len_L{level_idx}',
-                                                  accumulators["output_seq_lengths_compressors"][level_idx] / steps_accumulated,
-                                                  step=global_step)
-
-                        mlflow.log_metric('learning_rate', optimizer.param_groups[0]['lr'], step=global_step)
+                                metrics_dict[f'compression_avg/ratio_L{level_idx}'] = (
+                                    accumulators["compression_ratios"][level_idx] / steps_accumulated
+                                )
+                                metrics_dict[f'compression_avg/input_len_L{level_idx}'] = (
+                                    accumulators["input_seq_lengths_compressors"][level_idx] / steps_accumulated
+                                )
+                                metrics_dict[f'compression_avg/output_len_L{level_idx}'] = (
+                                    accumulators["output_seq_lengths_compressors"][level_idx] / steps_accumulated
+                                )
 
                         if 'all_codebook_perplexities' in output_dict:
                             for level_idx in range(exp_config.num_levels):
-                                mlflow.log_metric(f'vq_metrics_avg/perplexity_L{level_idx}',
-                                                  accumulators["all_codebook_perplexities"][level_idx] / steps_accumulated,
-                                                  step=global_step)
+                                metrics_dict[f'vq_metrics_avg/perplexity_L{level_idx}'] = (
+                                    accumulators["all_codebook_perplexities"][level_idx] / steps_accumulated
+                                )
                                 codebook_size_L_i = exp_config.compressor_level_configs[level_idx].codebook_size
-                                mlflow.log_metric(f'vq_metrics/codebook_size_L{level_idx}', codebook_size_L_i, step=global_step)
+                                metrics_dict[f'vq_metrics/codebook_size_L{level_idx}'] = codebook_size_L_i
 
                         if 'all_smoothed_perplexities' in output_dict:
                             for level_idx in range(exp_config.num_levels):
-                                mlflow.log_metric(f'vq_metrics_avg/smooth_perplexity_L{level_idx}',
-                                                  accumulators["all_smoothed_perplexities"][level_idx] / steps_accumulated,
-                                                  step=global_step)
+                                metrics_dict[f'vq_metrics_avg/smooth_perplexity_L{level_idx}'] = (
+                                    accumulators["all_smoothed_perplexities"][level_idx] / steps_accumulated
+                                )
+
+                        mlflow_metric_buffer.append((global_step, metrics_dict))
+                        if len(mlflow_metric_buffer) >= exp_config.mlflow_batch_interval:
+                            timestamp_ms = int(time.time() * 1000)
+                            metrics_entities = []
+                            for step_id, mdict in mlflow_metric_buffer:
+                                metrics_entities.extend([
+                                    Metric(key=k, value=v, timestamp=timestamp_ms, step=step_id)
+                                    for k, v in mdict.items()
+                                ])
+                            mlflow_client.log_batch(mlflow_run_id, metrics=metrics_entities)
+                            mlflow_metric_buffer = []
 
                 # Reset accumulators for the next window
                 accumulators = reset_accumulators(exp_config.num_levels)
@@ -693,6 +710,15 @@ if __name__ == "__main__":
     print("Training finished.")
     if exp_config.save_base_components_path:
         save_base_components(model, exp_config.save_base_components_path)
+    if mlflow_metric_buffer:
+        timestamp_ms = int(time.time() * 1000)
+        metrics_entities = []
+        for step_id, mdict in mlflow_metric_buffer:
+            metrics_entities.extend([
+                Metric(key=k, value=v, timestamp=timestamp_ms, step=step_id)
+                for k, v in mdict.items()
+            ])
+        mlflow_client.log_batch(mlflow_run_id, metrics=metrics_entities)
     mlflow.end_run()
 
     # Example of saving the model (optional)
