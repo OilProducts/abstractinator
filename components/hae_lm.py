@@ -11,7 +11,7 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval import utils
 
-from train import ByteLevelTokenizer
+from components.tokenizer import ByteLevelTokenizer
 from components import HierarchicalAutoencoder
 from configs.base_config import ExpConfig
 
