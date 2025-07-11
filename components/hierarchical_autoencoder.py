@@ -116,6 +116,8 @@ class HierarchicalAutoencoder(nn.Module):
             cfg = self.top_transformer_config
             transformer_dim = cfg.get("dim", embed_dim)
 
+            self.top_transformer_continuous = cfg.get("continuous", True)
+
             self.code_sequence_transformer = CodeSequenceTransformer(
                 embed_dim=embed_dim,
                 dim=transformer_dim,
@@ -124,12 +126,14 @@ class HierarchicalAutoencoder(nn.Module):
                 ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", 4),
                 vq=self.compressors[-1].vq,
             )
+            mode = "continuous" if self.top_transformer_continuous else "discrete"
             print(
-                f"Initialized CodeSequenceTransformer for continuous codes (embed_dim: {embed_dim}, dim: {transformer_dim})"
+                f"Initialized CodeSequenceTransformer for {mode} codes (embed_dim: {embed_dim}, dim: {transformer_dim})"
             )
 
         else:
             self.code_sequence_transformer = None
+            self.top_transformer_continuous = True
 
         # ---- Configure Expander Stack ----
         self.expanders = nn.ModuleList()
@@ -443,6 +447,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and compression_results['all_pre_vq'][-1].numel() > 0:
             cont = compression_results['all_pre_vq'][-1]
+            codes = compression_results['all_codes'][-1]
             cst_out = self.code_sequence_transformer(
                 input_embeddings=cont,
                 key_padding_mask=kpm_for_top_codes,
@@ -451,24 +456,34 @@ class HierarchicalAutoencoder(nn.Module):
             vq_loss_top = cst_out['vq_loss']
 
             if cont.size(1) <= 1:
-                mse_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
             else:
                 pred = preds_pre_vq[:, :-1, :]
-                target = cont[:, 1:, :]
                 mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
-                per_tok = F.mse_loss(pred, target, reduction='none').sum(dim=-1)
+                if self.top_transformer_continuous:
+                    target = cont[:, 1:, :]
+                    per_tok = F.mse_loss(pred, target, reduction='none').sum(dim=-1)
+                else:
+                    target = codes[:, 1:]
+                    codebook = self.compressors[-1].vq.codebook
+                    logits = -torch.cdist(pred, codebook)
+                    per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)), target.reshape(-1), reduction='none').view_as(target)
+
                 if mask is not None:
                     loss_mask = ~mask
                     valid_targets = loss_mask.sum()
                     if valid_targets > 0:
-                        mse_loss = (per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
+                        lm_loss = (per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
                     else:
-                        mse_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+                        lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
                 else:
-                    mse_loss = per_tok.mean()
+                    lm_loss = per_tok.mean()
 
-            avg_top_code_lm_loss = mse_loss + vq_loss_top
-            top_code_lm_loss_details["top_code_mse"] = mse_loss
+            avg_top_code_lm_loss = lm_loss + vq_loss_top
+            if self.top_transformer_continuous:
+                top_code_lm_loss_details["top_code_mse"] = lm_loss
+            else:
+                top_code_lm_loss_details["top_code_ce"] = lm_loss
             top_code_lm_loss_details["top_code_vq_loss"] = vq_loss_top
 
         # 2. Prepare targets and their KPMs for the expander stack (teacher forcing)
