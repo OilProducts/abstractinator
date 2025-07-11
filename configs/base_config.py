@@ -41,7 +41,7 @@ class TopTransformerConfig:
     num_layers: int = 8
     num_heads: int = 12
     ffn_dim_multiplier: int = 4
-    continuous: bool = True
+    continuous: bool = True  # When False, the top LM predicts discrete codes using cross-entropy
 
 
 @dataclass
