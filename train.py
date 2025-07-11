@@ -421,6 +421,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
     training_start_time = time.time()
     total_bytes_processed = 0
+    total_patches_processed_per_level = [0.0] * exp_config.num_levels
 
     # --- Metric Accumulators ---
     def reset_accumulators(num_levels):
@@ -540,6 +541,13 @@ if __name__ == "__main__":
                 tok_s_deque.append(tokens_per_second)
                 avg_tok_s = sum(tok_s_deque) / len(tok_s_deque)
 
+                patches_processed_this_window = accumulators["input_seq_lengths_compressors"]
+                patches_per_second = [
+                    p / duration_accumulation_window for p in patches_processed_this_window
+                ]
+                for lvl, cnt in enumerate(patches_processed_this_window):
+                    total_patches_processed_per_level[lvl] += cnt
+
                 # Update global byte count and compute ETAs
                 total_bytes_processed += tokens_processed_this_window
                 total_progress = (global_step + 1) / exp_config.num_training_steps
@@ -582,6 +590,17 @@ if __name__ == "__main__":
                         f"Bytes {short_num(total_bytes_processed)}",
                         f"ETAt {format_duration(total_eta_sec)}",
                     ])
+
+                    patch_log_parts = []
+                    for lvl in range(1, exp_config.num_levels - 1):
+                        patch_log_parts.append(
+                            f"L{lvl} {short_num(patches_per_second[lvl])}/s {short_num(total_patches_processed_per_level[lvl])}"
+                        )
+                    patch_log_parts.append(
+                        f"Top {short_num(patches_per_second[-1])}/s {short_num(total_patches_processed_per_level[-1])}"
+                    )
+                    if patch_log_parts:
+                        console_log_parts.append("Patches " + ", ".join(patch_log_parts))
 
                     # Additional metrics appended after the loss components
                     if 'compression_ratios' in accumulators and len(accumulators["compression_ratios"]) == exp_config.num_levels:
