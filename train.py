@@ -454,11 +454,15 @@ if __name__ == "__main__":
 
             if 'compression_ratios' in output_dict:
                 for level_idx, ratio in enumerate(output_dict['compression_ratios']):
-                    accumulators["compression_ratios"][level_idx] += ratio # Assuming ratio is already a float or .item() called
+                    # ratio is already a float or tensor scalar
+                    accumulators["compression_ratios"][level_idx] += ratio
+
+                batch_sz = tokens.size(0)
                 for level_idx, length in enumerate(output_dict['input_seq_lengths_compressors']):
-                    accumulators["input_seq_lengths_compressors"][level_idx] += length
+                    # lengths from the model are per-sample averages
+                    accumulators["input_seq_lengths_compressors"][level_idx] += length * batch_sz
                 for level_idx, length in enumerate(output_dict['output_seq_lengths_compressors']):
-                    accumulators["output_seq_lengths_compressors"][level_idx] += length
+                    accumulators["output_seq_lengths_compressors"][level_idx] += length * batch_sz
 
             if 'all_codebook_perplexities' in output_dict:
                 for level_idx, perplexity in enumerate(output_dict['all_codebook_perplexities']):
