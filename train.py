@@ -541,7 +541,10 @@ if __name__ == "__main__":
                 tok_s_deque.append(tokens_per_second)
                 avg_tok_s = sum(tok_s_deque) / len(tok_s_deque)
 
-                patches_processed_this_window = accumulators["input_seq_lengths_compressors"]
+                # Use output sequence lengths to measure patches processed
+                # The top LM consumes the outputs of the compressors, so its
+                # throughput should be based on these lengths.
+                patches_processed_this_window = accumulators["output_seq_lengths_compressors"]
                 patches_per_second = [
                     p / duration_accumulation_window for p in patches_processed_this_window
                 ]
