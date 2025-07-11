@@ -705,6 +705,13 @@ class HierarchicalAutoencoder(nn.Module):
                        max_len_override: Optional[int] = None) -> torch.Tensor:
         """Compress ``tokens`` and decode them autoregressively.
 
+        The top-level codes are optionally extended using the
+        :class:`CodeSequenceTransformer`.  When
+        ``use_continuous_expander_inputs`` is ``True`` the transformer operates
+        on continuous embeddings and the resulting vectors are fed directly to
+        :meth:`decompress`.  Otherwise the discrete indices predicted by the
+        transformer are gathered and passed to :meth:`decompress`.
+
         Args:
             tokens: Input byte tokens ``(B, S)``.
             key_padding_mask: Optional mask marking padded positions.
@@ -717,13 +724,15 @@ class HierarchicalAutoencoder(nn.Module):
         self.eval()
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
         top_cont = compression_results['all_pre_vq'][-1]
+        top_codes = compression_results['top_codes']
         kpm_for_top_expander_input = compression_results['final_key_padding_mask']
 
         generated_cont = top_cont
         generated_kpm = kpm_for_top_expander_input
+        generated_codes = top_codes if not self.use_continuous_expander_inputs else None
 
         if self.code_sequence_transformer is not None:
-            # Autoregressively extend using continuous predictions
+            # Autoregressively extend using transformer predictions
             while True:
                 if max_len_override is not None and generated_cont.size(1) >= max_len_override:
                     break
@@ -735,6 +744,8 @@ class HierarchicalAutoencoder(nn.Module):
                 next_vec = out["predictions_pre_vq"][:, -1, :]
                 next_idx = out["indices"][:, -1] if out["indices"] is not None else None
                 generated_cont = torch.cat([generated_cont, next_vec.unsqueeze(1)], dim=1)
+                if generated_codes is not None and next_idx is not None:
+                    generated_codes = torch.cat([generated_codes, next_idx.unsqueeze(1)], dim=1)
                 if generated_kpm is not None:
                     pad = torch.zeros(generated_kpm.size(0), 1, dtype=generated_kpm.dtype, device=generated_kpm.device)
                     generated_kpm = torch.cat([generated_kpm, pad], dim=1)
@@ -742,8 +753,9 @@ class HierarchicalAutoencoder(nn.Module):
                 if next_idx is not None and (next_idx == self.expander_eos_id).all():
                     break
 
+        decomp_input = generated_cont if self.use_continuous_expander_inputs else generated_codes
         decomp = self.decompress(
-            top_codes=generated_cont,
+            top_codes=decomp_input,
             top_codes_key_padding_mask=generated_kpm,
             targets_for_teacher_forcing=None,
             max_len_override=max_len_override,
