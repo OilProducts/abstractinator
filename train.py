@@ -24,6 +24,7 @@ from components.sliding_window_attention import _cached_cross_window_mask as _ca
 from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.utils import short_num, format_duration
 from components.tokenizer import ByteLevelTokenizer
+from data_utils import tokenize_and_process_examples
 from configs.base_config import (
     DEVICE as DEFAULT_DEVICE,
     N_CPU as DEFAULT_N_CPU,
@@ -210,79 +211,10 @@ if __name__ == "__main__":
         add_eos=True,
         expected_vocab_size=exp_config.initial_vocab_size,
     )
-    print(f"Tokenizer initialized. BOS ID: {tokenizer.bos_id}, EOS ID: {tokenizer.eos_id}, "
-          f"PAD ID: {tokenizer.pad_id}, Effective Vocab Size: {tokenizer.vocab_size}")
-
-
-    # --- Data Processing Function ---
-    def tokenize_and_process_examples(
-            examples: Dict[str, List[str]],
-            sequence_length: int,  # From exp_config
-            text_column="text"
-    ) -> Dict[str, List[torch.Tensor]]:
-        processed_input_ids_list = []
-        # Labels are same as input_ids for autoencoding tasks
-        # processed_labels_list = [] # Not explicitly needed if labels are input_ids
-        processed_kpm_list = []
-
-        for text_content in examples[text_column]:
-            if not isinstance(text_content, str):
-                text_content = str(text_content) if text_content is not None else ""
-
-            # Encode tokens (BOS/EOS added by tokenizer based on its settings)
-            encoded_tokens = tokenizer.encode(text_content)
-            current_length = len(encoded_tokens)
-            final_tokens: torch.Tensor
-
-            if current_length == 0 and sequence_length == 0:
-                final_tokens = torch.tensor([], dtype=torch.int16)
-            elif current_length == 0 and sequence_length > 0:
-                final_tokens = torch.full((sequence_length,), tokenizer.pad_id,
-                                          dtype=torch.int16)
-            elif sequence_length == 0 and current_length > 0:  # Truncate to empty
-                final_tokens = torch.tensor([], dtype=torch.int16)
-            elif current_length > sequence_length:
-                # Truncate and ensure EOS if tokenizer adds it and there's space
-                if tokenizer.add_eos:
-                    # Truncate to sequence_length - 1 to make space for EOS
-                    final_tokens = encoded_tokens[:sequence_length - 1]
-                    final_tokens = torch.cat(
-                        (final_tokens, torch.tensor([tokenizer.eos_id], dtype=torch.int16))
-                    )
-                else:
-                    final_tokens = encoded_tokens[:sequence_length]
-            elif current_length < sequence_length:
-                # Pad
-                padding_needed = sequence_length - current_length
-                padding_tensor = torch.full((padding_needed,), tokenizer.pad_id,
-                                            dtype=torch.int16)
-                final_tokens = torch.cat((encoded_tokens, padding_tensor))
-            else:  # current_length == sequence_length
-                final_tokens = encoded_tokens
-
-            # Ensure the final tensor has the exact sequence_length (important safety check)
-            if len(final_tokens) != sequence_length:
-                if len(final_tokens) > sequence_length:
-                    final_tokens = final_tokens[:sequence_length]
-                else:  # len < sequence_length
-                    padding_needed = sequence_length - len(final_tokens)
-                    final_tokens = torch.cat((final_tokens,
-                                              torch.full((padding_needed,), tokenizer.pad_id,
-                                                         dtype=torch.int16)))
-
-            # Generate key_padding_mask (True for padded tokens)
-            key_padding_mask = (final_tokens == tokenizer.pad_id)
-
-            processed_input_ids_list.append(final_tokens)
-            # processed_labels_list.append(final_tokens.clone()) # Labels are same as input
-            processed_kpm_list.append(key_padding_mask)
-
-        return {
-            "input_ids": processed_input_ids_list,
-            "labels": processed_input_ids_list,  # For autoencoder, labels are inputs
-            "key_padding_mask": processed_kpm_list
-        }
-
+    print(
+        f"Tokenizer initialized. BOS ID: {tokenizer.bos_id}, EOS ID: {tokenizer.eos_id}, "
+        f"PAD ID: {tokenizer.pad_id}, Effective Vocab Size: {tokenizer.vocab_size}"
+    )
 
     # --- Dataset Loading and Processing ---
     print(f"\nLoading dataset '{exp_config.dataset_name}'...")
@@ -306,6 +238,7 @@ if __name__ == "__main__":
         batched=True,
         fn_kwargs={
             "sequence_length": exp_config.sequence_length,
+            "tokenizer": tokenizer,
             "text_column": exp_config.text_column_name,
         },
         remove_columns=raw_dataset.column_names,
