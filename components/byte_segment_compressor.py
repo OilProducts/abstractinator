@@ -164,8 +164,9 @@ class ByteSegmentCompressor(nn.Module):
         # 2. Perform Entropy-Based Segmentation
         # This part determines segment boundaries based on token prediction entropy.
         # It's done with no_grad as the segmentation logic itself is not learned here.
+        # ``token_entropy`` computes entropy from the LM logits and ``entropy_segments``
+        # converts the resulting sequence of entropies into segment identifiers.
         with torch.no_grad():
-            # token_entropy and entropy_segments are assumed to be defined elsewhere
             entropy = token_entropy(logits)  # (B,S)
             seg_id = entropy_segments(
                 entropy,
