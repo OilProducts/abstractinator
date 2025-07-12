@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import torch
+
+logger = logging.getLogger(__name__)
 
 from .hierarchical_autoencoder import HierarchicalAutoencoder
 
@@ -26,4 +29,4 @@ def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
         },
         path,
     )
-    print(f"Base components saved to {path}")
+    logger.info("Base components saved to %s", path)

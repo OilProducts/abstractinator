@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +7,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from .byte_segment_compressor import ByteSegmentCompressor
 from .expander import CodeExpander, DecoderOnlyExpander
 from .code_sequence_transformer import CodeSequenceTransformer
+
+logger = logging.getLogger(__name__)
 
 class HierarchicalAutoencoder(nn.Module):
     """Multi-level autoencoder built from compressors and expanders.
@@ -127,8 +130,11 @@ class HierarchicalAutoencoder(nn.Module):
                 vq=self.compressors[-1].vq,
             )
             mode = "continuous" if self.top_transformer_continuous else "discrete"
-            print(
-                f"Initialized CodeSequenceTransformer for {mode} codes (embed_dim: {embed_dim}, dim: {transformer_dim})"
+            logger.info(
+                "Initialized CodeSequenceTransformer for %s codes (embed_dim: %s, dim: %s)",
+                mode,
+                embed_dim,
+                transformer_dim,
             )
 
         else:
@@ -260,8 +266,10 @@ class HierarchicalAutoencoder(nn.Module):
                         num_q_this_level, dim=1)
                 else:
                     if i < self.num_levels - 1:
-                        print(
-                            f"Warning: 'valid_mask' not returned by compressor {i}. KPM propagation to next level disabled.")
+                        logger.warning(
+                            "'valid_mask' not returned by compressor %s. KPM propagation to next level disabled.",
+                            i,
+                        )
                     current_kpm = None
             else:
                 current_kpm = None
