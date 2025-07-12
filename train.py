@@ -24,22 +24,13 @@ from components.sliding_window_attention import _cached_cross_window_mask as _ca
 from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.utils import short_num, format_duration
 from components.tokenizer import ByteLevelTokenizer
+from components.checkpoint_utils import save_base_components
 from data_utils import tokenize_and_process_examples
 from configs.base_config import (
     DEVICE as DEFAULT_DEVICE,
     N_CPU as DEFAULT_N_CPU,
     ExpConfig,
 )
-
-
-def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
-    """Save only the compressor and expander weights."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save({
-        "compressors": model.compressors.state_dict(),
-        "expanders": model.expanders.state_dict(),
-    }, path)
-    print(f"Base components saved to {path}")
 
 if __name__ == "__main__":
 
