@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 import argparse
 import importlib.util
 from dataclasses import asdict
+import logging
 
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
@@ -54,7 +55,21 @@ if __name__ == "__main__":
         default=None,
         help="Load pretrained compressor/expander checkpoint",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        help="Logging level (debug, info, warning, error, critical)",
+    )
     args = parser.parse_args()
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+
+    logger = logging.getLogger(__name__)
 
     def load_config(path: str):
         spec = importlib.util.spec_from_file_location("config_module", path)
@@ -87,20 +102,21 @@ if __name__ == "__main__":
     torch._dynamo.config.capture_scalar_outputs = True
     torch._dynamo.config.recompile_limit = 128
 
-    print(f"Using device: {DEVICE}")
+    logger.info("Using device: %s", DEVICE)
 
     # --- Experiment Configuration ---
     # Loaded from the provided config file
 
     # --- MLflow Setup ---
     # See https://mlflow.org/docs/latest/python_api/mlflow.html for API details
-    print(
-        f"Initializing MLflow run: {getattr(exp_config, 'run_name', 'DefaultRun')}"
+    logger.info(
+        "Initializing MLflow run: %s", getattr(exp_config, "run_name", "DefaultRun")
     )
     if getattr(exp_config, "project_name", None):
         mlflow.set_tracking_uri(f"file:./mlruns/{exp_config.project_name}")
-        print(
-            f"MLflow tracking URI set to: file:./mlruns/{exp_config.project_name}"
+        logger.info(
+            "MLflow tracking URI set to: file:./mlruns/%s",
+            exp_config.project_name,
         )
     mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
     mlflow_run = mlflow.start_run(
@@ -111,7 +127,7 @@ if __name__ == "__main__":
     mlflow_metric_buffer = []
 
     # --- Model, Optimizer ---
-    print("Initializing HierarchicalAutoencoder model...")
+    logger.info("Initializing HierarchicalAutoencoder model...")
     model = HierarchicalAutoencoder(
         num_levels=exp_config.num_levels,
         compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
@@ -144,28 +160,33 @@ if __name__ == "__main__":
         model.expanders.requires_grad_(False)
         model.compressors.eval()
         model.expanders.eval()
-        print(f"Loaded base components from {args.load_base_from}")
+        logger.info("Loaded base components from %s", args.load_base_from)
 
     def _count_params(module: torch.nn.Module) -> int:
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
     num_params = _count_params(model)
-    print(f"Model initialized on {DEVICE} with {short_num(num_params)} trainable parameters.")
+    logger.info(
+        "Model initialized on %s with %s trainable parameters.",
+        DEVICE,
+        short_num(num_params),
+    )
 
     # Print parameter counts for major components
     compressor_params = _count_params(model.compressors)
     expander_params = _count_params(model.expanders)
-    print(f"  Compressors: {short_num(compressor_params)} parameters")
-    print(f"  Expanders: {short_num(expander_params)} parameters")
+    logger.info("  Compressors: %s parameters", short_num(compressor_params))
+    logger.info("  Expanders: %s parameters", short_num(expander_params))
     if getattr(model, "code_sequence_transformer", None) is not None:
         cst_params = _count_params(model.code_sequence_transformer)
-        print(f"  CodeSequenceTransformer: {short_num(cst_params)} parameters")
+        logger.info("  CodeSequenceTransformer: %s parameters", short_num(cst_params))
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=exp_config.learning_rate)
-    print(
-        f"Optimizer AdamW initialized with learning rate: {exp_config.learning_rate:.0e}"
-        f" and {short_num(sum(p.numel() for p in trainable_params))} trainable params"
+    logger.info(
+        "Optimizer AdamW initialized with learning rate: %.0e and %s trainable params",
+        exp_config.learning_rate,
+        short_num(sum(p.numel() for p in trainable_params)),
     )
 
     # --- Checkpoint Utilities ---
@@ -179,7 +200,7 @@ if __name__ == "__main__":
             "global_step": step,
             "exp_config": exp_config,
         }, checkpoint_path)
-        print(f"Checkpoint saved to {checkpoint_path}")
+        logger.info("Checkpoint saved to %s", checkpoint_path)
 
     start_epoch = 0
     global_step = 0
@@ -191,9 +212,17 @@ if __name__ == "__main__":
             optimizer.load_state_dict(ckpt.get("optimizer_state", {}))
             start_epoch = ckpt.get("epoch", 0)
             global_step = ckpt.get("global_step", 0)
-            print(f"Resumed from checkpoint '{resume_path}' at step {global_step}, epoch {start_epoch}")
+            logger.info(
+                "Resumed from checkpoint '%s' at step %s, epoch %s",
+                resume_path,
+                global_step,
+                start_epoch,
+            )
         else:
-            print(f"Checkpoint path '{resume_path}' not found. Starting from scratch.")
+            logger.warning(
+                "Checkpoint path '%s' not found. Starting from scratch.",
+                resume_path,
+            )
 
 
     # --- Tokenizer ---
@@ -202,13 +231,16 @@ if __name__ == "__main__":
         add_eos=True,
         expected_vocab_size=exp_config.initial_vocab_size,
     )
-    print(
-        f"Tokenizer initialized. BOS ID: {tokenizer.bos_id}, EOS ID: {tokenizer.eos_id}, "
-        f"PAD ID: {tokenizer.pad_id}, Effective Vocab Size: {tokenizer.vocab_size}"
+    logger.info(
+        "Tokenizer initialized. BOS ID: %s, EOS ID: %s, PAD ID: %s, Effective Vocab Size: %s",
+        tokenizer.bos_id,
+        tokenizer.eos_id,
+        tokenizer.pad_id,
+        tokenizer.vocab_size,
     )
 
     # --- Dataset Loading and Processing ---
-    print(f"\nLoading dataset '{exp_config.dataset_name}'...")
+    logger.info("\nLoading dataset '%s'...", exp_config.dataset_name)
     raw_dataset = None
     try:
         raw_dataset = load_dataset(
@@ -216,13 +248,14 @@ if __name__ == "__main__":
             name=exp_config.dataset_config,
             split=exp_config.dataset_train_split,
         )
-        print(f"Dataset loaded. Number of examples: {len(raw_dataset)}")
+        logger.info("Dataset loaded. Number of examples: %s", len(raw_dataset))
     except Exception as e:
-        print(f"Error loading dataset '{exp_config.dataset_name}': {e}")
+        logger.error("Error loading dataset '%s': %s", exp_config.dataset_name, e)
         sys.exit()
 
-    print(
-        f"\nTokenizing and processing dataset with sequence length {exp_config.sequence_length}..."
+    logger.info(
+        "\nTokenizing and processing dataset with sequence length %s...",
+        exp_config.sequence_length,
     )
     tokenized_dataset = raw_dataset.map(
         tokenize_and_process_examples,
@@ -235,17 +268,17 @@ if __name__ == "__main__":
         remove_columns=raw_dataset.column_names,
         num_proc=N_CPU  # Use multiple processes for mapping
     )
-    print("Tokenization complete.")
+    logger.info("Tokenization complete.")
 
-    print("\nSetting dataset format to PyTorch tensors...")
+    logger.info("\nSetting dataset format to PyTorch tensors...")
     tokenized_dataset.set_format(
         type="torch",
         columns=["input_ids", "labels", "key_padding_mask"]
     )
-    print("Dataset format set.")
+    logger.info("Dataset format set.")
 
     # --- DataLoader ---
-    print(f"\nCreating PyTorch DataLoader with batch size {exp_config.batch_size}...")
+    logger.info("\nCreating PyTorch DataLoader with batch size %s...", exp_config.batch_size)
     train_dataloader = DataLoader(
         tokenized_dataset,
         batch_size=exp_config.batch_size,
@@ -253,7 +286,7 @@ if __name__ == "__main__":
         num_workers=N_CPU,  # Use N_CPU for DataLoader workers
         pin_memory=True if DEVICE == "cuda" else False  # pin_memory if using CUDA
     )
-    print(f"DataLoader created with {N_CPU} workers.")
+    logger.info("DataLoader created with %s workers.", N_CPU)
 
 
     # --- Scheduler Setup --- # <<< ADDED SECTION
@@ -266,8 +299,11 @@ if __name__ == "__main__":
     else:
         exp_config.num_training_steps = exp_config.num_epochs * num_update_steps_per_epoch
 
-    print(
-        f"Creating learning rate scheduler: {exp_config.scheduler_type} with {exp_config.warmup_steps} warmup steps and {exp_config.num_training_steps} total steps."
+    logger.info(
+        "Creating learning rate scheduler: %s with %s warmup steps and %s total steps.",
+        exp_config.scheduler_type,
+        exp_config.warmup_steps,
+        exp_config.num_training_steps,
     )
     lr_scheduler = get_scheduler(
         name=exp_config.scheduler_type,
@@ -278,12 +314,12 @@ if __name__ == "__main__":
     )
 
     # --- Track final hyperparameters with MLflow ---
-    print("Tracking hyperparameters with MLflow...")
+    logger.info("Tracking hyperparameters with MLflow...")
     mlflow.log_params(exp_config.as_dict())
-    print("Hyperparameters tracked.")
+    logger.info("Hyperparameters tracked.")
 
     # --- Training Loop ---
-    print("\nStarting training loop...")
+    logger.info("\nStarting training loop...")
     model.train()  # Set model to training mode
     optimizer.zero_grad()  # Reset gradients before training
 
@@ -323,7 +359,7 @@ if __name__ == "__main__":
     total_minibatches_in_epoch = len(train_dataloader)
 
     for epoch in range(start_epoch, exp_config.num_epochs):
-        print(f"\n--- Epoch {epoch + 1}/{exp_config.num_epochs} ---")
+        logger.info("\n--- Epoch %s/%s ---", epoch + 1, exp_config.num_epochs)
         # Clear cached attention masks to avoid GPU memory buildup
         _cached_cross_window_mask_cpu.cache_clear()
         _cached_causal_mask_cpu.cache_clear()
@@ -492,7 +528,7 @@ if __name__ == "__main__":
                             [f"{p / steps_accumulated:.4f}" for p in accumulators['all_smoothed_perplexities']])
                         console_log_parts.append(f"SmoothPPL [{ppl_str}]")
 
-                    print(" | ".join(console_log_parts), flush=True)
+                    logger.info(" | ".join(console_log_parts))
 
 
                     # --- Logging to MLflow (occurs every optimizer step) ---
@@ -565,7 +601,7 @@ if __name__ == "__main__":
 
                 # --- Generation During Training ---
                 if global_step > 0 and global_step % exp_config.generation_interval == 0:
-                    print(f"\nStep {global_step}: Generating sample...")
+                    logger.info("\nStep %s: Generating sample...", global_step)
                     model.eval()  # Switch to evaluation mode for generation
                     with torch.no_grad():
                         sample_text = exp_config.sample_prompt_for_generation
@@ -586,10 +622,10 @@ if __name__ == "__main__":
                         reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu(),
                                                               cut_at_eos=True)
 
-                        print(f"--- Sample Generation at Step {global_step} ---")
-                        print(f"Original Prompt:\n{sample_text}")
-                        print(f"Reconstructed Text:\n{reconstructed_text}")
-                        print("------------------------------------------")
+                        logger.info("--- Sample Generation at Step %s ---", global_step)
+                        logger.info("Original Prompt:\n%s", sample_text)
+                        logger.info("Reconstructed Text:\n%s", reconstructed_text)
+                        logger.info("------------------------------------------")
 
                         # Log to MLflow
                         mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
@@ -600,16 +636,20 @@ if __name__ == "__main__":
                     save_checkpoint(model, optimizer, epoch, global_step, exp_config.checkpoint_dir)
                 global_step += 1
                 if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
-                    print(f"Reached max_steps {exp_config.max_steps}. Stopping training.")
+                    logger.info("Reached max_steps %s. Stopping training.", exp_config.max_steps)
                     break
         epoch_duration = time.time() - epoch_start_time
-        print(f"--- Epoch {epoch + 1} finished. Duration: {epoch_duration:.2f}s ---") # MODIFIED: Epoch end print
+        logger.info(
+            "--- Epoch %s finished. Duration: %.2fs ---",
+            epoch + 1,
+            epoch_duration,
+        )
         save_checkpoint(model, optimizer, epoch, global_step, exp_config.checkpoint_dir)
 
         if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
             break
 
-    print("Training finished.")
+    logger.info("Training finished.")
     if exp_config.save_base_components_path:
         save_base_components(model, exp_config.save_base_components_path)
     if mlflow_metric_buffer:
