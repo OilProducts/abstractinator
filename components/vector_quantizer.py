@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +6,7 @@ from typing import Tuple, Any
 
 from torch import Tensor
 
+logger = logging.getLogger(__name__)
 
 # @torch.compile
 class VectorQuantizer(nn.Module):
@@ -116,7 +118,11 @@ class VectorQuantizer(nn.Module):
         replacement_vectors = source_vectors[rand_indices]
 
         if self.training:
-            print(f"VQ: Resetting {num_to_reset} dead codes via random sampling from buffer out of {num_dead_candidates} dead.")
+            logger.info(
+                "VQ: Resetting %s dead codes via random sampling from buffer out of %s dead.",
+                num_to_reset,
+                num_dead_candidates,
+            )
 
         self.codebook.data[actual_dead_indices] = replacement_vectors
         if self.ema:

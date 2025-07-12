@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class ByteLevelTokenizer:
@@ -41,9 +44,10 @@ class ByteLevelTokenizer:
         # vocab_size here would be max(bos,eos,pad) + 1 = 259 for defaults.
         self.vocab_size = max(bos_id, eos_id, pad_id) + 1
         if expected_vocab_size is not None and self.vocab_size != expected_vocab_size:
-            print(
-                f"Warning: Tokenizer vocab_size ({self.vocab_size}) does not match "
-                f"expected value ({expected_vocab_size})."
+            logger.warning(
+                "Tokenizer vocab_size (%s) does not match expected value (%s).",
+                self.vocab_size,
+                expected_vocab_size,
             )
 
     def encode(

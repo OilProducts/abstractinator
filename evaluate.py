@@ -1,10 +1,13 @@
 import argparse
 import json
 import importlib.util
+import logging
 from configs.base_config import ExpConfig
 
 from lm_eval import evaluator, utils
 import components.hae_lm  # registers HierarchicalAELM with lm_eval
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TASKS = [
     "lambada_openai",
@@ -47,7 +50,19 @@ def main():
         default=None,
         help="Limit number of evaluation examples (mainly for quick tests)",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        help="Logging level (debug, info, warning, error, critical)",
+    )
     args = parser.parse_args()
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
 
     if args.model == "hier_ae":
         model_args = utils.simple_parse_args_string(args.model_args or "")
@@ -93,7 +108,7 @@ def main():
         limit=args.limit,
     )
 
-    print(json.dumps(results, indent=2))
+    logger.info(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":
