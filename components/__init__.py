@@ -5,3 +5,4 @@ from .hierarchical_autoencoder import HierarchicalAutoencoder
 from .swiglu import SwiGLU
 from .expander import DecoderOnlyExpander
 from .tokenizer import ByteLevelTokenizer
+from .checkpoint_utils import save_base_components
