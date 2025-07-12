@@ -396,6 +396,282 @@ class HierarchicalAutoencoder(nn.Module):
             return {'generated_sequences': all_generated_tokens_list,
                     'final_reconstructed_tokens': all_generated_tokens_list[-1]}
 
+    # ------------------------------------------------------------------
+    # Helper utilities for the training forward pass
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
+                    kpm: Optional[torch.Tensor], eop_id: int
+                    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Insert ``eop_id`` after positions indicated by ``end_mask``."""
+
+        B, S = seq.shape
+        if S == 0:
+            lengths = end_mask.sum(dim=1)
+            max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+            out = seq.new_full((B, max_len), eop_id)
+            out_kpm = None if kpm is None else torch.ones((B, max_len),
+                                                          dtype=torch.bool,
+                                                          device=seq.device)
+            return out, out_kpm
+
+        end_cumsum = torch.cumsum(end_mask, dim=1)
+        lengths = S + end_cumsum[:, -1]
+        max_len = int(lengths.max().item())
+
+        out = seq.new_full((B, max_len), eop_id)
+        out_kpm = None
+        if kpm is not None:
+            out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
+
+        shift = end_cumsum - end_mask
+        token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
+        batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
+
+        out[batch_idx, token_pos] = seq
+        if out_kpm is not None:
+            out_kpm[batch_idx, token_pos] = kpm
+
+        eop_pos = token_pos + 1
+        mask = end_mask.bool()
+        if out_kpm is not None:
+            out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
+
+        return out, out_kpm
+
+    def _compute_compression_loss(
+        self,
+        compression_ratios: List[torch.Tensor],
+        device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        total_unweighted = torch.tensor(0., device=device, dtype=torch.float32)
+        total_weighted = torch.tensor(0., device=device, dtype=torch.float32)
+        details: Dict[str, torch.Tensor] = {}
+        for i, ratio in enumerate(compression_ratios):
+            tgt = self.target_compression_ratios[i] if i < len(self.target_compression_ratios) else None
+            loss = torch.tensor(0., device=device, dtype=torch.float32)
+            if tgt is not None:
+                loss = (ratio.mean() - tgt) ** 2
+                total_weighted += self.compression_loss_weights[i] * loss
+            total_unweighted += loss
+            details[f"compression_loss_L{i}"] = loss
+        avg = total_unweighted / self.num_levels if self.num_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+        return avg, total_weighted, details
+
+    def _compute_top_code_lm_loss(
+        self,
+        compression_results: Dict[str, Any],
+        kpm_for_top_codes: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = compression_results['all_pre_vq'][-1].device
+        avg_loss = torch.tensor(0., device=device, dtype=torch.float32)
+        details: Dict[str, torch.Tensor] = {}
+
+        if (self.code_sequence_transformer is not None and
+                self.top_lm_loss_weight > 0 and
+                compression_results['all_pre_vq'][-1].numel() > 0):
+            cont = compression_results['all_pre_vq'][-1]
+            codes = compression_results['all_codes'][-1]
+            cst_out = self.code_sequence_transformer(
+                input_embeddings=cont,
+                key_padding_mask=kpm_for_top_codes,
+            )
+            preds_pre_vq = cst_out['predictions_pre_vq']
+            vq_loss_top = cst_out['vq_loss']
+
+            if cont.size(1) <= 1:
+                lm_loss = torch.tensor(0., device=device, dtype=torch.float32)
+            else:
+                pred = preds_pre_vq[:, :-1, :]
+                mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
+                if self.top_transformer_continuous:
+                    target = cont[:, 1:, :]
+                    per_tok = F.mse_loss(pred, target, reduction='none').sum(dim=-1)
+                else:
+                    target = codes[:, 1:]
+                    codebook = self.compressors[-1].vq.codebook
+                    logits = -torch.cdist(pred, codebook)
+                    per_tok = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        target.reshape(-1),
+                        reduction='none'
+                    ).view_as(target)
+
+                if mask is not None:
+                    loss_mask = ~mask
+                    valid_targets = loss_mask.sum()
+                    if valid_targets > 0:
+                        lm_loss = (per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
+                    else:
+                        lm_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                else:
+                    lm_loss = per_tok.mean()
+
+            avg_loss = lm_loss + vq_loss_top
+            if self.top_transformer_continuous:
+                details['top_code_mse'] = lm_loss
+            else:
+                details['top_code_ce'] = lm_loss
+            details['top_code_vq_loss'] = vq_loss_top
+
+        return avg_loss, details
+
+    def _prepare_teacher_forcing_inputs(
+        self,
+        tokens: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        compression_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        all_compressed_codes = compression_results['all_codes']
+        all_pre_vq = compression_results['all_pre_vq']
+        all_valid_masks = compression_results['all_compressor_level_valid_masks']
+        all_patch_end_masks = compression_results.get('all_patch_end_masks', [])
+
+        targets: List[torch.Tensor] = []
+        kpms: List[Optional[torch.Tensor]] = []
+
+        for j in range(self.num_levels):
+            target_lvl_idx = self.num_levels - 1 - j
+            target_kpm = None
+            if target_lvl_idx == 0:
+                target = tokens
+                target_kpm = key_padding_mask
+            else:
+                target_code_idx = target_lvl_idx - 1
+                target = all_compressed_codes[target_code_idx]
+                if self.propagate_key_padding_mask:
+                    valid_mask = all_valid_masks[target_code_idx]
+                    if valid_mask is not None:
+                        num_q = self.compressors[target_code_idx].num_queries_per_segment
+                        target_kpm = ~valid_mask.repeat_interleave(num_q, dim=1)
+
+            patch_mask = None
+            if target_lvl_idx < len(all_patch_end_masks):
+                patch_mask = all_patch_end_masks[target_lvl_idx]
+            if patch_mask is not None and target_lvl_idx > 0:
+                eop_id = self.compressors[target_lvl_idx - 1].vq.eop_token_id
+                target, target_kpm = self._insert_eop(target, patch_mask, target_kpm, eop_id)
+
+            targets.append(target)
+            kpms.append(target_kpm)
+
+        if self.use_continuous_expander_inputs:
+            top_codes_for_decompress = all_pre_vq[-1]
+            tf_continuous = [
+                all_pre_vq[self.num_levels - 2 - i]
+                for i in range(self.num_levels - 1)
+            ]
+        else:
+            top_codes_for_decompress = compression_results['top_codes']
+            tf_continuous = None
+
+        return {
+            'targets': targets,
+            'target_kpms': kpms,
+            'top_codes': top_codes_for_decompress,
+            'teacher_forcing_embeddings': tf_continuous,
+        }
+
+    def _compute_reconstruction_loss(
+        self,
+        all_logits: List[torch.Tensor],
+        targets: List[torch.Tensor],
+        target_kpms: List[Optional[torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = all_logits[0].device if all_logits else torch.device('cpu')
+        total_loss = torch.tensor(0., device=device, dtype=torch.float32)
+        details: Dict[str, torch.Tensor] = {}
+
+        for i in range(self.num_levels):
+            logits_i = all_logits[i]
+            target_i = targets[i]
+            target_kpm_i = target_kpms[i]
+
+            loss_per_token = F.cross_entropy(
+                logits_i.reshape(-1, logits_i.size(-1)),
+                target_i.reshape(-1),
+                reduction='none',
+            ).view_as(target_i)
+
+            if target_kpm_i is not None:
+                loss_mask = ~target_kpm_i
+                current_loss = (loss_per_token * loss_mask).sum() / loss_mask.sum().clamp(min=1e-9)
+            else:
+                current_loss = loss_per_token.mean()
+
+            expander_k_lo = self.expanders[i].K_lo
+            if expander_k_lo == self.initial_vocab_size:
+                target_level_desc = '_bytes'
+            else:
+                reconstructed_code_level_idx = self.num_levels - 2 - i
+                if reconstructed_code_level_idx >= 0:
+                    target_level_desc = f"_codesL{reconstructed_code_level_idx}"
+                else:
+                    target_level_desc = '_intermediate_codes'
+            level_name = f"reconstruction_to_K{expander_k_lo}{target_level_desc}"
+
+            details[level_name] = current_loss
+            total_loss += current_loss
+
+        avg_loss = total_loss / self.num_levels if self.num_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+        return avg_loss, details
+
+    def _compute_auxiliary_losses(
+        self,
+        tokens: torch.Tensor,
+        all_encoder_logits: List[torch.Tensor],
+        all_compressor_input_tokens: List[torch.Tensor],
+        all_compressor_input_kpms: List[Optional[torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = tokens.device
+        total_unweighted = torch.tensor(0., device=device, dtype=torch.float32)
+        details: Dict[str, torch.Tensor] = {}
+
+        if self.aux_lm_loss_weight > 0 and all_encoder_logits:
+            num_valid_levels = 0
+            for i in range(self.num_levels):
+                encoder_logits_i = all_encoder_logits[i]
+                input_tokens_i = all_compressor_input_tokens[i]
+                input_kpm_i = all_compressor_input_kpms[i]
+
+                if input_tokens_i.size(1) <= 1:
+                    current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                else:
+                    logits_for_next = encoder_logits_i[:, :-1, :]
+                    target_tokens_for_next = input_tokens_i[:, 1:]
+                    kpm_for_shifted_targets = input_kpm_i[:, 1:] if input_kpm_i is not None else None
+
+                    if logits_for_next.size(1) == 0:
+                        current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                    else:
+                        loss_per_tok = F.cross_entropy(
+                            logits_for_next.reshape(-1, logits_for_next.size(-1)),
+                            target_tokens_for_next.reshape(-1),
+                            reduction='none'
+                        ).view_as(target_tokens_for_next)
+
+                        if kpm_for_shifted_targets is not None:
+                            loss_mask = ~kpm_for_shifted_targets
+                            valid_targets_count = loss_mask.sum()
+                            if valid_targets_count > 0:
+                                current_aux_loss = (loss_per_tok * loss_mask).sum() / valid_targets_count.clamp(min=1e-9)
+                            else:
+                                current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                        else:
+                            current_aux_loss = loss_per_tok.mean()
+
+                    num_valid_levels += 1
+
+                details[f"aux_lm_loss_L{i}"] = current_aux_loss
+                total_unweighted += current_aux_loss
+
+            avg_loss = total_unweighted / num_valid_levels if num_valid_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+        else:
+            avg_loss = torch.tensor(0., device=device, dtype=torch.float32)
+
+        return avg_loss, details
+
     def forward(self, tokens: torch.Tensor,
                 key_padding_mask: Optional[torch.Tensor] = None
                 ) -> Dict[str, Any]:
@@ -413,169 +689,32 @@ class HierarchicalAutoencoder(nn.Module):
             Dictionary containing the total loss and detailed statistics for
             each loss term, along with compression metrics.
         """
-        # 1. Compress
         compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
-        all_compressed_codes = compression_results['all_codes']
-        all_pre_vq = compression_results['all_pre_vq']
-        top_codes = compression_results['top_codes']
         vq_loss = compression_results['vq_loss']
         kpm_for_top_codes = compression_results['final_key_padding_mask']
-        all_compressor_level_valid_masks = compression_results['all_compressor_level_valid_masks']
-        all_codebook_perplexities = compression_results['all_codebook_perplexities']
-        all_smoothed_perplexities = compression_results['all_smoothed_perplexities']
-        all_patch_end_masks = compression_results.get('all_patch_end_masks', [])
-
-        # For auxiliary LM loss
-        all_encoder_logits = compression_results['all_encoder_logits']
-        all_compressor_input_tokens = compression_results['all_compressor_input_tokens']
-        all_compressor_input_kpms = compression_results['all_compressor_input_kpms']
-
-        # For metrics
         compression_ratios = compression_results['compression_ratios']
         input_seq_lengths_c = compression_results['input_seq_lengths']
         output_seq_lengths_c = compression_results['output_seq_lengths']
+        all_encoder_logits = compression_results['all_encoder_logits']
+        all_compressor_input_tokens = compression_results['all_compressor_input_tokens']
+        all_compressor_input_kpms = compression_results['all_compressor_input_kpms']
+        all_codebook_perplexities = compression_results['all_codebook_perplexities']
+        all_smoothed_perplexities = compression_results['all_smoothed_perplexities']
 
-        total_compression_loss_unweighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-        total_compression_loss_weighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-        compression_loss_details: Dict[str, torch.Tensor] = {}
-        for i, ratio in enumerate(compression_ratios):
-            tgt = self.target_compression_ratios[i] if i < len(self.target_compression_ratios) else None
-            loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-            if tgt is not None:
-                loss = (ratio.mean() - tgt) ** 2
-                total_compression_loss_weighted += self.compression_loss_weights[i] * loss
-            total_compression_loss_unweighted += loss
-            compression_loss_details[f"compression_loss_L{i}"] = loss
+        avg_compression_loss, total_compression_loss_weighted, compression_loss_details = (
+            self._compute_compression_loss(compression_ratios, tokens.device)
+        )
 
-        avg_compression_loss = total_compression_loss_unweighted / self.num_levels if self.num_levels > 0 else torch.tensor(0.)
+        avg_top_code_lm_loss, top_code_lm_loss_details = self._compute_top_code_lm_loss(
+            compression_results, kpm_for_top_codes
+        )
 
-        # --- 1.5 Process top_codes with CodeSequenceTransformer (if it exists) ---
-        avg_top_code_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-        top_code_lm_loss_details: Dict[str, torch.Tensor] = {}  # For consistency, though only one level here
+        tf_inputs = self._prepare_teacher_forcing_inputs(tokens, key_padding_mask, compression_results)
+        targets_for_expander_stack = tf_inputs['targets']
+        target_kpms_for_expander_stack = tf_inputs['target_kpms']
+        top_codes_for_decompress = tf_inputs['top_codes']
+        tf_continuous = tf_inputs['teacher_forcing_embeddings']
 
-        if self.code_sequence_transformer is not None and self.top_lm_loss_weight > 0 and compression_results['all_pre_vq'][-1].numel() > 0:
-            cont = compression_results['all_pre_vq'][-1]
-            codes = compression_results['all_codes'][-1]
-            cst_out = self.code_sequence_transformer(
-                input_embeddings=cont,
-                key_padding_mask=kpm_for_top_codes,
-            )
-            preds_pre_vq = cst_out['predictions_pre_vq']
-            vq_loss_top = cst_out['vq_loss']
-
-            if cont.size(1) <= 1:
-                lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-            else:
-                pred = preds_pre_vq[:, :-1, :]
-                mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
-                if self.top_transformer_continuous:
-                    target = cont[:, 1:, :]
-                    per_tok = F.mse_loss(pred, target, reduction='none').sum(dim=-1)
-                else:
-                    target = codes[:, 1:]
-                    codebook = self.compressors[-1].vq.codebook
-                    logits = -torch.cdist(pred, codebook)
-                    per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)), target.reshape(-1), reduction='none').view_as(target)
-
-                if mask is not None:
-                    loss_mask = ~mask
-                    valid_targets = loss_mask.sum()
-                    if valid_targets > 0:
-                        lm_loss = (per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
-                    else:
-                        lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-                else:
-                    lm_loss = per_tok.mean()
-
-            avg_top_code_lm_loss = lm_loss + vq_loss_top
-            if self.top_transformer_continuous:
-                top_code_lm_loss_details["top_code_mse"] = lm_loss
-            else:
-                top_code_lm_loss_details["top_code_ce"] = lm_loss
-            top_code_lm_loss_details["top_code_vq_loss"] = vq_loss_top
-
-        # 2. Prepare targets and their KPMs for the expander stack (teacher forcing)
-        targets_for_expander_stack: List[torch.Tensor] = []
-        target_kpms_for_expander_stack: List[Optional[torch.Tensor]] = []
-
-        def insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
-                       kpm: Optional[torch.Tensor], eop_id: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-            """Insert ``eop_id`` after positions indicated by ``end_mask``.
-
-            This vectorized implementation avoids Python loops by computing
-            insertion indices with cumulative sums of ``end_mask``.
-            """
-            B, S = seq.shape
-
-            if S == 0:
-                lengths = end_mask.sum(dim=1)
-                max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
-                out = seq.new_full((B, max_len), eop_id)
-                out_kpm = None if kpm is None else torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
-                return out, out_kpm
-
-            end_cumsum = torch.cumsum(end_mask, dim=1)
-            lengths = S + end_cumsum[:, -1]
-            max_len = int(lengths.max().item())
-
-            out = seq.new_full((B, max_len), eop_id)
-            out_kpm = None
-            if kpm is not None:
-                out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
-
-            shift = end_cumsum - end_mask
-            token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
-            batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
-
-            out[batch_idx, token_pos] = seq
-            if out_kpm is not None:
-                out_kpm[batch_idx, token_pos] = kpm
-
-            eop_pos = token_pos + 1
-            mask = end_mask.bool()
-            if out_kpm is not None:
-                out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
-
-            return out, out_kpm
-
-        for j in range(self.num_levels):  # j is index for self.expanders list
-            target_compressor_input_level_idx = self.num_levels - 1 - j
-            target_kpm = None
-            if target_compressor_input_level_idx == 0:
-                target = tokens
-                target_kpm = key_padding_mask
-            else:
-                target_code_idx = target_compressor_input_level_idx - 1
-                target = all_compressed_codes[target_code_idx]
-
-                if self.propagate_key_padding_mask:
-                    valid_mask_for_target_segments = all_compressor_level_valid_masks[
-                        target_code_idx]
-                    if valid_mask_for_target_segments is not None:
-                        num_q = self.compressors[target_code_idx].num_queries_per_segment
-                        target_kpm = ~valid_mask_for_target_segments.repeat_interleave(num_q, dim=1)
-
-            patch_mask = None
-            if target_compressor_input_level_idx < len(all_patch_end_masks):
-                patch_mask = all_patch_end_masks[target_compressor_input_level_idx]
-            if patch_mask is not None and target_compressor_input_level_idx > 0:
-                eop_id = self.compressors[target_compressor_input_level_idx - 1].vq.eop_token_id
-                target, target_kpm = insert_eop(target, patch_mask, target_kpm, eop_id)
-
-            targets_for_expander_stack.append(target)
-            target_kpms_for_expander_stack.append(target_kpm)
-
-        if self.use_continuous_expander_inputs:
-            top_codes_for_decompress = all_pre_vq[-1]
-            tf_continuous = [
-                all_pre_vq[self.num_levels - 2 - i]
-                for i in range(self.num_levels - 1)
-            ]
-        else:
-            top_codes_for_decompress = top_codes
-            tf_continuous = None
-
-        # 3. Decompress with teacher forcing
         decompression_results = self.decompress(
             top_codes=top_codes_for_decompress,
             top_codes_key_padding_mask=kpm_for_top_codes,
@@ -583,133 +722,37 @@ class HierarchicalAutoencoder(nn.Module):
             target_key_padding_masks=target_kpms_for_expander_stack,
             teacher_forcing_embeddings=tf_continuous,
         )
-        all_reconstruction_logits = decompression_results['all_logits']
 
-        # 4. Calculate hierarchical reconstruction losses
-        total_reconstruction_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-        reconstruction_loss_details: Dict[str, torch.Tensor] = {}
+        avg_reconstruction_loss, reconstruction_loss_details = self._compute_reconstruction_loss(
+            decompression_results['all_logits'],
+            targets_for_expander_stack,
+            target_kpms_for_expander_stack,
+        )
 
-        for i in range(self.num_levels):
-            logits_i = all_reconstruction_logits[i]
-            target_i = targets_for_expander_stack[i]
-            target_kpm_i = target_kpms_for_expander_stack[i]  # This is True where padded
-
-            # Calculate loss per token, then mask and average
-            loss_per_token = F.cross_entropy(
-                logits_i.reshape(-1, logits_i.size(-1)),
-                target_i.reshape(-1),
-                reduction='none'
-            )
-            loss_per_token = loss_per_token.view_as(target_i)  # Reshape to (B, S_target_i)
-
-            if target_kpm_i is not None:
-                # loss_mask is True for valid (non-padded) tokens
-                loss_mask = ~target_kpm_i
-                current_level_loss = (loss_per_token * loss_mask).sum() / loss_mask.sum().clamp(
-                    min=1e-9)
-            else:
-                current_level_loss = loss_per_token.mean()
-
-            # --- Naming for the loss level ---
-            expander_k_lo = self.expanders[i].K_lo
-            target_level_desc = ""
-            if expander_k_lo == self.initial_vocab_size:
-                target_level_desc = "_bytes"
-            else:
-                # Determine which compressor's output this expander reconstructs (as input to next compressor)
-                # expanders[i] reconstructs target_for_expander_stack[i]
-                # if i=0 (TopExp), target is input to comp[N-1], which is output of comp[N-2]. So, codesL(N-2)
-                # In general, expanders[i] reconstructs the input to compressors[num_levels - 1 - i]
-                # This input is the output of compressors[num_levels - 2 - i]
-                reconstructed_code_level_idx = self.num_levels - 2 - i
-                if reconstructed_code_level_idx >= 0:
-                    target_level_desc = f"_codesL{reconstructed_code_level_idx}"
-                else:  # Should only happen if num_levels=1 and i=0, where K_lo is initial_vocab_size
-                    target_level_desc = "_intermediate_codes"  # Fallback
-            level_name = f"reconstruction_to_K{expander_k_lo}{target_level_desc}"
-            # --- End Naming ---
-
-            reconstruction_loss_details[level_name] = current_level_loss
-            total_reconstruction_loss += current_level_loss
-
-        avg_reconstruction_loss = total_reconstruction_loss / self.num_levels if self.num_levels > 0 else torch.tensor(
-            0.)
-
-        # --- 5. Calculate Auxiliary LM Loss for Compressors ---
-        total_aux_lm_loss_unweighted = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-        aux_lm_loss_details: Dict[str, torch.Tensor] = {}
-
-        if self.aux_lm_loss_weight > 0 and all_encoder_logits:  # Ensure weight is positive and logits list exists
-            num_valid_aux_lm_levels = 0
-            for i in range(self.num_levels):
-                encoder_logits_i = all_encoder_logits[i]  # (B, S_in_i, V_in_i)
-                input_tokens_i = all_compressor_input_tokens[i]  # (B, S_in_i)
-                input_kpm_i = all_compressor_input_kpms[i]  # (B, S_in_i) or None
-
-                # Ensure there's enough sequence length to predict a next token
-                if input_tokens_i.size(1) <= 1:  # Cannot form shifted targets if seq_len is 0 or 1
-                    current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-                    # Optionally log that this level was skipped for aux LM loss
-                    # print(f"Skipping aux LM loss for level {i} due to short sequence length: {input_tokens_i.size(1)}")
-                else:
-                    # Shift logits and targets for next token prediction
-                    # Logits from position t are used to predict token t+1
-                    logits_for_next_token_pred = encoder_logits_i[:, :-1, :]  # (B, S_in_i - 1, V_in_i)
-                    # Target token at t+1 is the label for logits from position t
-                    target_tokens_for_next_token_pred = input_tokens_i[:, 1:]  # (B, S_in_i - 1)
-
-                    # Shift key_padding_mask for the targets
-                    kpm_for_shifted_targets = None
-                    if input_kpm_i is not None:
-                        kpm_for_shifted_targets = input_kpm_i[:, 1:]  # (B, S_in_i - 1)
-
-                    if logits_for_next_token_pred.size(1) == 0:  # Should be caught by outer if, but defensive
-                        current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-                    else:
-                        loss_lm_i_per_token = F.cross_entropy(
-                            logits_for_next_token_pred.reshape(-1, logits_for_next_token_pred.size(-1)),
-                            target_tokens_for_next_token_pred.reshape(-1),
-                            reduction='none'
-                        ).view_as(target_tokens_for_next_token_pred)  # (B, S_in_i - 1)
-
-                        if kpm_for_shifted_targets is not None:
-                            loss_mask = ~kpm_for_shifted_targets  # True for valid (non-padded) target tokens
-                            # Ensure loss_mask is not all False, which can happen if all shifted targets are padding
-                            valid_targets_count = loss_mask.sum()
-                            if valid_targets_count > 0:
-                                current_aux_loss = (loss_lm_i_per_token * loss_mask).sum() / valid_targets_count.clamp(
-                                    min=1e-9)
-                            else:  # No valid targets to compute loss on (e.g., sequence was all padding after shift)
-                                current_aux_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
-                        else:  # No padding mask for targets
-                            current_aux_loss = loss_lm_i_per_token.mean()
-
-                    num_valid_aux_lm_levels += 1
-
-                aux_lm_loss_details[f"aux_lm_loss_L{i}"] = current_aux_loss
-                total_aux_lm_loss_unweighted += current_aux_loss
-
-            # Average only over levels where loss was actually computed meaningfully
-            avg_aux_lm_loss = total_aux_lm_loss_unweighted / num_valid_aux_lm_levels if num_valid_aux_lm_levels > 0 else torch.tensor(
-                0.)
-        else:
-            avg_aux_lm_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)  # Default if not active
+        avg_aux_lm_loss, aux_lm_loss_details = self._compute_auxiliary_losses(
+            tokens,
+            all_encoder_logits,
+            all_compressor_input_tokens,
+            all_compressor_input_kpms,
+        )
 
         final_total_loss = (
-                avg_reconstruction_loss +
-                vq_loss +
-                (self.aux_lm_loss_weight * avg_aux_lm_loss) +
-                (self.top_lm_loss_weight * avg_top_code_lm_loss) +
-                total_compression_loss_weighted
+            avg_reconstruction_loss
+            + vq_loss
+            + (self.aux_lm_loss_weight * avg_aux_lm_loss)
+            + (self.top_lm_loss_weight * avg_top_code_lm_loss)
+            + total_compression_loss_weighted
         )
+
         return {
-            'total_loss': final_total_loss, 'vq_loss': vq_loss,
+            'total_loss': final_total_loss,
+            'vq_loss': vq_loss,
             'avg_reconstruction_loss': avg_reconstruction_loss,
             'reconstruction_loss_details': reconstruction_loss_details,
-            'avg_aux_lm_loss': avg_aux_lm_loss,  # For logging
-            'aux_lm_loss_details': aux_lm_loss_details,  # For logging
-            'avg_top_code_lm_loss': avg_top_code_lm_loss,  # <<< ADDED for logging
-            'top_code_lm_loss_details': top_code_lm_loss_details,  # <<< ADDED for logging
+            'avg_aux_lm_loss': avg_aux_lm_loss,
+            'aux_lm_loss_details': aux_lm_loss_details,
+            'avg_top_code_lm_loss': avg_top_code_lm_loss,
+            'top_code_lm_loss_details': top_code_lm_loss_details,
             'avg_compression_loss': avg_compression_loss,
             'compression_loss_details': compression_loss_details,
             'final_reconstructed_logits': decompression_results['final_reconstructed_logits'],
@@ -718,7 +761,6 @@ class HierarchicalAutoencoder(nn.Module):
             'output_seq_lengths_compressors': output_seq_lengths_c,
             'all_codebook_perplexities': all_codebook_perplexities,
             'all_smoothed_perplexities': all_smoothed_perplexities,
-
         }
 
     @torch.no_grad()
