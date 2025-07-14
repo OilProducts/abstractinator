@@ -1,8 +1,5 @@
-import os
-import sys
 import torch
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from components.hierarchical_autoencoder import HierarchicalAutoencoder
 from components.checkpoint_utils import save_base_components
