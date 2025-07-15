@@ -8,6 +8,9 @@ import importlib.util
 from dataclasses import asdict
 import logging
 
+# Name for loggers created in this module so logs don't show '__main__'
+LOGGER_NAME = "abstractinator.train"
+
 import torch
 from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
 from torch import optim
@@ -103,7 +106,7 @@ def initialize_model(
 ) -> tuple[HierarchicalAutoencoder, optim.Optimizer, int, int]:
     """Instantiate the model, optimizer and restore any checkpoints."""
 
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger(LOGGER_NAME)
 
     model = HierarchicalAutoencoder(
         num_levels=exp_config.num_levels,
@@ -233,7 +236,7 @@ class Trainer:
             level=log_level,
             format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         )
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(LOGGER_NAME)
         self.logger.info("Using device: %s", self.device)
 
     def train(self) -> None:
@@ -262,7 +265,7 @@ def train_loop(
 ) -> None:
     """Run the full training loop."""
 
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger(LOGGER_NAME)
 
     mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
     mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
