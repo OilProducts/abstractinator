@@ -179,6 +179,77 @@ def initialize_model(
     return model, optimizer, start_epoch, global_step
 
 
+def save_checkpoint(
+    model: HierarchicalAutoencoder,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    step: int,
+    checkpoint_dir: str,
+    exp_config: ExpConfig,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Persist training state to ``checkpoint_dir``."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step{step}.pt")
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": epoch,
+            "global_step": step,
+            "exp_config": exp_config,
+        },
+        checkpoint_path,
+    )
+    if logger:
+        logger.info("Checkpoint saved to %s", checkpoint_path)
+
+
+class Trainer:
+    """Encapsulate training state and loop."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.device, self.n_cpu, self.exp_config = load_experiment_config(args)
+        self._setup_logging()
+
+        torch.set_float32_matmul_precision("high")
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_printoptions(threshold=100_000)
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.recompile_limit = 128
+
+        (
+            self.model,
+            self.optimizer,
+            self.start_epoch,
+            self.global_step,
+        ) = initialize_model(args, self.exp_config, self.device)
+
+    def _setup_logging(self) -> None:
+        """Configure the global logger."""
+        log_level = getattr(logging, self.args.log_level.upper(), logging.INFO)
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        )
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Using device: %s", self.device)
+
+    def train(self) -> None:
+        """Run the training loop."""
+        train_loop(
+            model=self.model,
+            optimizer=self.optimizer,
+            exp_config=self.exp_config,
+            device=self.device,
+            n_cpu=self.n_cpu,
+            start_epoch=self.start_epoch,
+            global_step=self.global_step,
+            args=self.args,
+        )
+
+
 def train_loop(
     model: HierarchicalAutoencoder,
     optimizer: optim.Optimizer,
@@ -543,36 +614,31 @@ def train_loop(
 
                     model.train()
                 if global_step > 0 and global_step % exp_config.checkpoint_interval == 0:
-                    os.makedirs(exp_config.checkpoint_dir, exist_ok=True)
-                    checkpoint_path = os.path.join(exp_config.checkpoint_dir, f"checkpoint_step{global_step}.pt")
-                    torch.save(
-                        {
-                            "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "exp_config": exp_config,
-                        },
-                        checkpoint_path,
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        epoch,
+                        global_step,
+                        exp_config.checkpoint_dir,
+                        exp_config,
+                        logger,
                     )
-                    logger.info("Checkpoint saved to %s", checkpoint_path)
+
                 global_step += 1
                 if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
                     logger.info("Reached max_steps %s. Stopping training.", exp_config.max_steps)
                     break
         epoch_duration = time.time() - epoch_start_time
         logger.info("--- Epoch %s finished. Duration: %.2fs ---", epoch + 1, epoch_duration)
-        os.makedirs(exp_config.checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(exp_config.checkpoint_dir, f"checkpoint_step{global_step}.pt")
-        torch.save(
-            {
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "exp_config": exp_config,
-            },
-            checkpoint_path,
+        save_checkpoint(
+            model,
+            optimizer,
+            epoch,
+            global_step,
+            exp_config.checkpoint_dir,
+            exp_config,
+            logger,
+
         )
 
         if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
@@ -596,32 +662,9 @@ def main() -> None:
     """Entry point for command line execution."""
 
     args = parse_args()
+    trainer = Trainer(args)
+    trainer.train()
 
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    logging.basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-
-    device, n_cpu, exp_config = load_experiment_config(args)
-
-    torch.set_float32_matmul_precision("high")
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_printoptions(threshold=100_000)
-    torch._dynamo.config.capture_scalar_outputs = True
-    torch._dynamo.config.recompile_limit = 128
-
-    logging.getLogger(__name__).info("Using device: %s", device)
-
-    model, optimizer, start_epoch, global_step = initialize_model(args, exp_config, device)
-
-    train_loop(
-        model=model,
-        optimizer=optimizer,
-        exp_config=exp_config,
-        device=device,
-        n_cpu=n_cpu,
-        start_epoch=start_epoch,
-        global_step=global_step,
-        args=args,
-    )
 
 
 if __name__ == "__main__":
