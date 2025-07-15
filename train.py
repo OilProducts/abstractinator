@@ -623,6 +623,7 @@ def train_loop(
                         exp_config,
                         logger,
                     )
+
                 global_step += 1
                 if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
                     logger.info("Reached max_steps %s. Stopping training.", exp_config.max_steps)
@@ -637,6 +638,7 @@ def train_loop(
             exp_config.checkpoint_dir,
             exp_config,
             logger,
+
         )
 
         if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
@@ -662,6 +664,7 @@ def main() -> None:
     args = parse_args()
     trainer = Trainer(args)
     trainer.train()
+
 
 
 if __name__ == "__main__":
