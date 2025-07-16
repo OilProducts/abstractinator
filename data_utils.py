@@ -29,42 +29,32 @@ def tokenize_and_process_examples(
         if not isinstance(text_content, str):
             text_content = str(text_content) if text_content is not None else ""
 
-        encoded_tokens = tokenizer.encode(text_content)
-        current_length = len(encoded_tokens)
+        # 1) Tokenize the text to a tensor of token IDs
+        tokens = tokenizer.encode(text_content).to(torch.int16)
 
-        if current_length == 0 and sequence_length == 0:
-            final_tokens = torch.tensor([], dtype=torch.int16)
-        elif current_length == 0 and sequence_length > 0:
-            final_tokens = torch.full((sequence_length,), tokenizer.pad_id, dtype=torch.int16)
-        elif sequence_length == 0 and current_length > 0:
-            final_tokens = torch.tensor([], dtype=torch.int16)
-        elif current_length > sequence_length:
-            if getattr(tokenizer, "add_eos", False):
-                final_tokens = encoded_tokens[: sequence_length - 1]
-                final_tokens = torch.cat(
-                    (final_tokens, torch.tensor([tokenizer.eos_id], dtype=torch.int16))
-                )
-            else:
-                final_tokens = encoded_tokens[:sequence_length]
-        elif current_length < sequence_length:
-            padding_needed = sequence_length - current_length
-            padding_tensor = torch.full((padding_needed,), tokenizer.pad_id, dtype=torch.int16)
-            final_tokens = torch.cat((encoded_tokens, padding_tensor))
+        if sequence_length > 0:
+            # 2) Truncate to ``sequence_length`` while preserving EOS semantics
+            if tokens.size(0) > sequence_length:
+                if getattr(tokenizer, "add_eos", False):
+                    truncated = tokens[: sequence_length - 1]
+                    tokens = torch.cat(
+                        (truncated, torch.tensor([tokenizer.eos_id], dtype=torch.int16))
+                    )
+                else:
+                    tokens = tokens[:sequence_length]
+
+            # 3) Pad to ``sequence_length`` using the tokenizer's PAD ID
+            if tokens.size(0) < sequence_length:
+                pad_len = sequence_length - tokens.size(0)
+                padding = torch.full((pad_len,), tokenizer.pad_id, dtype=torch.int16)
+                tokens = torch.cat((tokens, padding))
         else:
-            final_tokens = encoded_tokens
+            # ``sequence_length`` of zero means return an empty tensor
+            tokens = torch.tensor([], dtype=torch.int16)
 
-        if len(final_tokens) != sequence_length:
-            if len(final_tokens) > sequence_length:
-                final_tokens = final_tokens[:sequence_length]
-            else:
-                padding_needed = sequence_length - len(final_tokens)
-                final_tokens = torch.cat(
-                    (final_tokens, torch.full((padding_needed,), tokenizer.pad_id, dtype=torch.int16))
-                )
+        key_padding_mask = tokens == tokenizer.pad_id
 
-        key_padding_mask = final_tokens == tokenizer.pad_id
-
-        processed_input_ids_list.append(final_tokens)
+        processed_input_ids_list.append(tokens)
         processed_kpm_list.append(key_padding_mask)
 
     return {
