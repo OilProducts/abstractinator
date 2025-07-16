@@ -41,6 +41,8 @@ class HierarchicalAutoencoder(nn.Module):
         top_transformer_config: Optional configuration for a
             ``CodeSequenceTransformer`` over the top-level codes.
         top_lm_loss_weight: Weight for the top-level language-modeling loss.
+        top_lm_mse_weight: Weight for the MSE component of the top LM loss.
+        top_lm_ce_weight: Weight for the cross-entropy component of the top LM loss.
     """
 
     def __init__(self,
@@ -58,7 +60,9 @@ class HierarchicalAutoencoder(nn.Module):
                  aux_lm_loss_weight: float = 0.1,
                  top_transformer_config: Optional[Dict[str, Any]] = None,
                  top_lm_loss_weight: float = 1.0,
-                 use_continuous_expander_inputs: bool = False,):
+                 use_continuous_expander_inputs: bool = False,
+                 top_lm_mse_weight: float = 1.0,
+                 top_lm_ce_weight: float = 1.0,):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -75,8 +79,8 @@ class HierarchicalAutoencoder(nn.Module):
 
         self.top_transformer_config = top_transformer_config
         self.top_lm_loss_weight = top_lm_loss_weight
-        self.top_lm_mse_weight = 1.0
-        self.top_lm_ce_weight = 1.0
+        self.top_lm_mse_weight = top_lm_mse_weight
+        self.top_lm_ce_weight = top_lm_ce_weight
         self.use_continuous_expander_inputs = use_continuous_expander_inputs
 
         self.target_compression_ratios: List[Optional[float]] = []
@@ -122,8 +126,8 @@ class HierarchicalAutoencoder(nn.Module):
             transformer_dim = cfg.get("dim", embed_dim)
 
             self.top_transformer_continuous = cfg.get("continuous", True)
-            self.top_lm_mse_weight = cfg.get("mse_weight", 1.0)
-            self.top_lm_ce_weight = cfg.get("ce_weight", 1.0)
+            self.top_lm_mse_weight = cfg.get("mse_weight", self.top_lm_mse_weight)
+            self.top_lm_ce_weight = cfg.get("ce_weight", self.top_lm_ce_weight)
 
             self.code_sequence_transformer = CodeSequenceTransformer(
                 embed_dim=embed_dim,
@@ -144,8 +148,6 @@ class HierarchicalAutoencoder(nn.Module):
         else:
             self.code_sequence_transformer = None
             self.top_transformer_continuous = True
-            self.top_lm_mse_weight = 1.0
-            self.top_lm_ce_weight = 1.0
 
         # ---- Configure Expander Stack ----
         self.expanders = nn.ModuleList()
