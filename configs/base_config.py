@@ -42,6 +42,8 @@ class TopTransformerConfig:
     num_heads: int = 12
     ffn_dim_multiplier: int = 4
     continuous: bool = True  # When False, the top LM predicts discrete codes using cross-entropy
+    mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
+    ce_weight: float = 1.0   # Weight for the cross-entropy component of the top LM loss
 
 
 @dataclass

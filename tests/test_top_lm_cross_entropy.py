@@ -37,5 +37,7 @@ def test_top_lm_cross_entropy_loss():
     tokens = torch.tensor([[2, 3, 4, 5]], dtype=torch.long)
     kpm = torch.zeros_like(tokens, dtype=torch.bool)
     out = model.forward(tokens, key_padding_mask=kpm)
-    assert "top_code_ce" in out["top_code_lm_loss_details"]
+    details = out["top_code_lm_loss_details"]
+    assert "top_code_ce" in details
+    assert "top_code_mse" in details
 
