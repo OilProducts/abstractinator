@@ -68,6 +68,8 @@ class HierarchicalAELM(LM):
             ),
             top_lm_loss_weight=exp_config.top_lm_loss_weight,
             use_continuous_expander_inputs=exp_config.use_continuous_expander_inputs,
+            top_lm_mse_weight=exp_config.top_lm_mse_weight,
+            top_lm_ce_weight=exp_config.top_lm_ce_weight,
         ).to(self.device)
         ckpt = torch.load(checkpoint, map_location=self.device)
         self.model.load_state_dict(ckpt["model_state"])
