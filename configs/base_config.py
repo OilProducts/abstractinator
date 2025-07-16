@@ -65,6 +65,8 @@ class ExpConfig:
     propagate_key_padding_mask: bool = True
     aux_lm_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
+    top_lm_mse_weight: float = 1.0
+    top_lm_ce_weight: float = 1.0
     top_transformer_config: Optional[TopTransformerConfig] = field(
         default_factory=TopTransformerConfig
     )
