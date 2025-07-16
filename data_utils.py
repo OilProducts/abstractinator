@@ -29,42 +29,25 @@ def tokenize_and_process_examples(
         if not isinstance(text_content, str):
             text_content = str(text_content) if text_content is not None else ""
 
-        encoded_tokens = tokenizer.encode(text_content)
-        current_length = len(encoded_tokens)
+        # 1. Tokenize the raw text
+        tokens = tokenizer.encode(text_content).to(torch.int16)
 
-        if current_length == 0 and sequence_length == 0:
-            final_tokens = torch.tensor([], dtype=torch.int16)
-        elif current_length == 0 and sequence_length > 0:
-            final_tokens = torch.full((sequence_length,), tokenizer.pad_id, dtype=torch.int16)
-        elif sequence_length == 0 and current_length > 0:
-            final_tokens = torch.tensor([], dtype=torch.int16)
-        elif current_length > sequence_length:
-            if getattr(tokenizer, "add_eos", False):
-                final_tokens = encoded_tokens[: sequence_length - 1]
-                final_tokens = torch.cat(
-                    (final_tokens, torch.tensor([tokenizer.eos_id], dtype=torch.int16))
-                )
-            else:
-                final_tokens = encoded_tokens[:sequence_length]
-        elif current_length < sequence_length:
-            padding_needed = sequence_length - current_length
-            padding_tensor = torch.full((padding_needed,), tokenizer.pad_id, dtype=torch.int16)
-            final_tokens = torch.cat((encoded_tokens, padding_tensor))
-        else:
-            final_tokens = encoded_tokens
+        # 2. Truncate to ``sequence_length`` while ensuring the last token is EOS
+        #    when the tokenizer adds EOS by default
+        if len(tokens) > sequence_length:
+            tokens = tokens[:sequence_length]
+            if getattr(tokenizer, "add_eos", False) and sequence_length > 0:
+                tokens[-1] = tokenizer.eos_id
 
-        if len(final_tokens) != sequence_length:
-            if len(final_tokens) > sequence_length:
-                final_tokens = final_tokens[:sequence_length]
-            else:
-                padding_needed = sequence_length - len(final_tokens)
-                final_tokens = torch.cat(
-                    (final_tokens, torch.full((padding_needed,), tokenizer.pad_id, dtype=torch.int16))
-                )
+        # 3. Pad sequences shorter than ``sequence_length``
+        if len(tokens) < sequence_length:
+            pad_len = sequence_length - len(tokens)
+            pad_tensor = torch.full((pad_len,), tokenizer.pad_id, dtype=torch.int16)
+            tokens = torch.cat((tokens, pad_tensor))
 
-        key_padding_mask = final_tokens == tokenizer.pad_id
+        key_padding_mask = tokens == tokenizer.pad_id
 
-        processed_input_ids_list.append(final_tokens)
+        processed_input_ids_list.append(tokens)
         processed_kpm_list.append(key_padding_mask)
 
     return {
