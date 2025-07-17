@@ -624,6 +624,9 @@ def train_loop(
                         mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
 
                     model.train()
+                    if args.load_base_from:
+                        model.compressors.eval()
+                        model.expanders.eval()
                 if global_step > 0 and global_step % exp_config.checkpoint_interval == 0:
                     save_checkpoint(
                         model,
