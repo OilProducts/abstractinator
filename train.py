@@ -345,6 +345,9 @@ def train_loop(
     mlflow.log_params(exp_config.as_dict())
 
     model.train()
+    if args.load_base_from:
+        model.compressors.eval()
+        model.expanders.eval()
     optimizer.zero_grad()
 
     if device == "cuda":
@@ -386,6 +389,9 @@ def train_loop(
         _cached_causal_mask_cpu.cache_clear()
         epoch_start_time = time.time()
         model.train()
+        if args.load_base_from:
+            model.compressors.eval()
+            model.expanders.eval()
 
         for i, batch in enumerate(train_dataloader):
             tokens = batch["input_ids"].to(device)
