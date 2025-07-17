@@ -133,7 +133,7 @@ def initialize_model(
     ).to(device)
 
     if args.load_base_from:
-        ckpt = torch.load(args.load_base_from, map_location=device)
+        ckpt = torch.load(args.load_base_from, map_location=device, weights_only=False)
         model.compressors.load_state_dict(ckpt.get("compressors", {}), strict=False)
         model.expanders.load_state_dict(ckpt.get("expanders", {}), strict=False)
         model.compressors.requires_grad_(False)
