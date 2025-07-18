@@ -6,5 +6,5 @@ from .byte_segment_compressor import ByteSegmentCompressor
 from .swiglu import SwiGLU
 from .expander import DecoderOnlyExpander
 from .tokenizer import ByteLevelTokenizer
-from .checkpoint_utils import save_base_components
+from .checkpoint_utils import save_base_components, load_base_components
 from .code_sequence_transformer import CodeSequenceTransformer
