@@ -2,7 +2,7 @@ import torch
 
 
 from components.hierarchical_autoencoder import HierarchicalAutoencoder
-from components.checkpoint_utils import save_base_components
+from components.checkpoint_utils import save_base_components, load_base_components
 
 
 def build_base_model():
@@ -70,13 +70,28 @@ def test_load_and_freeze_base_components(tmp_path):
     save_base_components(base, str(save_path))
 
     top = build_top_model()
-    ckpt = torch.load(save_path, map_location="cpu")
-    top.compressors.load_state_dict(ckpt["compressors"], strict=False)
-    top.expanders.load_state_dict(ckpt["expanders"], strict=False)
-    top.compressors.requires_grad_(False)
-    top.expanders.requires_grad_(False)
-    top.compressors.eval()
-    top.expanders.eval()
+    load_base_components(top, str(save_path))
+
+    for p in top.compressors.parameters():
+        assert not p.requires_grad
+    for p in top.expanders.parameters():
+        assert not p.requires_grad
+    trainable_flags = [p.requires_grad for p in top.code_sequence_transformer.parameters()]
+    assert any(trainable_flags)
+
+    opt_params = [p for p in top.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(opt_params, lr=1e-3)
+    assert opt.param_groups[0]["params"] == opt_params
+
+
+def test_load_base_components_from_full_state(tmp_path):
+    torch.manual_seed(0)
+    base = build_base_model()
+    save_path = tmp_path / "base_full.pt"
+    torch.save({"model_state": base.state_dict()}, save_path)
+
+    top = build_top_model()
+    load_base_components(top, str(save_path))
 
     for p in top.compressors.parameters():
         assert not p.requires_grad

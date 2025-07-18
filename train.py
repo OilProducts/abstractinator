@@ -28,7 +28,7 @@ from components.sliding_window_attention import _cached_cross_window_mask as _ca
 from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.utils import short_num, format_duration
 from components.tokenizer import ByteLevelTokenizer
-from components.checkpoint_utils import save_base_components
+from components.checkpoint_utils import save_base_components, load_base_components
 from data_utils import tokenize_and_process_examples
 
 from configs.base_config import (
@@ -133,14 +133,12 @@ def initialize_model(
     ).to(device)
 
     if args.load_base_from:
-        ckpt = torch.load(args.load_base_from, map_location=device, weights_only=False)
-        model.compressors.load_state_dict(ckpt.get("compressors", {}), strict=False)
-        model.expanders.load_state_dict(ckpt.get("expanders", {}), strict=False)
-        model.compressors.requires_grad_(False)
-        model.expanders.requires_grad_(False)
-        model.compressors.eval()
-        model.expanders.eval()
-        logger.info("Loaded base components from %s", args.load_base_from)
+        load_base_components(
+            model,
+            args.load_base_from,
+            freeze=True,
+            map_location=device,
+        )
 
     def _count_params(module: torch.nn.Module) -> int:
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
