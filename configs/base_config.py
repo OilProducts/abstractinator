@@ -15,17 +15,17 @@ if torch.backends.mps.is_available() and DEVICE == "cpu":
 
 @dataclass
 class CompressorLevelConfig:
-    dim: int = 256
-    heads: int = 8
+    dim: int = 128
+    heads: int = 4
     window: int = 128
     num_encoder_layers: int = 0
-    num_shared_encoder_layers: int = 2
-    num_lm_encoder_layers: Optional[int] = 2
-    num_compression_encoder_layers: Optional[int] = 2
+    num_shared_encoder_layers: int = 1
+    num_lm_encoder_layers: Optional[int] = 8
+    num_compression_encoder_layers: Optional[int] = 1
     encoder_ffn_dim_multiplier: int = 4
     max_seq_len_encoder: int = 4096
     num_queries: int = 1
-    codebook_size: int = 4096
+    codebook_size: int = 8192
     beta: float = 1.0
     vq_reset_interval: int = 250
     entropy_delta: float = 0.2
@@ -36,19 +36,19 @@ class CompressorLevelConfig:
 
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 256
-    dim: int = 384
-    num_layers: int = 8
-    num_heads: int = 12
+    embed_dim: int = 128
+    dim: int = 256
+    num_layers: int = 12
+    num_heads: int = 8
     ffn_dim_multiplier: int = 4
-    continuous: bool = True  # When False, the top LM predicts discrete codes using cross-entropy
+    continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
     ce_weight: float = 1.0   # Weight for the cross-entropy component of the top LM loss
 
 
 @dataclass
 class ExpConfig:
-    run_name: str = "HierarchicalAE_KPM_Run_v2"
+    run_name: str = "HierarchicalAE_Default"
     project_name: str = "TemporalAutoencodedLanguageModelling"
     num_levels: int = 1
     initial_vocab_size: int = 259
@@ -60,7 +60,7 @@ class ExpConfig:
     expander_num_dec_layers: int = 4
     expander_heads_scale: float = 1.0
     expander_eos_id: int = 1
-    expander_max_len: int = 2048
+    expander_max_len: int = 8192
     use_decoder_only_expander: bool = True
     propagate_key_padding_mask: bool = True
     aux_lm_loss_weight: float = 1.0
@@ -70,9 +70,9 @@ class ExpConfig:
     top_transformer_config: Optional[TopTransformerConfig] = field(
         default_factory=TopTransformerConfig
     )
-    learning_rate: float = 1e-4
-    batch_size: int = 16
-    sequence_length: int = 1024
+    learning_rate: float = 5e-4
+    batch_size: int = 4
+    sequence_length: int = 4096
     num_epochs: int = 1
     max_steps: Optional[int] = None
     log_interval: int = 1
@@ -83,12 +83,12 @@ class ExpConfig:
     scheduler_specific_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {"min_lr": 1e-6}
     )
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_config: Optional[str] = "sample-10BT"
+    dataset_name: str = "roneneldan/TinyStories"
+    dataset_config: Optional[str] = None
     dataset_train_split: str = "train"
     text_column_name: str = "text"
     generation_interval: int = 50
-    sample_prompt_for_generation: str = "The purpose of education is "
+    sample_prompt_for_generation: str = "In a land far away, "
     generation_max_len_override: int = 512
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"
