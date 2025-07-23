@@ -39,7 +39,9 @@ class ByteSegmentCompressor(nn.Module):
         vocab_size: int = 259,
         dim: int = 256,
         heads: int = 8,  # Num heads for both encoder and pooler
-        window: int = 128,  # Window size for encoder
+        window: int = 128,  # Window size for shared encoder layers
+        lm_window: Optional[int] = None,
+        compression_window: Optional[int] = None,
         num_encoder_layers: int = 3,
         encoder_ffn_dim_multiplier: int = 4,
         num_shared_encoder_layers: int = 0,
@@ -56,6 +58,14 @@ class ByteSegmentCompressor(nn.Module):
         self.num_queries_per_segment = num_queries
         self.entropy_delta = entropy_delta
         self.entropy_abs_threshold = entropy_abs_threshold
+
+        if lm_window is None:
+            lm_window = window
+        if compression_window is None:
+            compression_window = window
+
+        self.lm_window = lm_window
+        self.compression_window = compression_window
 
         if num_lm_encoder_layers is None:
             num_lm_encoder_layers = num_encoder_layers
@@ -82,7 +92,7 @@ class ByteSegmentCompressor(nn.Module):
                 SlidingWindowTransformerBlock(
                     dim=dim,
                     num_heads=heads,
-                    window_size=window,
+                    window_size=self.compression_window,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
                     use_flex_attention=torch.cuda.is_available(),
                 )
@@ -95,7 +105,7 @@ class ByteSegmentCompressor(nn.Module):
                 SlidingWindowTransformerBlock(
                     dim=dim,
                     num_heads=heads,
-                    window_size=window,
+                    window_size=self.lm_window,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
                     use_flex_attention=torch.cuda.is_available(),
                 )

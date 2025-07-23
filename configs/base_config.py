@@ -18,6 +18,8 @@ class CompressorLevelConfig:
     dim: int = 128
     heads: int = 4
     window: int = 128
+    lm_window: Optional[int] = None
+    compression_window: Optional[int] = None
     num_encoder_layers: int = 0
     num_shared_encoder_layers: int = 1
     num_lm_encoder_layers: Optional[int] = 8
@@ -32,6 +34,12 @@ class CompressorLevelConfig:
     entropy_abs_threshold: Optional[float] = None
     target_compression_ratio: Optional[List[float]] = None
     compression_loss_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.lm_window is None:
+            self.lm_window = self.window
+        if self.compression_window is None:
+            self.compression_window = self.window
 
 
 @dataclass
