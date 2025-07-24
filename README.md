@@ -4,7 +4,7 @@ An experimental hierarchical autoencoder for compressing and reconstructing arbi
 
 ## Overview
 
-I came up with the idea after reading the [Byte Latent Transformer](https://arxiv.org/pdf/2412.09871) paper.  They describe a method that could be describe d as "learned tokenization" which works pretty well, but I thought it could be improved (like all things in deep learning) by stacking them.
+I came up with the idea after reading the [Byte Latent Transformer](https://arxiv.org/pdf/2412.09871) paper.  They describe a method that could be described as "learned tokenization" which works pretty well, but I thought it could be improved (like all things in deep learning) by stacking them.
 
 Lots of problems with that idea.
 
