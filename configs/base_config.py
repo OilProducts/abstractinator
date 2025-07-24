@@ -55,6 +55,19 @@ class TopTransformerConfig:
 
 
 @dataclass
+class ExpanderConfig:
+    dim_scale: float = 1.0
+    num_enc_layers: int = 2
+    num_dec_layers: int = 4
+    heads_scale: float = 1.0
+    eos_id: int = 1
+    max_len: int = 8192
+    use_decoder_only: bool = True
+    propagate_key_padding_mask: bool = True
+    use_continuous_inputs: bool = False
+
+
+@dataclass
 class ExpConfig:
     run_name: str = "HierarchicalAE_Default"
     project_name: str = "TemporalAutoencodedLanguageModelling"
@@ -63,14 +76,7 @@ class ExpConfig:
     compressor_level_configs: List[CompressorLevelConfig] = field(
         default_factory=lambda: [CompressorLevelConfig()]
     )
-    expander_dim_scale: float = 1.0
-    expander_num_enc_layers: int = 2
-    expander_num_dec_layers: int = 4
-    expander_heads_scale: float = 1.0
-    expander_eos_id: int = 1
-    expander_max_len: int = 8192
-    use_decoder_only_expander: bool = True
-    propagate_key_padding_mask: bool = True
+    expander: ExpanderConfig = field(default_factory=ExpanderConfig)
     aux_lm_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
     top_lm_mse_weight: float = 1.0
@@ -102,7 +108,6 @@ class ExpConfig:
     checkpoint_dir: str = "./checkpoints"
     resume_from_checkpoint: Optional[str] = None
     save_base_components_path: Optional[str] = None
-    use_continuous_expander_inputs: bool = False
     mlflow_batch_interval: int = 50
 
     def as_dict(self) -> Dict[str, Any]:
