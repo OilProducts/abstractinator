@@ -1,22 +1,18 @@
 # Abstractinator
 
-An experimental hierarchical autoencoder for compressing and reconstructing raw
-text at the byte level. The project explores whether long sequences can be
-represented with a compact set of discrete codes while still allowing faithful
-recovery. Training and dataset parameters are configured in a Python config file
-(`configs/config.py` by default).
+An experimental hierarchical autoencoder for compressing and reconstructing arbitrary sequences of things. 
 
 ## Overview
 
-The autoencoder is built from several custom modules that work together to
-compress sequences of UTF‑8 bytes. Each compression level reduces the length of
-the sequence and discretizes the result, enabling efficient storage or further
-modeling. Decompression reverses this process to reconstruct the original text.
+I came up with the idea after reading the [Byte Latent Transformer](https://arxiv.org/pdf/2412.09871) paper.  They describe a method that could be describe d as "learned tokenization" which works pretty well, but I thought it could be improved (like all things in deep learning) by stacking them.
 
-Why build this? Hierarchical discrete representations can decouple expensive
-language models from the byte-level details of text. If a compact code sequence
-faithfully represents a document, the codes themselves become a smaller,
-cleaner target for downstream models or storage.
+Lots of problems with that idea.
+
+Eventually I came up with this model that I call the Abstractinator.  Inspired by the BLT paper it uses a small transformer based model at each level that learns to predict the next token.  Uses the logits from that prediction to calculate entropy, then uses the entropy of the next element to define patch boundaries which are then fed through an encoder.  The design of the encoder is the key innovation of the Abstractinator that allows them to be stacked.  An Abstractinator encoder consists of a sliding window transformer with a short window, followed by a *Learned Query, Multi-Head Attention* module with a *single* query that pools the variable length segments into a fixed length representation.  This is then passed through a vector quantizer to produce a discrete code that can be used as discrete inputs for the next token prediction transformer of the next level in the hierarchy.  
+
+The continuous output from the encoder (not discrete) is also passed through to the next level, but goes direct to the compression path, not the entropy path. (at least, this is the plan)
+
+Why build this?  Well in my grand plan, Abstractinator based compression can be used to enable transformer based models to reason over much higher level concepts.  The hypothesis is that the first level will create tokens similar to BPE tokens, like the Byte Latent Transformer paper showed, but the second level will create tokens that are more like phrases or sentence clauses, the next could be whole ideas that would take a full sentence to express.  Clearly, if your sequence is abstracted to that level then the model can reason over much bigger things, without murdering getting to the problematic portion of the space complexity curve of attention.
 
 ## Installation
 
