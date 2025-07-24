@@ -112,14 +112,14 @@ def initialize_model(
         num_levels=exp_config.num_levels,
         compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
         initial_vocab_size=exp_config.initial_vocab_size,
-        expander_dim_scale=exp_config.expander_dim_scale,
-        expander_num_enc_layers=exp_config.expander_num_enc_layers,
-        expander_num_dec_layers=exp_config.expander_num_dec_layers,
-        expander_heads_scale=exp_config.expander_heads_scale,
-        expander_eos_id=exp_config.expander_eos_id,
-        expander_max_len=exp_config.expander_max_len,
-        use_decoder_only_expander=exp_config.use_decoder_only_expander,
-        propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
+        expander_dim_scale=exp_config.expander.dim_scale,
+        expander_num_enc_layers=exp_config.expander.num_enc_layers,
+        expander_num_dec_layers=exp_config.expander.num_dec_layers,
+        expander_heads_scale=exp_config.expander.heads_scale,
+        expander_eos_id=exp_config.expander.eos_id,
+        expander_max_len=exp_config.expander.max_len,
+        use_decoder_only_expander=exp_config.expander.use_decoder_only,
+        propagate_key_padding_mask=exp_config.expander.propagate_key_padding_mask,
         aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
         top_transformer_config=(
             asdict(exp_config.top_transformer_config)
@@ -127,7 +127,7 @@ def initialize_model(
             else None
         ),
         top_lm_loss_weight=exp_config.top_lm_loss_weight,
-        use_continuous_expander_inputs=exp_config.use_continuous_expander_inputs,
+        use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
         top_lm_mse_weight=exp_config.top_lm_mse_weight,
         top_lm_ce_weight=exp_config.top_lm_ce_weight,
     ).to(device)

@@ -28,8 +28,8 @@ exp_config.compressor_level_configs = [
         compression_loss_weight=1.0,
     )
 ]
-exp_config.expander_num_enc_layers = 1
-exp_config.expander_num_dec_layers = 1
+exp_config.expander.num_enc_layers = 1
+exp_config.expander.num_dec_layers = 1
 exp_config.aux_lm_loss_weight = 0.1
 exp_config.top_lm_loss_weight = 1.0
 exp_config.top_transformer_config = TopTransformerConfig(
