@@ -3,8 +3,8 @@ from typing import Optional, Tuple, Callable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
+from functools import lru_cache
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -140,11 +140,12 @@ class MultiheadLatentAttention(nn.Module):
 
     # ------------------------------------------------------------------ #
     # fast path when FlexAttention is available
-    def _flex_attention(self, q_r, k_r, v_c):
+    def _flex_attention(self, q_r, k_r, v_c, *, block_mask=None):
         # shapes: q_r [B,H,1,r]   k_r [B,H,L,r]   v_c [B,H,L,d_c]
         return flex_attention(
             q_r, k_r, v_c,  # Q, K, V
-            score_mod=self.score_mod  # your masking fn
+            score_mod=self.score_mod if block_mask is None else None,
+            block_mask=block_mask,
         ).squeeze(2)  # -> [B,H,d_c]
 
     def _fallback_attention(
@@ -152,6 +153,8 @@ class MultiheadLatentAttention(nn.Module):
             q_r: torch.Tensor,  # [B, H, 1, r]
             k_r: torch.Tensor,  # [B, H, L, r]
             v_c: torch.Tensor,  # [B, H, L, d_c]
+            *,
+            block_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Light‑weight dot‑product attention used when FlexAttention is unavailable.
@@ -172,13 +175,25 @@ class MultiheadLatentAttention(nn.Module):
         # -- 2. user‑supplied bias / mask operates on raw logits ---------------
         scores = self.score_mod(scores)
 
+        # Apply sparse mask if given
+        if block_mask is not None:
+            if hasattr(block_mask, 'mask_mod'):
+                B, H, _, L = scores.shape
+                q_idx = torch.arange(L, device=scores.device)
+                k_idx = q_idx[:, None]
+                keep = block_mask.mask_mod(0, 0, q_idx[:, None], k_idx[:, None])
+                scores = scores.masked_fill(keep, -float('inf'))
+            else:
+                scores = scores.masked_fill(block_mask, float('inf'))
+
+
         # -- 3. softmax & value aggregation ------------------------------------
         attn = torch.softmax(scores, dim=-1)  # [B, H, L]
 
         # fused gemm: (B·H)×L @ L×d_c  →  (B·H)×d_c
         return torch.matmul(attn, v_c)  # [B, H, d_c]
 
-    def forward(self, hidden_q: torch.Tensor, kv_c: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_q: torch.Tensor, kv_c: torch.Tensor, block_mask=None) -> torch.Tensor:
         B, L, _ = kv_c.shape
         dev, dt = kv_c.device, kv_c.dtype
 
@@ -199,9 +214,9 @@ class MultiheadLatentAttention(nn.Module):
         v_c = kv_c.unsqueeze(1).expand(-1, self.h, -1, -1)  # [B,H,L,d_c]
 
         # 5) attention
-        ctx_c = (self._flex_attention(q_r, k_r, v_c)
+        ctx_c = (self._flex_attention(q_r, k_r, v_c, block_mask=block_mask)
                  if self.use_flex else
-                 self._fallback_attention(q_r, k_r, v_c))  # [B,H,d_c]
+                 self._fallback_attention(q_r, k_r, v_c, block_mask=block_mask))  # [B,H,d_c]
 
         # 6) compressed → latent
         ctx_lat = torch.einsum('bhd,hdK->bhk', ctx_c, self.w_kc_kv_T)  # [B,H,K]
@@ -209,3 +224,54 @@ class MultiheadLatentAttention(nn.Module):
 
         # 7) output
         return self.out_proj(ctx_lat)  # [B,D]
+
+
+
+
+@lru_cache(maxsize=64)
+def _cached_sliding_mask(seq_len, window, device):
+    def mask_mod(b, h, q, k):
+        return (k >= q - window) & (k <= q)
+    return create_block_mask(
+        mask_mod,
+        B=None, H=None,
+        Q_LEN=seq_len, KV_LEN=seq_len,
+        BLOCK_SIZE=128,
+        _compile=False,
+        device=device,
+    )
+
+class SlidingWindowMLA(nn.Module):
+    """
+    Wraps MultiheadLatentAttention and supplies a cached sliding block mask.
+    """
+
+    def __init__(self, window_size: int, *mla_args, **mla_kwargs):
+        super().__init__()
+        self.window = window_size
+        self.mla = MultiheadLatentAttention(*mla_args, **mla_kwargs)
+        self.kv_proj = nn.Linear(mla_kwargs.get("dim_q"), self.mla.d_c, bias=False)
+        self.o_proj = nn.Linear(mla_kwargs.get("dim_q"), mla_kwargs.get("dim_q"), bias=False)
+
+    def forward(self, x, key_padding_mask: Optional[torch.Tensor] = None):
+        B, S, _ = x.shape
+        dev = x.device
+
+        kv_c = self.kv_proj(x)                     # [B,S,d_c]
+        if key_padding_mask is not None:
+            kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.)
+
+        block = _cached_sliding_mask(S, self.window, dev)
+        if key_padding_mask is not None:
+            pad = key_padding_mask.to(torch.bool)
+            def _keep(b,h,q,k): return ~pad[b,k]
+            block = create_block_mask(
+                and_masks(block.mask_mod, _keep),
+                B=pad.size(0), H=None,
+                Q_LEN=S, KV_LEN=S,
+                BLOCK_SIZE=block.BLOCK_SIZE,
+                device=dev
+            )
+
+        ctx = self.mla(x, kv_c, block_mask=block)  # single MLA call
+        return self.o_proj(ctx)
