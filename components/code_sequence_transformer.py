@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from .expander import EncoderBlock
 from .vector_quantizer import VectorQuantizer
 
-@torch.compile
+# @torch.compile
 class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 

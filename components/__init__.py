@@ -1,6 +1,6 @@
 from .vector_quantizer import VectorQuantizer
 from .learned_query_attention import LearnedQueryAttention
-from .utils import token_entropy, entropy_segments, build_segment_queries_mask
+from .utils import token_entropy, entropy_segments, build_segment_queries_mask, safe_softmax
 from .hierarchical_autoencoder import HierarchicalAutoencoder
 from .byte_segment_compressor import ByteSegmentCompressor
 from .swiglu import SwiGLU
