@@ -23,26 +23,42 @@ def _apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.
 
 class _RoPECache:
     """
-    Tiny helper that memoises sin/cos tables on a per‑(seq_len, dim, device, dtype) key.
-    This avoids recomputing the expensive outer‑product each forward pass.
+    Memoises (sin,cos) lookup tables keyed on
+        (seq_len, dim, device, dtype)
+    so we only pay the outer‑product cost once.
     """
-    _cache = {}
+    _cache: dict[tuple[int, int, torch.device, torch.dtype],
+                 tuple[torch.Tensor, torch.Tensor]] = {}
 
     @classmethod
-    def get(cls, seq_len: int, dim: int, device: torch.device, dtype: torch.dtype
-            ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get(
+        cls,
+        seq_len: int,
+        dim: int,
+        device: torch.device,
+        dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         key = (seq_len, dim, device, dtype)
         if key not in cls._cache:
-            # In RoPE literature the freq base is usually 10_000.
-            inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
-            t = torch.arange(seq_len, device=device, dtype=dtype)
-            freqs = torch.einsum('l,d->ld', t, inv_freq)          # [L, dim/2]
-            sin, cos = freqs.sin(), freqs.cos()                   # [L, dim/2]
-            # Interleave to shape [L, dim] so we can multiply directly.
-            sin = torch.stack((sin, sin), dim=-1).reshape(seq_len, dim)   # [L, dim]
-            cos = torch.stack((cos, cos), dim=-1).reshape(seq_len, dim)   # [L, dim]
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2,
+                                                     device=device,
+                                                     dtype=dtype) / dim))
+            t = torch.arange(seq_len, device=device, dtype=dtype)              # [L]
+            freqs = torch.einsum('l,d->ld', t, inv_freq)                       # [L, dim/2]
+            sin = freqs.sin()                                                  # [L, dim/2]
+            cos = freqs.cos()
+
+            # interleave quickly:  (x0,x1,…,x_{d/2-1}) -> (x0,x0,x1,x1,…)
+            sin = sin.repeat_interleave(2, dim=-1)                             # [L, dim]
+            cos = cos.repeat_interleave(2, dim=-1)
+
             cls._cache[key] = (sin, cos)
         return cls._cache[key]
+
+    @classmethod
+    def clear(cls) -> None:
+        """Call in `load_state_dict()` to avoid stale dtype/device entries."""
+        cls._cache.clear()
 
 
 class MultiheadLatentAttention(nn.Module):
