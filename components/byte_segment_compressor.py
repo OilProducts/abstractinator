@@ -6,9 +6,10 @@ import torch.nn as nn
 from .learned_query_attention import LearnedQueryAttention
 from .vector_quantizer import VectorQuantizer
 from .sliding_window_attention import SlidingWindowTransformerBlock
+from .mla import SlidingWindowMLATransformerBlock
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask
 
-# @torch.compile
+@torch.compile
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
@@ -40,6 +41,10 @@ class ByteSegmentCompressor(nn.Module):
         dim: int = 256,
         heads: int = 8,  # Num heads for both encoder and pooler
         window: int = 128,  # Window size for shared encoder layers
+        head_dim: Optional[int] = 32,
+        kv_comp_dim: Optional[int] = 32,
+        q_comp_dim: Optional[int] = 48,
+        retr_dim: Optional[int] = 32,
         lm_window: Optional[int] = None,
         compression_window: Optional[int] = None,
         num_encoder_layers: int = 3,
@@ -76,10 +81,14 @@ class ByteSegmentCompressor(nn.Module):
 
         self.shared_layers = nn.ModuleList(
             [
-                SlidingWindowTransformerBlock(
+                SlidingWindowMLATransformerBlock(
                     dim=dim,
                     num_heads=heads,
                     window_size=window,
+                    head_dim = head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
                     use_flex_attention=torch.cuda.is_available(),
                 )
@@ -89,10 +98,14 @@ class ByteSegmentCompressor(nn.Module):
 
         self.compression_layers = nn.ModuleList(
             [
-                SlidingWindowTransformerBlock(
+                SlidingWindowMLATransformerBlock(
                     dim=dim,
                     num_heads=heads,
                     window_size=self.compression_window,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
                     use_flex_attention=torch.cuda.is_available(),
                 )
@@ -102,10 +115,14 @@ class ByteSegmentCompressor(nn.Module):
 
         self.lm_layers = nn.ModuleList(
             [
-                SlidingWindowTransformerBlock(
+                SlidingWindowMLATransformerBlock(
                     dim=dim,
                     num_heads=heads,
                     window_size=self.lm_window,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
                     use_flex_attention=torch.cuda.is_available(),
                 )

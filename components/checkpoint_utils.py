@@ -57,7 +57,7 @@ def load_base_components(
         map_location: Device mapping for :func:`torch.load`.
     """
 
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     state = ckpt.get("model_state", ckpt)
 
     if "compressors" in state and "expanders" in state:

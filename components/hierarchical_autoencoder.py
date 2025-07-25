@@ -99,6 +99,7 @@ class HierarchicalAutoencoder(nn.Module):
                 heads=config['heads'],
                 window=config['window'],
                 lm_window=config.get('lm_window'),
+
                 compression_window=config.get('compression_window'),
                 num_encoder_layers=config.get('num_encoder_layers', 3),
                 encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4),
