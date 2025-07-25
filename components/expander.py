@@ -14,7 +14,7 @@ from .sliding_window_attention import SlidingWindowCrossAttention
 def _cached_causal_mask(length: int) -> torch.Tensor:
     """Return a causal mask computed on CPU."""
     mask = torch.triu(
-        torch.ones(length, length, device="cpu", dtype=torch.bool), diagonal=1
+        torch.ones(length, length, device="cuda", dtype=torch.bool), diagonal=1
     )
     return mask
 
@@ -224,7 +224,7 @@ class SlidingDecoder(nn.Module):
 # CodeExpander: Sequence-to-Sequence model using the custom Transformer blocks
 # ---------------------------------------------------------------------------
 
-@torch.compile
+# @torch.compile
 class CodeExpander(nn.Module):
     def __init__(
         self,
@@ -324,7 +324,7 @@ class CodeExpander(nn.Module):
                 break
         return generated_ids[:, 1:]
 
-@torch.compile
+# @torch.compile
 class DecoderOnlyExpander(nn.Module):
     """Decoder-only variant using sliding-window cross attention for memory access."""
 

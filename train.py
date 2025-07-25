@@ -37,6 +37,10 @@ from configs.base_config import (
     ExpConfig,
 )
 
+torch.backends.cuda.enable_flash_sdp(True)   # FlashAttn‑2*
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
 
 def parse_args() -> argparse.Namespace:
     """Return command line arguments for the training script."""
@@ -220,7 +224,7 @@ class Trainer:
         torch.set_default_dtype(torch.bfloat16)
         torch.set_printoptions(threshold=100_000)
         torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.recompile_limit = 128
+        # torch._dynamo.config.recompile_limit = 128
 
         (
             self.model,

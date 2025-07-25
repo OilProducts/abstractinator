@@ -15,20 +15,20 @@ if torch.backends.mps.is_available() and DEVICE == "cpu":
 
 @dataclass
 class CompressorLevelConfig:
-    dim: int = 128
-    heads: int = 4
+    dim: int = 256
+    heads: int = 8
     window: int = 128
-    head_dim: Optional[int] = 32
-    kv_comp_dim: Optional[int] = 32
-    q_comp_dim: Optional[int] = 48
-    retr_dim: Optional[int] = 32
+    head_dim: Optional[int] = 32 # K
+    kv_comp_dim: Optional[int] = 64 # d_c
+    q_comp_dim: Optional[int] = 96 # d_c`
+    retr_dim: Optional[int] = 32 # r
     lm_window: Optional[int] = 128
     compression_window: Optional[int] = 16
     num_encoder_layers: int = 0
     num_shared_encoder_layers: int = 1
     num_lm_encoder_layers: Optional[int] = 8
     num_compression_encoder_layers: Optional[int] = 1
-    encoder_ffn_dim_multiplier: int = 4
+    encoder_ffn_dim_multiplier: int = 2
     max_seq_len_encoder: int = 4096
     num_queries: int = 1
     codebook_size: int = 8192
@@ -89,13 +89,13 @@ class ExpConfig:
     )
     propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
-    batch_size: int = 4
+    batch_size: int = 8
     sequence_length: int = 4096
     num_epochs: int = 1
     max_steps: Optional[int] = None
     log_interval: int = 1
     gradient_clip_norm: float = 1.0
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 8
     scheduler_type: str = "cosine_with_min_lr"
     warmup_steps: int = 1000
     scheduler_specific_kwargs: Dict[str, Any] = field(

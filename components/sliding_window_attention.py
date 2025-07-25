@@ -16,8 +16,8 @@ from typing import Optional, Tuple
 @lru_cache(maxsize=64)
 def _cached_cross_window_mask(q_len: int, kv_len: int, window: int) -> torch.Tensor:
     """Return a cross-window mask computed on CPU."""
-    q_idx = torch.arange(q_len, device="cpu")[:, None]
-    kv_idx = torch.arange(kv_len, device="cpu")[None, :]
+    q_idx = torch.arange(q_len, device="cuda")[:, None]
+    kv_idx = torch.arange(kv_len, device="cuda")[None, :]
     rel_pos = kv_idx - q_idx
     mask = (rel_pos > 0) | (rel_pos < -window)
     return mask
@@ -31,7 +31,7 @@ def get_cross_window_mask(
     """Return the cached mask on ``device``."""
     return _cached_cross_window_mask(q_len, kv_len, window).to(device)
 
-@torch.compile
+# @torch.compile
 class LocalSlidingWindowAttention(nn.Module):
     """
     Causal sliding‑window multi‑head attention in O(S·w) with FlexAttention.
@@ -368,7 +368,7 @@ class SlidingWindowCrossAttention(nn.Module):
 
         return output
 
-@torch.compile
+# @torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
     A single Transformer block using LocalSlidingWindowAttention (Pre-LN variant).
