@@ -82,7 +82,6 @@ class MultiheadLatentAttention(nn.Module):
         kv_comp_dim: int = 512,     # d_c
         q_comp_dim: int  = 1536,    # d_c'
         retr_dim: int   = 64,       # r
-        dropout_p: float = 0.0,
         score_mod: Optional[Callable] = None,   # Flex mask/bias callback
         use_flex: bool = True,
     ):
@@ -106,7 +105,6 @@ class MultiheadLatentAttention(nn.Module):
 
         # output
         self.out_proj = nn.Linear(self.h * self.k, dim_q, bias=False)
-        self.dropout  = nn.Dropout(dropout_p)
 
         self._init_weights()
 
@@ -130,22 +128,17 @@ class MultiheadLatentAttention(nn.Module):
             score_mod=self.score_mod         # your masking fn
         ).squeeze(2)                         # -> [B,H,d_c]
 
-    # vanilla einsum + softmax fallback (identical maths)
-    def _fallback_attention(self, q_r, k_r, v_c):
-        # [B,H,L]
+    def _fallback_attention(self, q_r, k_r, v_c, kv_shared):
+        # scores: B,H,L
         scores = torch.einsum('bhdr,bhlr->bhl', q_r, k_r)
-        if self.score_mod is not None and self.score_mod.__code__.co_argcount == 5:
-            B,H,L = scores.shape
-            b,h,l = torch.meshgrid(
-                torch.arange(B,device=scores.device),
-                torch.arange(H,device=scores.device),
-                torch.arange(L,device=scores.device),
-                indexing='ij'
-            )
-            scores = self.score_mod(scores, b, h, torch.zeros_like(l), l)
-        attn = F.softmax(scores, -1)
-        attn = self.dropout(attn)
-        return torch.einsum('bhl,bhld->bhd', attn, v_c)
+
+        # optional bias / mask
+        scores = self.score_mod(scores)
+
+        attn = F.softmax(scores, dim=-1)
+
+        # fused matmul:                B,H,L   ×   B,L,d_c  ->  B,H,d_c
+        return torch.einsum('bhl,bld->bhd', attn, kv_shared)
 
     # ------------------------------------------------------------------ #
     def forward(self, hidden_q: torch.Tensor, kv_c: torch.Tensor) -> torch.Tensor:
