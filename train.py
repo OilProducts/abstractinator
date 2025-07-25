@@ -119,7 +119,7 @@ def initialize_model(
         expander_eos_id=exp_config.expander.eos_id,
         expander_max_len=exp_config.expander.max_len,
         use_decoder_only_expander=exp_config.expander.use_decoder_only,
-        propagate_key_padding_mask=exp_config.expander.propagate_key_padding_mask,
+        propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
         aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
         top_transformer_config=(
             asdict(exp_config.top_transformer_config)

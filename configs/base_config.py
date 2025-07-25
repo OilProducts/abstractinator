@@ -18,6 +18,10 @@ class CompressorLevelConfig:
     dim: int = 128
     heads: int = 4
     window: int = 128
+    head_dim: Optional[int] = 32
+    kv_comp_dim: Optional[int] = 32
+    q_comp_dim: Optional[int] = 48
+    retr_dim: Optional[int] = 32
     lm_window: Optional[int] = 128
     compression_window: Optional[int] = 16
     num_encoder_layers: int = 0
@@ -63,7 +67,6 @@ class ExpanderConfig:
     eos_id: int = 1
     max_len: int = 8192
     use_decoder_only: bool = True
-    propagate_key_padding_mask: bool = True
     use_continuous_inputs: bool = False
 
 
@@ -84,6 +87,7 @@ class ExpConfig:
     top_transformer_config: Optional[TopTransformerConfig] = field(
         default_factory=TopTransformerConfig
     )
+    propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
     batch_size: int = 4
     sequence_length: int = 4096

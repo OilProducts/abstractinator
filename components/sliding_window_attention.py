@@ -31,7 +31,7 @@ def get_cross_window_mask(
     """Return the cached mask on ``device``."""
     return _cached_cross_window_mask(q_len, kv_len, window).to(device)
 
-# @torch.compile
+@torch.compile
 class LocalSlidingWindowAttention(nn.Module):
     """
     Causal sliding‑window multi‑head attention in O(S·w) with FlexAttention.
@@ -432,8 +432,6 @@ class SlidingWindowTransformerBlock(nn.Module):
         x = x + attn_output
 
         # Feed-forward sub-layer (Pre-LN)
-        # x_norm2 = self.norm2(x) # Normalize input to FFN
-        # ffn_output = self.ffn(x_norm2) # Apply FFN
         ffn_output = self.ffn(self.norm2(x))
         x = x + ffn_output
 

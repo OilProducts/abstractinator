@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from .expander import EncoderBlock
 from .vector_quantizer import VectorQuantizer
 
-# Disable torch.compile on this module to keep unit tests lightweight
+@torch.compile
 class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 
