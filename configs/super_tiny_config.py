@@ -13,14 +13,16 @@ exp_config: ExpConfig = deepcopy(_base_exp_config)
 # Extra-small settings for quick sanity checks
 exp_config.compressor_level_configs = [
     CompressorLevelConfig(
-        dim=128,
+        dim=256,
         heads=8,
-        window=64,
-        num_encoder_layers=1,
+        window=128,
+        num_shared_encoder_layers = 0,
+        num_lm_encoder_layers = 2,
+        num_compression_encoder_layers = 2,
         encoder_ffn_dim_multiplier=4,
         max_seq_len_encoder=4096,
         num_queries=1,
-        codebook_size=2048,
+        codebook_size=8192,
         beta=1.0,
         entropy_delta=0.2,
         entropy_abs_threshold=None,
@@ -28,20 +30,22 @@ exp_config.compressor_level_configs = [
         compression_loss_weight=1.0,
     )
 ]
-exp_config.expander.num_enc_layers = 1
-exp_config.expander.num_dec_layers = 1
-exp_config.aux_lm_loss_weight = 0.1
+exp_config.expander_num_enc_layers = 1
+exp_config.expander_num_dec_layers = 1
+exp_config.aux_lm_loss_weight = 1.0
 exp_config.top_lm_loss_weight = 1.0
 exp_config.top_transformer_config = TopTransformerConfig(
-    embed_dim=128,
-    dim=128,
+    embed_dim=256,
+    dim=384,
     num_layers=8,
-    num_heads=8,
+    num_heads=12,
     ffn_dim_multiplier=4,
-    continuous=True,
+    continuous=False,
 )
 exp_config.learning_rate = 5e-4
-exp_config.gradient_accumulation_steps = 2
+exp_config.gradient_accumulation_steps = 8
+exp_config.batch_size = 8
+exp_config.sequence_length = 2048
 exp_config.dataset_name = "roneneldan/TinyStories"
 exp_config.dataset_config = None
 exp_config.sample_prompt_for_generation = (

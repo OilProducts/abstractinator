@@ -18,8 +18,8 @@ class CompressorLevelConfig:
     dim: int = 128
     heads: int = 4
     window: int = 128
-    lm_window: Optional[int] = None
-    compression_window: Optional[int] = None
+    lm_window: Optional[int] = 128
+    compression_window: Optional[int] = 16
     num_encoder_layers: int = 0
     num_shared_encoder_layers: int = 1
     num_lm_encoder_layers: Optional[int] = 8
