@@ -138,6 +138,9 @@ class HierarchicalAutoencoder(nn.Module):
                 num_layers=cfg.get("num_layers", 4),
                 num_heads=cfg.get("num_heads", 8),
                 ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", 4),
+                kv_comp_dim =cfg.get("kv_comp_dim", 64),  # d_c
+                q_comp_dim = cfg.get("q_comp_dim", 96),  # d_c`
+                retr_dim = cfg.get("retr_dim", 32),  # r
                 vq=self.compressors[-1].vq,
             )
             mode = "continuous" if self.top_transformer_continuous else "discrete"
