@@ -289,7 +289,9 @@ class HierarchicalAutoencoder(nn.Module):
             out_len / in_len if in_len > 0 else 0.0
             for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths)
         ]
-        compression_ratios = [tokens.new_tensor(r) for r in compression_ratios]
+        compression_ratios = [
+            tokens.new_tensor(r, dtype=torch.float32) for r in compression_ratios
+        ]
 
         return {
             'top_codes': all_codes_list[-1] if all_codes_list else torch.empty(0,
