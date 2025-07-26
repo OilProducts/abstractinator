@@ -84,7 +84,7 @@ def main():
     tokenized.set_format(type="torch", columns=["input_ids", "key_padding_mask"])
 
     model = build_model(exp_cfg, device)
-    state = torch.load(args.checkpoint, map_location=device)
+    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     sd = state.get("model_state", state)
     model.load_state_dict(sd, strict=False)
     model.eval()

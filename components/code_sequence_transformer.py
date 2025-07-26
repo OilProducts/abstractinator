@@ -33,7 +33,7 @@ class CodeSequenceTransformer(nn.Module):
         self.encoder = nn.ModuleList(
             [CausalMLATransformerBlock(dim=dim,
                                        num_heads=num_heads,
-                                       ffn_dim_multiplier=dim * ffn_dim_multiplier,
+                                       ffn_dim_multiplier=ffn_dim_multiplier,
                                        head_dim=head_dim,
                                        kv_comp_dim=kv_comp_dim,
                                        q_comp_dim=q_comp_dim,

@@ -15,21 +15,20 @@ if torch.backends.mps.is_available() and DEVICE == "cpu":
 
 @dataclass
 class CompressorLevelConfig:
-    dim: int = 256
-    heads: int = 8
+    dim: int = 512
+    heads: int = 32
     window: int = 128
-    head_dim: Optional[int] = 32 # K
+    head_dim: Optional[int] = 16 # K
     kv_comp_dim: Optional[int] = 64 # d_c
     q_comp_dim: Optional[int] = 96 # d_c`
-    retr_dim: Optional[int] = 32 # r
-    lm_window: Optional[int] = 128
+    retr_dim: Optional[int] = 64 # r
+    lm_window: Optional[int] = 512
     compression_window: Optional[int] = 16
     num_encoder_layers: int = 0
     num_shared_encoder_layers: int = 0
     num_lm_encoder_layers: Optional[int] = 14
     num_compression_encoder_layers: Optional[int] = 4
     encoder_ffn_dim_multiplier: int = 2
-    max_seq_len_encoder: int = 1024
     num_queries: int = 1
     codebook_size: int = 8192
     beta: float = 1.0
