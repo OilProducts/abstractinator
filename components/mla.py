@@ -128,7 +128,6 @@ class MultiheadLatentAttention(nn.Module):
         with torch.no_grad():
             self.W_qr.div_(math.sqrt(self.r))
 
-
     # clear RoPE tables when dtype/device flip
     def load_state_dict(self, *a, **kw):
         ret = super().load_state_dict(*a, **kw)
@@ -185,6 +184,7 @@ class MultiheadLatentAttention(nn.Module):
                 scores = scores.masked_fill(block_mask, float('inf'))
                 mask = mask | block_mask
 
+
         # -- 3. softmax & value aggregation ------------------------------------
         attn = safe_softmax(scores, mask, dim=-1)  # [B, H, L]
 
@@ -226,8 +226,6 @@ class MultiheadLatentAttention(nn.Module):
         return self.out_proj(ctx_lat)  # [B,D]
 
 
-
-
 @lru_cache(maxsize=64)
 def _cached_sliding_mask(seq_len, window, device):
     def mask_mod(b, h, q, k):
@@ -241,6 +239,7 @@ def _cached_sliding_mask(seq_len, window, device):
         BLOCK_SIZE=128,
         device=device,
     )
+
 
 class SlidingWindowMLA(nn.Module):
     """
@@ -258,7 +257,7 @@ class SlidingWindowMLA(nn.Module):
         B, S, _ = x.shape
         dev = x.device
 
-        kv_c = self.kv_proj(x)                     # [B,S,d_c]
+        kv_c = self.kv_proj(x)  # [B,S,d_c]
         if key_padding_mask is not None:
             kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.)
 
@@ -288,7 +287,9 @@ class SlidingWindowMLA(nn.Module):
             block_mask = _cached_sliding_mask(S, self.window, dev)
             if key_padding_mask is not None:
                 pad = key_padding_mask.to(torch.bool)
-                def _keep(b,h,q,k): return ~pad[b,k]
+
+                def _keep(b, h, q, k): return ~pad[b, k]
+
                 block_mask = create_block_mask(
                     and_masks(block_mask.mask_mod, _keep),
                     B=pad.size(0), H=None,
@@ -333,17 +334,17 @@ class SlidingWindowMLATransformerBlock(nn.Module):
     """
 
     def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        window_size: int,
-        *,
-        head_dim: int = 128,
-        kv_comp_dim: int = 512,
-        q_comp_dim: int = 1536,
-        retr_dim: int = 64,
-        ffn_dim_multiplier: int = 4,
-        use_flex_attention: bool = True,
+            self,
+            dim: int,
+            num_heads: int,
+            window_size: int,
+            *,
+            head_dim: int = 128,
+            kv_comp_dim: int = 512,
+            q_comp_dim: int = 1536,
+            retr_dim: int = 64,
+            ffn_dim_multiplier: int = 4,
+            use_flex_attention: bool = True,
     ):
         super().__init__()
 
@@ -369,9 +370,9 @@ class SlidingWindowMLATransformerBlock(nn.Module):
 
     # --------------------------------------------------------------------- #
     def forward(
-        self,
-        x: Tensor,
-        key_padding_mask: Optional[Tensor] = None,
+            self,
+            x: Tensor,
+            key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args
@@ -390,5 +391,171 @@ class SlidingWindowMLATransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
 
         # Feed‑forward (Pre‑LN)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+@lru_cache(maxsize=64)
+def _cached_causal_mask(seq_len: int, device: torch.device):
+    """
+    Fast‑path builder for a FlexAttention‑compatible causal mask.
+
+    keep(b,h,q,k) == True  ➜ *allow* logit      (Flex keeps allowed positions)
+    We therefore “keep” only keys k that are **not** in the future (k ≤ q).
+    """
+
+    def _keep(_b, _h, q, k):  # noqa: D401  (simple lambda clearer here)
+        return k <= q
+
+    return create_block_mask(
+        _keep,
+        B=None, H=None,
+        Q_LEN=seq_len, KV_LEN=seq_len,
+        BLOCK_SIZE=128,
+        device=device,
+    )
+
+
+def _boolean_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    """Fallback mask for the pure‑PyTorch path (shape [1,1,S,S])"""
+    q_idx = torch.arange(seq_len, device=device)[:, None]
+    k_idx = torch.arange(seq_len, device=device)[None, :]
+    return (k_idx > q_idx).unsqueeze(0).unsqueeze(0)  # True = *mask out*
+
+
+# ----------------------------------------------------------------------------- #
+
+
+class CausalMLA(nn.Module):
+    """
+    Wraps `MultiheadLatentAttention` with a standard causal mask.
+    """
+
+    def __init__(self, *mla_args, dim_q: int, **mla_kwargs):
+        """
+        Parameters
+        ----------
+        dim_q : int
+            Model width (passed to the K/V projection and output projection).
+        *mla_args / **mla_kwargs
+            Forwarded to `MultiheadLatentAttention`.
+        """
+        super().__init__()
+        self.mla = MultiheadLatentAttention(*mla_args, dim_q=dim_q, **mla_kwargs)
+
+        # Project tokens into compressed K/V space once per layer
+        self.kv_proj = nn.Linear(dim_q, self.mla.d_c, bias=False)
+
+        # Final linear to mix latent heads back to model space
+        self.o_proj = nn.Linear(dim_q, dim_q, bias=False)
+
+    # --------------------------------------------------------------------- #
+    def _build_mask(
+            self,
+            seq_len: int,
+            key_padding_mask: Optional[torch.Tensor],
+            device: torch.device,
+    ):
+        """
+        Returns a `block_mask` suitable for the current back‑end
+        (FlexAttention vs. fallback) and already combined with `key_padding_mask`.
+        """
+        if self.mla.use_flex:
+            block_mask = _cached_causal_mask(seq_len, device)
+            if key_padding_mask is not None:
+                pad = key_padding_mask.to(torch.bool)
+
+                def _keep_pad(b, h, q, k):
+                    return ~pad[b, k]
+
+                block_mask = create_block_mask(
+                    and_masks(block_mask.mask_mod, _keep_pad),
+                    B=pad.size(0),
+                    H=None,
+                    Q_LEN=seq_len,
+                    KV_LEN=seq_len,
+                    BLOCK_SIZE=block_mask.BLOCK_SIZE,
+                    device=device,
+                )
+            return block_mask
+
+        # ---------- PyTorch path (boolean tensor) -------------------------
+        block_mask = _boolean_causal_mask(seq_len, device)
+        if key_padding_mask is not None:
+            block_mask = block_mask | key_padding_mask[:, None, None, :]
+        return block_mask
+
+    # --------------------------------------------------------------------- #
+
+    def forward(
+            self,
+            x: torch.Tensor,  # [B,S,D]
+            key_padding_mask: Optional[torch.Tensor] = None,  # [B,S] (True = pad)
+    ) -> torch.Tensor:
+        B, S, _ = x.shape
+        kv_c = self.kv_proj(x)  # [B,S,d_c]
+        if key_padding_mask is not None:
+            kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.0)
+
+        block_mask = self._build_mask(S, key_padding_mask, x.device)
+        ctx = self.mla(x, kv_c, block_mask=block_mask)  # [B,S,D]
+        return self.o_proj(ctx)
+
+
+# ----------------------------------------------------------------------------- #
+# Transformer Block
+# ----------------------------------------------------------------------------- #
+
+@torch.compile
+class CausalMLATransformerBlock(nn.Module):
+    """
+    Standard Pre‑LN causal Transformer block powered by MLA.
+
+    Layout:
+        x  →  RMSNorm →  CausalMLA  → +residual
+           →  RMSNorm →  SwiGLU FFN → +residual
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            *,
+            head_dim: int = 128,
+            kv_comp_dim: int = 512,
+            q_comp_dim: int = 1536,
+            retr_dim: int = 64,
+            ffn_dim_multiplier: int = 4,
+            use_flex_attention: bool = True,
+    ):
+        super().__init__()
+
+        # Attention sub‑layer --------------------------------------------------
+        self.norm1 = nn.RMSNorm(dim)
+        self.attn = CausalMLA(
+            dim_q=dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            kv_comp_dim=kv_comp_dim,
+            q_comp_dim=q_comp_dim,
+            retr_dim=retr_dim,
+            use_flex=use_flex_attention,
+        )
+
+        # Feed‑forward sub‑layer ----------------------------------------------
+        self.norm2 = nn.RMSNorm(dim)
+        hidden_dim = dim * ffn_dim_multiplier
+        self.ffn = SwiGLU(dim, hidden_dim)
+
+    # --------------------------------------------------------------------- #
+    def forward(
+            self,
+            x: torch.Tensor,  # [B,S,D]
+            key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # 1. Causal MLA
+        x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
+
+        # 2. Feed‑forward
         x = x + self.ffn(self.norm2(x))
         return x
