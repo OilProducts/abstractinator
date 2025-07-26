@@ -25,11 +25,11 @@ class CompressorLevelConfig:
     lm_window: Optional[int] = 128
     compression_window: Optional[int] = 16
     num_encoder_layers: int = 0
-    num_shared_encoder_layers: int = 1
-    num_lm_encoder_layers: Optional[int] = 8
-    num_compression_encoder_layers: Optional[int] = 1
+    num_shared_encoder_layers: int = 0
+    num_lm_encoder_layers: Optional[int] = 14
+    num_compression_encoder_layers: Optional[int] = 4
     encoder_ffn_dim_multiplier: int = 2
-    max_seq_len_encoder: int = 4096
+    max_seq_len_encoder: int = 1024
     num_queries: int = 1
     codebook_size: int = 8192
     beta: float = 1.0
@@ -48,14 +48,19 @@ class CompressorLevelConfig:
 
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 128
-    dim: int = 256
-    num_layers: int = 12
-    num_heads: int = 8
+    embed_dim: int = 256
+    dim: int = 512
+    num_layers: int = 24
+    num_heads: int = 16
     ffn_dim_multiplier: int = 4
     continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
     ce_weight: float = 1.0   # Weight for the cross-entropy component of the top LM loss
+    head_dim: Optional[int] = 32 # K
+    kv_comp_dim: Optional[int] = 64 # d_c
+    q_comp_dim: Optional[int] = 96 # d_c`
+    retr_dim: Optional[int] = 64 # r
+    lm_window: Optional[int] = 128
 
 
 @dataclass
@@ -89,13 +94,13 @@ class ExpConfig:
     )
     propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
-    batch_size: int = 8
+    batch_size: int = 4
     sequence_length: int = 4096
     num_epochs: int = 1
     max_steps: Optional[int] = None
     log_interval: int = 1
     gradient_clip_norm: float = 1.0
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 16
     scheduler_type: str = "cosine_with_min_lr"
     warmup_steps: int = 1000
     scheduler_specific_kwargs: Dict[str, Any] = field(
