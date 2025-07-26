@@ -13,8 +13,9 @@ from .sliding_window_attention import SlidingWindowCrossAttention
 @lru_cache(maxsize=64)
 def _cached_causal_mask(length: int) -> torch.Tensor:
     """Return a causal mask computed on CPU."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     mask = torch.triu(
-        torch.ones(length, length, device="cuda", dtype=torch.bool), diagonal=1
+        torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1
     )
     return mask
 

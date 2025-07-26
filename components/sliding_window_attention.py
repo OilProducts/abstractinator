@@ -16,8 +16,9 @@ from typing import Optional, Tuple
 @lru_cache(maxsize=64)
 def _cached_cross_window_mask(q_len: int, kv_len: int, window: int) -> torch.Tensor:
     """Return a cross-window mask computed on CPU."""
-    q_idx = torch.arange(q_len, device="cuda")[:, None]
-    kv_idx = torch.arange(kv_len, device="cuda")[None, :]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q_idx = torch.arange(q_len, device=device)[:, None]
+    kv_idx = torch.arange(kv_len, device=device)[None, :]
     rel_pos = kv_idx - q_idx
     mask = (rel_pos > 0) | (rel_pos < -window)
     return mask
