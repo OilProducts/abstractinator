@@ -100,8 +100,9 @@ class MultiheadLatentAttention(nn.Module):
         self.q_proj = nn.Linear(dim_q, self.h * self.k, bias=False)
 
         # absorbed projections to compressed spaces
-        self.w_kc_q = nn.Parameter(torch.empty(self.h, self.k, self.d_cq, device='cuda'))  # K→d_c'
-        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c, device='cuda'))  # K→d_c
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.w_kc_q = nn.Parameter(torch.empty(self.h, self.k, self.d_cq, device=device))  # K→d_c'
+        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c, device=device))  # K→d_c
 
         self.register_buffer(
             "w_kc_kv_T", self.w_kc_kv.transpose(1, 2), persistent=False
@@ -170,7 +171,7 @@ class MultiheadLatentAttention(nn.Module):
         # -- 2. user‑supplied bias / mask operates on raw logits ---------------
         scores = self.score_mod(scores)
 
-        # Apply sparse mask if given
+        mask = torch.zeros_like(scores, dtype=torch.bool)
         if block_mask is not None:
             if hasattr(block_mask, 'mask_mod'):
                 B, H, _, L = scores.shape
@@ -178,11 +179,14 @@ class MultiheadLatentAttention(nn.Module):
                 k_idx = q_idx[:, None]
                 keep = block_mask.mask_mod(0, 0, q_idx[:, None], k_idx[:, None])
                 scores = scores.masked_fill(keep, -float('inf'))
+                mask = mask | keep
             else:
                 scores = scores.masked_fill(block_mask, float('inf'))
+                mask = mask | block_mask
+
 
         # -- 3. softmax & value aggregation ------------------------------------
-        attn = safe_softmax(scores, dim=-1)  # [B, H, L]
+        attn = safe_softmax(scores, mask, dim=-1)  # [B, H, L]
 
         # fused gemm: (B·H)×L @ L×d_c  →  (B·H)×d_c
         return torch.matmul(attn, v_c)  # [B, H, d_c]
