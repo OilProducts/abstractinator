@@ -12,7 +12,7 @@ Eventually I came up with this model that I call the Abstractinator.  Inspired b
 
 The continuous output from the encoder (not discrete) is also passed through to the next level, but goes direct to the compression path, not the entropy path. (at least, this is the plan)
 
-Why build this?  Well in my grand plan, Abstractinator based compression can be used to enable transformer based models to reason over much higher level concepts.  The hypothesis is that the first level will create tokens similar to BPE tokens, like the Byte Latent Transformer paper showed, but the second level will create tokens that are more like phrases or sentence clauses, the next could be whole ideas that would take a full sentence to express.  Clearly, if your sequence is abstracted to that level then the model can reason over much bigger things, without murdering getting to the problematic portion of the space complexity curve of attention.
+Why build this?  Well in my grand plan, Abstractinator based compression can be used to enable transformer based models to reason over much higher level concepts.  The hypothesis is that the first level will create tokens similar to BPE tokens, like the Byte Latent Transformer paper showed, but the second level will create tokens that are more like phrases or sentence clauses, the next could be whole ideas that would take a full sentence to express.  Clearly, if your sequence is abstracted to that level then the model can reason over much bigger things, without getting to the problematic portion of the space complexity curve of attention.
 
 ## Installation
 
