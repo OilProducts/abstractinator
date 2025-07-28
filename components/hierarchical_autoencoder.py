@@ -504,7 +504,7 @@ class HierarchicalAutoencoder(nn.Module):
                 mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
 
                 target_cont = cont[:, 1:, :]
-                mse_per_tok = F.mse_loss(pred, target_cont, reduction='none').sum(dim=-1)
+                mse_per_tok = F.mse_loss(pred, target_cont, reduction='none').mean(dim=-1)
 
                 target_codes = codes[:, 1:]
                 codebook = self.compressors[-1].vq.codebook
