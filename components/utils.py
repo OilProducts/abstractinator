@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+
 import math
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+
+import torch
+import functools
+from typing import Callable
 
 def safe_softmax(scores: torch.Tensor,
                  mask: torch.Tensor,
@@ -117,7 +124,8 @@ def entropy_segments(
     *,
     increase_delta: float = 0.2,
     abs_threshold: float | None = None,
-) -> torch.Tensor:
+    return_boundary: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """Generate segment IDs based on token entropy.
 
     A new segment begins when either:
@@ -134,9 +142,12 @@ def entropy_segments(
             start a new segment.
         abs_threshold: Optional absolute entropy level that also triggers a new
             segment when crossed.
+        return_boundary: If ``True``, also return a boolean mask indicating the
+            end of each segment (True at the last token of each segment).
 
     Returns:
-        Integer tensor of segment IDs ``(B, S)``.
+        seg_id          : (B,S₀)  int64
+        patch_end_mask? : (B,S₀)  bool  (True at last token of each segment) IDs ``(B, S)``.
     """
     if ent.ndim != 2:
         raise ValueError(f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}")
@@ -168,7 +179,73 @@ def entropy_segments(
     # This creates the segment IDs. Each time `inc` is 1, the segment ID increments.
     seg_id = torch.cumsum(inc, dim=1)  # Shape: (batch_size, sequence_length)
 
-    return seg_id
+
+    if return_boundary:
+        # seg_id differs at patch borders
+        patch_end = torch.zeros_like(seg_id, dtype=torch.bool)
+        if seg_id.size(1) > 0:  # guard empty seq
+            patch_end[:, :-1] = seg_id[:, 1:] != seg_id[:, :-1]
+            patch_end[:, -1] = True
+        return seg_id, patch_end
+    else:
+        return seg_id
+
+
+
+
+def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
+    """
+    Returns a closure (b, h, q, k) → bool that implements
+    segment‑restricted masking.
+
+    seg_id : (B,S₀)  int64
+    L      : queries per segment
+    """
+    seg_id = seg_id.contiguous()          # keep a private copy
+
+    def mask(b: int, h: int,
+             q_idx: torch.Tensor,
+             k_idx: torch.Tensor) -> torch.Tensor:
+        """
+        q_idx, k_idx: broadcast‑compatible tensors
+        Returns True where attention is **blocked**.
+        """
+        seg_k = seg_id[b][k_idx]  # ✓ broadcasting, same shape as k_idx
+        return (q_idx // L) != seg_k  # result shape (Q,S)
+
+    return mask
+
+
+# ---------------------------------------------------------------------
+#  Very small LRU for tiled‑query caching
+# ---------------------------------------------------------------------
+@functools.lru_cache(maxsize=32)
+def _cached_tiled_queries(L: int, D: int, S_hat: int, device: torch.device):
+    """
+    Returns tensor (Ŝ·L, D)  _without_ batch dimension.
+    """
+    base = torch.empty((L, D), device=device)   # placeholder; caller will .copy_()
+    return base.repeat_interleave(S_hat, 0)     # (Ŝ·L, D)
+
+
+def get_tiled_queries(base_queries: torch.Tensor,
+                      B: int,
+                      S_hat: int) -> torch.Tensor:
+    """
+    base_queries : (L,D)  learnable parameter
+    Returns      : (B, Ŝ·L, D)  ready for attention
+    """
+    L, D = base_queries.shape
+    device = base_queries.device
+
+    tiled = _cached_tiled_queries(L, D, S_hat, device)  # (Ŝ·L, D)
+    # copy learnable contents (one kernel, much cheaper than allocate)
+    # tiled = base_queries.repeat_interleave(S_hat, 0)  # (Ŝ·L, D)
+
+    tiled.copy_(base_queries.repeat_interleave(S_hat, 0))
+    return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
+
+
 
 
 def build_segment_queries_mask(

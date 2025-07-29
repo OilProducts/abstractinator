@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F # Required if safe_softmax uses F.softmax
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable, Union
 import math
 
 from .utils import safe_softmax
@@ -84,9 +84,9 @@ class LearnedQueryAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                      # Input context: (B, S, D) for keys & values
-        queries: torch.Tensor,                # Pre-built queries: (B, Q_tot, D)
-        attn_mask: torch.Tensor,              # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
+        x: torch.Tensor,                            # Input context: (B, S, D) for keys & values
+        queries: torch.Tensor,                      # Pre-built queries: (B, Q_tot, D)
+        attn_mask: Union[torch.Tensor, Callable],   # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
         key_padding_mask: Optional[torch.Tensor] = None # Key padding mask: (B, S), boolean (True where padded)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -147,14 +147,28 @@ class LearnedQueryAttention(nn.Module):
         # (B, H, Q_tot, d_h) @ (B, H, d_h, S) -> (B, H, Q_tot, S)
         scores = (q @ k) / math.sqrt(self.head_dim)
 
-        # Combine attention mask and key padding mask
-        # Reshape attn_mask from (B*H, Q_tot, S) to (B, H, Q_tot, S) for broadcasting
-        combined_mask = attn_mask.view(B, self.num_heads, Q_tot, S)
-        if key_padding_mask is not None:
-            # Expand key_padding_mask from (B, S) to (B, 1, 1, S) for broadcasting.
-            # If a key is padded (True in key_padding_mask), or if attn_mask
-            # already specifies masking (True in combined_mask), then mask.
-            combined_mask = combined_mask | key_padding_mask[:, None, None, :] # (B,H,Q,S)
+        # scores: (B,H,Q,S)
+        if callable(attn_mask):
+            # Build mask *on the fly* by giving indices to the closure
+            q_idx = torch.arange(Q_tot, device=scores.device)[:, None]             # (Q,)
+            k_idx = torch.arange(S,     device=scores.device)[None, :]             # (S,)
+            # (B,Q,S) — stack calls for each batch
+            mask_bqs = torch.stack(
+                [attn_mask(b=i, h=0, q_idx=q_idx, k_idx=k_idx) for i in range(B)],
+                dim=0
+            )
+            combined_mask = mask_bqs.unsqueeze(1)  # (1,1,Q,S)
+            if key_padding_mask is not None:
+                combined_mask = combined_mask | key_padding_mask[:, None, None, :]
+        else:
+            # Combine attention mask and key padding mask
+            # Reshape attn_mask from (B*H, Q_tot, S) to (B, H, Q_tot, S) for broadcasting
+            combined_mask = attn_mask.view(B, self.num_heads, Q_tot, S)
+            if key_padding_mask is not None:
+                # Expand key_padding_mask from (B, S) to (B, 1, 1, S) for broadcasting.
+                # If a key is padded (True in key_padding_mask), or if attn_mask
+                # already specifies masking (True in combined_mask), then mask.
+                combined_mask = combined_mask | key_padding_mask[:, None, None, :] # (B,H,Q,S)
 
         # Apply softmax with the combined mask
         # `safe_softmax` is assumed to handle masking by setting masked scores to -inf before softmax
