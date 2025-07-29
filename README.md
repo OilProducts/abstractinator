@@ -18,7 +18,19 @@ Why build this?  Well in my grand plan, Abstractinator based compression can be 
 
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
+
+## Development
+
+Install and run pre-commit hooks so code style checks run automatically:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+The hooks will run on each commit and also execute in CI.
 
 ## Training
 
