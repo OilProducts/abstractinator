@@ -134,6 +134,7 @@ def initialize_model(
         use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
         top_lm_mse_weight=exp_config.top_lm_mse_weight,
         top_lm_ce_weight=exp_config.top_lm_ce_weight,
+        use_flex_attention=exp_config.flex_attention,
     ).to(device)
 
     if args.load_base_from:

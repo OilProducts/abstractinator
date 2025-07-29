@@ -39,6 +39,7 @@ def build_model(exp_cfg, device):
         use_continuous_expander_inputs=exp_cfg.expander.use_continuous_inputs,
         top_lm_mse_weight=exp_cfg.top_lm_mse_weight,
         top_lm_ce_weight=exp_cfg.top_lm_ce_weight,
+        use_flex_attention=exp_cfg.flex_attention,
     ).to(device)
     return model
 

@@ -23,11 +23,13 @@ class CodeSequenceTransformer(nn.Module):
             q_comp_dim: Optional[int] = 96,  # d_c`
             retr_dim: Optional[int] = 32,  # r
             vq: Optional[VectorQuantizer] = None,
+            use_flex_attention: bool = True,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.dim = dim
         self.vq = vq
+        self.use_flex_attention = use_flex_attention
 
         self.in_proj = nn.Linear(embed_dim, dim)
         self.encoder = nn.ModuleList(
@@ -38,6 +40,7 @@ class CodeSequenceTransformer(nn.Module):
                                        kv_comp_dim=kv_comp_dim,
                                        q_comp_dim=q_comp_dim,
                                        retr_dim=retr_dim,
+                                       use_flex_attention=self.use_flex_attention
                                        ) for _ in range(num_layers)]
         )
         self.final_norm = nn.RMSNorm(dim)

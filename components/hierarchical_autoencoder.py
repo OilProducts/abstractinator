@@ -62,7 +62,9 @@ class HierarchicalAutoencoder(nn.Module):
                  top_lm_loss_weight: float = 1.0,
                  use_continuous_expander_inputs: bool = False,
                  top_lm_mse_weight: float = 1.0,
-                 top_lm_ce_weight: float = 1.0,):
+                 top_lm_ce_weight: float = 1.0,
+                 use_flex_attention: bool = True
+                 ):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -82,6 +84,7 @@ class HierarchicalAutoencoder(nn.Module):
         self.top_lm_mse_weight = top_lm_mse_weight
         self.top_lm_ce_weight = top_lm_ce_weight
         self.use_continuous_expander_inputs = use_continuous_expander_inputs
+        self.use_flex_attention = use_flex_attention
 
         self.target_compression_ratios: List[Optional[float]] = []
         self.compression_loss_weights: List[float] = []
@@ -112,6 +115,7 @@ class HierarchicalAutoencoder(nn.Module):
                 vq_reset_interval=config.get('vq_reset_interval', 250),
                 entropy_delta=config.get('entropy_delta', 0.2),
                 entropy_abs_threshold=config.get('entropy_abs_threshold'),
+                use_flex_attention=use_flex_attention,
             )
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])

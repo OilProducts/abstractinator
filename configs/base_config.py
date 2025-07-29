@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
+from torch.nn.attention.flex_attention import flex_attention
 
 import torch
 
@@ -8,9 +9,32 @@ import torch
 N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least one worker
 
 # Determine the preferred device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.backends.mps.is_available() and DEVICE == "cpu":
-    DEVICE = torch.device("mps")
+
+def _check_device() -> str:
+    """Return the preferred device for PyTorch operations."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+def _check_flex_attention() -> bool:
+    """Return True if flex_attention can run on this system."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        q = torch.randn(1, 1, 1, 8, device="cuda")
+        flex_attention(q, q, q)
+        return True
+    except Exception:
+        return False
+
+
+DEVICE = _check_device()
+FLEX_ATTENTION = _check_flex_attention()
+
+
 
 
 @dataclass
@@ -78,6 +102,8 @@ class ExpanderConfig:
 class ExpConfig:
     run_name: str = "HierarchicalAE_Default"
     project_name: str = "TemporalAutoencodedLanguageModelling"
+    device: str = DEVICE
+    flex_attention: bool = FLEX_ATTENTION
     num_levels: int = 1
     initial_vocab_size: int = 259
     compressor_level_configs: List[CompressorLevelConfig] = field(

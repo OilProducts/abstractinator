@@ -87,7 +87,7 @@ class MultiheadLatentAttention(nn.Module):
             q_comp_dim: int = 1536,  # d_c'
             retr_dim: int = 64,  # r
             score_mod: Optional[Callable] = None,  # Flex mask/bias callback
-            use_flex: bool = True,
+            use_flex_attention: bool = True,
     ):
         super().__init__()
         self.h = num_heads
@@ -118,7 +118,11 @@ class MultiheadLatentAttention(nn.Module):
         self._init_weights()
 
         self.score_mod = score_mod or (lambda s, *_: s)  # identity if none
-        self.use_flex = bool(use_flex and flex_attention)
+        self.use_flex_attention = use_flex_attention
+        if self.use_flex_attention:
+            self._attn = self._flex_attention
+        else:
+            self._attn = self._fallback_attention
 
     # ------------------------------------------------------------------ #
     def _init_weights(self):
@@ -214,9 +218,7 @@ class MultiheadLatentAttention(nn.Module):
         v_c = kv_c.unsqueeze(1).expand(-1, self.h, -1, -1)  # [B,H,L,d_c]
 
         # 5) attention
-        ctx_c = (self._flex_attention(q_r, k_r, v_c, block_mask=block_mask)
-                 if self.use_flex else
-                 self._fallback_attention(q_r, k_r, v_c, block_mask=block_mask))  # [B,H,d_c]
+        ctx_c = self._attn(q_r, k_r, v_c, block_mask=block_mask) # [B,H,d_c]
 
         # 6) compressed → latent
         ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv_T)  # [B,H,S,K]
