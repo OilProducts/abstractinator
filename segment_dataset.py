@@ -113,7 +113,7 @@ def main():
 
         print(f"Sample {idx}")
         for sid, text in segments:
-            print(f"  Segment {sid}: {text}")
+            print(f":{text}", end="")
         print()
 
 
