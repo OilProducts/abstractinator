@@ -48,19 +48,13 @@ class HierarchicalAutoencoder(nn.Module):
     def __init__(self,
                  num_levels: int,
                  compressor_level_configs: List[Dict[str, Any]],
+                 expander_level_configs: List[Dict[str, Any]],
                  initial_vocab_size: int = 259,
-                 expander_dim_scale: float = 1.0,
-                 expander_num_enc_layers: int = 4,
-                 expander_num_dec_layers: int = 4,
-                 expander_heads_scale: float = 1.0,
-                 expander_eos_id: int = 1,
-                 expander_max_len: int = 2048,
-                 use_decoder_only_expander: bool = False,
                  propagate_key_padding_mask: bool = True,
                  aux_lm_loss_weight: float = 0.1,
                  top_transformer_config: Optional[Dict[str, Any]] = None,
                  top_lm_loss_weight: float = 1.0,
-                 use_continuous_expander_inputs: bool = False,
+                 # use_continuous_expander_inputs: bool = False,
                  top_lm_mse_weight: float = 1.0,
                  top_lm_ce_weight: float = 1.0,
                  use_flex_attention: bool = True
@@ -160,6 +154,8 @@ class HierarchicalAutoencoder(nn.Module):
             self.top_transformer_continuous = True
 
         # ---- Configure Expander Stack ----
+        # TODO: for i in range(num_levels) over the expander_level_configs
+
         self.expanders = nn.ModuleList()
         for i in range(num_levels - 1, -1, -1):
             k_hi = self.actual_codebook_sizes[i]
