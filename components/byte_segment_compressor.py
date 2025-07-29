@@ -58,11 +58,13 @@ class ByteSegmentCompressor(nn.Module):
         vq_reset_interval: int = 250,
         entropy_delta: float = 0.2,
         entropy_abs_threshold: float | None = None,
+        use_flex_attention: bool = True,
     ):
         super().__init__()
         self.num_queries_per_segment = num_queries
         self.entropy_delta = entropy_delta
         self.entropy_abs_threshold = entropy_abs_threshold
+        self.use_flex_attention = use_flex_attention
 
         if lm_window is None:
             lm_window = window
@@ -90,7 +92,7 @@ class ByteSegmentCompressor(nn.Module):
                     q_comp_dim=q_comp_dim,
                     retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=torch.cuda.is_available(),
+                    use_flex_attention=self.use_flex_attention,
                 )
                 for _ in range(num_shared_encoder_layers)
             ]
@@ -107,7 +109,7 @@ class ByteSegmentCompressor(nn.Module):
                     q_comp_dim=q_comp_dim,
                     retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=torch.cuda.is_available(),
+                    use_flex_attention=self.use_flex_attention,
                 )
                 for _ in range(num_compression_encoder_layers)
             ]
@@ -124,7 +126,7 @@ class ByteSegmentCompressor(nn.Module):
                     q_comp_dim=q_comp_dim,
                     retr_dim=retr_dim,
                     ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=torch.cuda.is_available(),
+                    use_flex_attention=self.use_flex_attention,
                 )
                 for _ in range(num_lm_encoder_layers)
             ]
