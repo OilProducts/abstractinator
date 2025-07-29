@@ -471,7 +471,7 @@ class CausalMLA(nn.Module):
         Returns a `block_mask` suitable for the current back‑end
         (FlexAttention vs. fallback) and already combined with `key_padding_mask`.
         """
-        if self.mla.use_flex:
+        if self.mla.use_flex_attention:
             block_mask = _cached_causal_mask(seq_len, device)
             if key_padding_mask is not None:
                 pad = key_padding_mask.to(torch.bool)
