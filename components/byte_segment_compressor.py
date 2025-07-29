@@ -9,7 +9,7 @@ from .sliding_window_attention import SlidingWindowTransformerBlock
 from .mla import SlidingWindowMLATransformerBlock
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask, get_tiled_queries, make_seg_mask_fn
 
-# @torch.compile
+@torch.compile(dynamic=True)
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
