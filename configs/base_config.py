@@ -8,8 +8,8 @@ import torch
 # Determine CPU count for data loading and processing
 N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least one worker
 
-# Determine the preferred device
 
+# Determine the preferred device
 def _check_device() -> str:
     """Return the preferred device for PyTorch operations."""
     if torch.cuda.is_available():
@@ -19,6 +19,8 @@ def _check_device() -> str:
     else:
         return "cpu"
 
+
+# Check if flex_attention can run on the current system
 def _check_flex_attention() -> bool:
     """Return True if flex_attention can run on this system."""
     if not torch.cuda.is_available():
@@ -31,10 +33,42 @@ def _check_flex_attention() -> bool:
         return False
 
 
+# Select the default floating-point dtype based on device capabilities
+def _select_default_dtype() -> torch.dtype:
+    """
+    Choose the best‑supported floating‑point dtype for the current device.
+
+    Order of preference
+    -------------------
+    1. bfloat16  – fastest on Ampere/Hopper GPUs that expose BF16 kernels.
+    2. float16   – good fallback on other CUDA or MPS devices.
+    3. float32   – always safe (CPU or any device without *any* reduced‑precision support).
+    """
+    # CUDA path
+    if torch.cuda.is_available():
+        # PyTorch ≥1.12 ships `torch.cuda.is_bf16_supported`; fall back to
+        # capability sniffing if the symbol is missing (older builds).
+        if getattr(torch.cuda, "is_bf16_supported", None):
+            if torch.cuda.is_bf16_supported():  # A100, H100, etc.
+                return torch.bfloat16
+        else:
+            major, _ = torch.cuda.get_device_capability()
+            if major >= 8:  # sm80+ very likely BF16
+                return torch.bfloat16
+        return torch.float16  # any other CUDA card
+
+    # Apple Silicon / Metal backend
+    if torch.backends.mps.is_available():
+        return torch.float16
+
+    # Pure CPU
+    return torch.float32
+
+
 DEVICE = _check_device()
 FLEX_ATTENTION = _check_flex_attention()
-
-
+DEFAULT_DTYPE = _select_default_dtype()
+torch.set_default_dtype(DEFAULT_DTYPE)
 
 
 @dataclass
@@ -42,10 +76,10 @@ class CompressorLevelConfig:
     dim: int = 128
     heads: int = 8
     window: int = 64
-    head_dim: Optional[int] = 16 # K
-    kv_comp_dim: Optional[int] = 32 # d_c
-    q_comp_dim: Optional[int] = 48 # d_c`
-    retr_dim: Optional[int] = 32 # r
+    head_dim: Optional[int] = 16  # K
+    kv_comp_dim: Optional[int] = 32  # d_c
+    q_comp_dim: Optional[int] = 48  # d_c`
+    retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 64
     compression_window: Optional[int] = 8
     num_encoder_layers: int = 0
@@ -78,11 +112,11 @@ class TopTransformerConfig:
     ffn_dim_multiplier: int = 4
     continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
-    ce_weight: float = 1.0   # Weight for the cross-entropy component of the top LM loss
-    head_dim: Optional[int] = 32 # K
-    kv_comp_dim: Optional[int] = 64 # d_c
-    q_comp_dim: Optional[int] = 96 # d_c`
-    retr_dim: Optional[int] = 32 # r
+    ce_weight: float = 1.0  # Weight for the cross-entropy component of the top LM loss
+    head_dim: Optional[int] = 32  # K
+    kv_comp_dim: Optional[int] = 64  # d_c
+    q_comp_dim: Optional[int] = 96  # d_c`
+    retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 128
 
 
