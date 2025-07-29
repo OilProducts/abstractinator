@@ -100,13 +100,8 @@ class MultiheadLatentAttention(nn.Module):
         self.q_proj = nn.Linear(dim_q, self.h * self.k, bias=False)
 
         # absorbed projections to compressed spaces
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.w_kc_q = nn.Parameter(torch.empty(self.h, self.k, self.d_cq, device=device))  # K→d_c'
-        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c, device=device))  # K→d_c
-
-        self.register_buffer(
-            "w_kc_kv_T", self.w_kc_kv.transpose(1, 2), persistent=False
-        )
+        self.w_kc_q = nn.Parameter(torch.empty(self.h, self.k, self.d_cq))  # K→d_c'
+        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c))  # K→d_c
 
         # retrieval adapters
         self.W_qr = nn.Parameter(torch.empty(self.h, self.d_cq, self.r))
@@ -151,7 +146,7 @@ class MultiheadLatentAttention(nn.Module):
 
     def _fallback_attention(
             self,
-            q_r: torch.Tensor,  # [B, H, 1, r]
+            q_r: torch.Tensor,  # [B, H, S, r]
             k_r: torch.Tensor,  # [B, H, L, r]
             v_c: torch.Tensor,  # [B, H, L, d_c]
             *,
@@ -165,12 +160,8 @@ class MultiheadLatentAttention(nn.Module):
         ctx_c : torch.Tensor, shape [B, H, d_c]
             Per‑head context vectors in compressed space.
         """
-        # -- 1. scores ----------------------------------------------------------
-        q = q_r
-        #   transpose for classic (Q @ Kᵀ) formulation → [B, H, r, L]
-        k = k_r.transpose(-1, -2)
-
-        scores = torch.matmul(q, k)
+        # q_r: [B,H,S,r]   k_r: [B,H,L,r]  →  scores: [B,H,S,L]
+        scores = torch.matmul(q_r, k_r.transpose(-2, -1))  # [B, H, S, L]
 
         # -- 2. user‑supplied bias / mask operates on raw logits ---------------
         scores = self.score_mod(scores)
@@ -185,15 +176,15 @@ class MultiheadLatentAttention(nn.Module):
                 scores = scores.masked_fill(keep, -float('inf'))
                 mask = mask | keep
             else:
-                scores = scores.masked_fill(block_mask, float('inf'))
+                scores = scores.masked_fill(block_mask, -float(
+                    'inf'))
                 mask = mask | block_mask
 
-
         # -- 3. softmax & value aggregation ------------------------------------
-        attn = safe_softmax(scores, mask, dim=-1)  # [B, H, L]
+        attn = safe_softmax(scores, mask, dim=-1)  # [B, H, S, L]
 
-        # fused gemm: (B·H)×L @ L×d_c  →  (B·H)×d_c
-        return torch.matmul(attn, v_c)  # [B, H, d_c]
+        # fused gemm: (B·H·S)×L @ L×d_c  →  (B·H·S)×d_c
+        return torch.matmul(attn, v_c)  # [B, H, S, d_c]
 
     def forward(self, hidden_q: torch.Tensor, kv_c: torch.Tensor, block_mask=None) -> torch.Tensor:
         B, S, _ = hidden_q.shape
@@ -206,9 +197,11 @@ class MultiheadLatentAttention(nn.Module):
         # 2) big compressed view (only one needed now)
         q_big = torch.einsum('bshk,hkq->bshq', q_hk, self.w_kc_q)  # [B,S,H,d_c′]
 
-        # 3) rotary on KV only
-        sin, cos = _RoPECache.get(L, self.d_c, dev, dt)
-        kv_c = _apply_rope(kv_c, sin[None], cos[None])  # [B,L,d_c]
+        sin_q, cos_q = _RoPECache.get(S, self.d_cq, dev, dt)  # [S, d_c′]
+        q_big = _apply_rope(q_big, sin_q[None, :, None, :], cos_q[None, :, None, :])  # [1,S,1,d_c′]
+
+        sin_k, cos_k = _RoPECache.get(L, self.d_c, dev, dt)
+        kv_c = _apply_rope(kv_c, sin_k[None], cos_k[None])  # [B,L,d_c]
 
         # 4) retrieval space
         q_r = torch.einsum('bshq,hqr->bshr', q_big, self.W_qr)  # [B,S,H,r]
@@ -218,10 +211,10 @@ class MultiheadLatentAttention(nn.Module):
         v_c = kv_c.unsqueeze(1).expand(-1, self.h, -1, -1)  # [B,H,L,d_c]
 
         # 5) attention
-        ctx_c = self._attn(q_r, k_r, v_c, block_mask=block_mask) # [B,H,d_c]
+        ctx_c = self._attn(q_r, k_r, v_c, block_mask=block_mask)  # [B,H,d_c]
 
         # 6) compressed → latent
-        ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv_T)  # [B,H,S,K]
+        ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv.transpose(1,2))  # [B,H,S,K]
         ctx_lat = ctx_lat.permute(0, 2, 1, 3).reshape(B, S, -1)  # [B,S,H*K]
 
         # 7) output
@@ -243,6 +236,15 @@ def _cached_sliding_mask(seq_len, window, device):
     )
 
 
+def _keep_fn(window: int):
+    """
+    Returns the canonical predicate `keep(b, h, q, k) -> bool`
+    that *allows* keys `k` no more than `window` steps behind `q`,
+    never looking into the future.
+    """
+    return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
+
+
 class SlidingWindowMLA(nn.Module):
     """
     Wraps MultiheadLatentAttention and supplies a cached sliding block mask.
@@ -255,6 +257,56 @@ class SlidingWindowMLA(nn.Module):
         self.kv_proj = nn.Linear(mla_kwargs.get("dim_q"), self.mla.d_c, bias=False)
         self.o_proj = nn.Linear(mla_kwargs.get("dim_q"), mla_kwargs.get("dim_q"), bias=False)
 
+    def build_sliding_masks(
+            self,
+            seq_len: int,
+            window: int,
+            pad: Optional[torch.Tensor],
+            use_flex: bool,
+            device: torch.device,
+            block_size: int = 128,
+    ) -> Tuple[Optional[Callable], Optional[torch.Tensor]]:
+        """
+        Returns `(flex_mask, dense_mask)` – exactly one is not‑None, keyed off
+        `use_flex`.  The logical rule is:
+
+            keep  ⇔  k ≤ q  and  (q − k) ≤ window  and  (not padding)
+
+        * `flex_mask`  – a BlockMask object accepted by FlexAttention
+                         (True → keep / compute)
+        * `dense_mask` – bool tensor broadcastable to [B,H,S,S]
+                         (True → mask‑out / set −∞)
+        """
+
+        # --------------------------------------------------------------------- #
+        def _keep_time(_b, _h, q, k):
+            return (k <= q) & ((q - k) <= window)
+
+        if use_flex:
+            keep = _keep_time if pad is None else and_masks(
+                _keep_time, lambda b, h, q, k: ~(pad[b, k])
+            )
+            flex_mask = create_block_mask(
+                keep,
+                B=None if pad is None else pad.size(0),
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                BLOCK_SIZE=block_size,
+                device=device,
+            )
+            return flex_mask, None
+
+        # ---------- dense mask path (fallback) --------------------------------
+        q_idx = torch.arange(seq_len, device=device)[:, None]
+        k_idx = torch.arange(seq_len, device=device)[None, :]
+
+        dense = (k_idx > q_idx) | (k_idx < q_idx - window)  # outside window
+        dense = dense.unsqueeze(0).unsqueeze(0)  # [1,1,S,S]
+        if pad is not None:
+            dense = dense | pad[:, None, None, :]
+        return None, dense
+
     def forward(self, x, key_padding_mask: Optional[torch.Tensor] = None):
         B, S, _ = x.shape
         dev = x.device
@@ -263,45 +315,17 @@ class SlidingWindowMLA(nn.Module):
         if key_padding_mask is not None:
             kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.)
 
-        block_mask = None
-        # If we are NOT using flex_attention, we must create a simple boolean mask tensor.
-        if not self.mla.use_flex:
-            # Create a standard [S, S] sliding window mask.
-            q_indices = torch.arange(S, device=dev)[:, None]
-            k_indices = torch.arange(S, device=dev)[None, :]
+        flex_mask, dense_mask = self.build_sliding_masks(
+            seq_len=S,
+            window=self.window,
+            pad=key_padding_mask.to(torch.bool) if key_padding_mask is not None else None,
+            use_flex=self.mla.use_flex_attention,
+            device=dev,
+        )
+        block_mask = flex_mask if flex_mask is not None else dense_mask
 
-            # True for positions within the causal sliding window
-            window_mask = (k_indices >= q_indices - self.window) & (k_indices <= q_indices)
-
-            # The `masked_fill` function in fallback attention expects True for positions to MASK.
-            # So, we invert the window mask.
-            block_mask = ~window_mask
-            block_mask = block_mask.unsqueeze(0).unsqueeze(0)  # Shape: [1, 1, S, S]
-
-            # Also incorporate the key_padding_mask if it exists
-            if key_padding_mask is not None:
-                # key_padding_mask is True for padding. Shape [B, S].
-                # Reshape to [B, 1, 1, S] to broadcast with scores and window mask.
-                padding_mask_expanded = key_padding_mask.unsqueeze(1).unsqueeze(2)
-                # Combine masks. A position is masked if it's outside the window OR it's a pad token.
-                block_mask = block_mask | padding_mask_expanded
-        else:
-            block_mask = _cached_sliding_mask(S, self.window, dev)
-            if key_padding_mask is not None:
-                pad = key_padding_mask.to(torch.bool)
-
-                def _keep(b, h, q, k): return ~pad[b, k]
-
-                block_mask = create_block_mask(
-                    and_masks(block_mask.mask_mod, _keep),
-                    B=pad.size(0), H=None,
-                    Q_LEN=S, KV_LEN=S,
-                    BLOCK_SIZE=block_mask.BLOCK_SIZE,
-                    device=dev
-                )
-
-        ctx = self.mla(x, kv_c, block_mask=block_mask)  # single MLA call
-        return self.o_proj(ctx)
+        ctx = self.mla(x, kv_c, block_mask=block_mask)  # [B,S,D]
+        return ctx
 
 
 @torch.compile
@@ -362,7 +386,7 @@ class SlidingWindowMLATransformerBlock(nn.Module):
             kv_comp_dim=kv_comp_dim,
             q_comp_dim=q_comp_dim,
             retr_dim=retr_dim,
-            use_flex=use_flex_attention,
+            use_flex_attention=use_flex_attention,
         )
 
         # Feed‑forward sub‑layer
@@ -541,7 +565,7 @@ class CausalMLATransformerBlock(nn.Module):
             kv_comp_dim=kv_comp_dim,
             q_comp_dim=q_comp_dim,
             retr_dim=retr_dim,
-            use_flex=use_flex_attention,
+            use_flex_attention=use_flex_attention,
         )
 
         # Feed‑forward sub‑layer ----------------------------------------------
