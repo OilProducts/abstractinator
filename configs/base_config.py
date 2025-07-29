@@ -143,7 +143,7 @@ class ExpConfig:
     compressor_level_configs: List[CompressorLevelConfig] = field(
         default_factory=lambda: [CompressorLevelConfig()]
     )
-    expander: ExpanderConfig = field(default_factory=ExpanderConfig)
+    expander_level_configs: List[ExpanderConfig] = field(default_factory=lambda: [ExpanderConfig()])
     aux_lm_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
     top_lm_mse_weight: float = 1.0
