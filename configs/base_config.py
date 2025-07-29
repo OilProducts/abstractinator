@@ -39,15 +39,15 @@ FLEX_ATTENTION = _check_flex_attention()
 
 @dataclass
 class CompressorLevelConfig:
-    dim: int = 512
-    heads: int = 32
-    window: int = 128
+    dim: int = 128
+    heads: int = 8
+    window: int = 64
     head_dim: Optional[int] = 16 # K
-    kv_comp_dim: Optional[int] = 64 # d_c
-    q_comp_dim: Optional[int] = 96 # d_c`
-    retr_dim: Optional[int] = 64 # r
-    lm_window: Optional[int] = 512
-    compression_window: Optional[int] = 16
+    kv_comp_dim: Optional[int] = 32 # d_c
+    q_comp_dim: Optional[int] = 48 # d_c`
+    retr_dim: Optional[int] = 32 # r
+    lm_window: Optional[int] = 64
+    compression_window: Optional[int] = 8
     num_encoder_layers: int = 0
     num_shared_encoder_layers: int = 0
     num_lm_encoder_layers: Optional[int] = 14
@@ -71,8 +71,8 @@ class CompressorLevelConfig:
 
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 256
-    dim: int = 512
+    embed_dim: int = 128
+    dim: int = 256
     num_layers: int = 24
     num_heads: int = 16
     ffn_dim_multiplier: int = 4
@@ -82,7 +82,7 @@ class TopTransformerConfig:
     head_dim: Optional[int] = 32 # K
     kv_comp_dim: Optional[int] = 64 # d_c
     q_comp_dim: Optional[int] = 96 # d_c`
-    retr_dim: Optional[int] = 64 # r
+    retr_dim: Optional[int] = 32 # r
     lm_window: Optional[int] = 128
 
 
@@ -119,13 +119,13 @@ class ExpConfig:
     )
     propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
-    batch_size: int = 4
-    sequence_length: int = 4096
+    batch_size: int = 32
+    sequence_length: int = 1024
     num_epochs: int = 1
     max_steps: Optional[int] = None
     log_interval: int = 1
     gradient_clip_norm: float = 1.0
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 4
     scheduler_type: str = "cosine_with_min_lr"
     warmup_steps: int = 1000
     scheduler_specific_kwargs: Dict[str, Any] = field(
