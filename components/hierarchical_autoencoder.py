@@ -25,15 +25,9 @@ class HierarchicalAutoencoder(nn.Module):
         compressor_level_configs: Configuration dictionary for each
             ``ByteSegmentCompressor``.
         initial_vocab_size: Vocabulary size of the raw byte tokens.
-        expander_dim_scale: Multiplier applied to compressor dims when creating
-            expanders.
-        expander_num_enc_layers: Number of layers in each expander encoder.
-        expander_num_dec_layers: Number of layers in each expander decoder.
-        expander_heads_scale: Multiplier for attention heads in expanders.
-        expander_eos_id: Token used as EOS/BOS for expanders.
-        expander_max_len: Maximum length an expander may generate.
-        use_decoder_only_expander: If ``True`` use :class:`DecoderOnlyExpander`
-            instead of the default :class:`CodeExpander`.
+        expander_level_configs: Configuration dictionary for each
+            ``CodeExpander`` or ``DecoderOnlyExpander``. The list should be in
+            order from bottom (closest to the bytes) to top.
         propagate_key_padding_mask: Whether to propagate padding masks between
             levels.
         aux_lm_loss_weight: Weight of auxiliary language-modeling losses on
@@ -54,7 +48,6 @@ class HierarchicalAutoencoder(nn.Module):
                  aux_lm_loss_weight: float = 0.1,
                  top_transformer_config: Optional[Dict[str, Any]] = None,
                  top_lm_loss_weight: float = 1.0,
-                 # use_continuous_expander_inputs: bool = False,
                  top_lm_mse_weight: float = 1.0,
                  top_lm_ce_weight: float = 1.0,
                  use_flex_attention: bool = True
@@ -68,16 +61,13 @@ class HierarchicalAutoencoder(nn.Module):
 
         self.num_levels = num_levels
         self.initial_vocab_size = initial_vocab_size
-        self.expander_eos_id = expander_eos_id  # Used as BOS in CodeExpander
         self.propagate_key_padding_mask = propagate_key_padding_mask
         self.aux_lm_loss_weight = aux_lm_loss_weight  # Weight for auxiliary LM loss
-        self.use_decoder_only_expander = use_decoder_only_expander
 
         self.top_transformer_config = top_transformer_config
         self.top_lm_loss_weight = top_lm_loss_weight
         self.top_lm_mse_weight = top_lm_mse_weight
         self.top_lm_ce_weight = top_lm_ce_weight
-        self.use_continuous_expander_inputs = use_continuous_expander_inputs
         self.use_flex_attention = use_flex_attention
 
         self.target_compression_ratios: List[Optional[float]] = []
@@ -154,37 +144,50 @@ class HierarchicalAutoencoder(nn.Module):
             self.top_transformer_continuous = True
 
         # ---- Configure Expander Stack ----
-        # TODO: for i in range(num_levels) over the expander_level_configs
+        if len(expander_level_configs) != num_levels:
+            raise ValueError("Length of expander_level_configs must match num_levels.")
+
+        self.use_continuous_expander_inputs = any(
+            cfg.get("use_continuous_inputs", False) for cfg in expander_level_configs
+        )
+        self.expander_eos_id = expander_level_configs[-1].get("eos_id", 1)
 
         self.expanders = nn.ModuleList()
         for i in range(num_levels - 1, -1, -1):
-            k_hi = self.actual_codebook_sizes[i]
-            base_comp_config = compressor_level_configs[i]
-            k_lo = self.initial_vocab_size if i == 0 else self.actual_codebook_sizes[i - 1]
-            exp_dim = int(base_comp_config['dim'] * expander_dim_scale)
-            exp_heads = max(1, int(base_comp_config['heads'] * expander_heads_scale))
+            comp_cfg = compressor_level_configs[i]
+            exp_cfg = expander_level_configs[i]
 
-            if self.use_decoder_only_expander:
+            k_hi = self.actual_codebook_sizes[i]
+            k_lo = self.initial_vocab_size if i == 0 else self.actual_codebook_sizes[i - 1]
+
+            exp_dim = int(comp_cfg["dim"] * exp_cfg.get("dim_scale", 1.0))
+            exp_heads = max(1, int(comp_cfg["heads"] * exp_cfg.get("heads_scale", 1.0)))
+            n_enc = exp_cfg.get("num_enc_layers", 1)
+            n_dec = exp_cfg.get("num_dec_layers", 1)
+            eos_id = exp_cfg.get("eos_id", 1)
+            max_len = exp_cfg.get("max_len", 2048)
+
+            if exp_cfg.get("use_decoder_only", True):
                 expander = DecoderOnlyExpander(
                     K_hi=k_hi,
                     K_lo=k_lo,
                     D=exp_dim,
-                    N_dec=expander_num_dec_layers,
+                    N_dec=n_dec,
                     H=exp_heads,
-                    cross_window=base_comp_config.get('compression_window', base_comp_config.get('window', 128)),
-                    eos_id=expander_eos_id,
-                    max_len=expander_max_len,
+                    cross_window=comp_cfg.get("compression_window", comp_cfg.get("window", 128)),
+                    eos_id=eos_id,
+                    max_len=max_len,
                 )
             else:
                 expander = CodeExpander(
                     K_hi=k_hi,
                     K_lo=k_lo,
                     D=exp_dim,
-                    N_enc=expander_num_enc_layers,
-                    N_dec=expander_num_dec_layers,
+                    N_enc=n_enc,
+                    N_dec=n_dec,
                     H=exp_heads,
-                    eos_id=expander_eos_id,
-                    max_len=expander_max_len,
+                    eos_id=eos_id,
+                    max_len=max_len,
                 )
             self.expanders.append(expander)
 
