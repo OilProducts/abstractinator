@@ -16,21 +16,25 @@ def build_model():
             "beta": 0.25,
         }
     ]
+    exp_cfg = [{
+        "dim_scale": 1.0,
+        "num_enc_layers": 1,
+        "num_dec_layers": 1,
+        "heads_scale": 1.0,
+        "eos_id": 1,
+        "max_len": 8,
+        "use_decoder_only": True,
+        "use_continuous_inputs": True,
+    }]
     model = HierarchicalAutoencoder(
         num_levels=1,
         compressor_level_configs=comp_cfg,
+        expander_level_configs=exp_cfg,
         initial_vocab_size=259,
-        expander_dim_scale=1.0,
-        expander_num_enc_layers=1,
-        expander_num_dec_layers=1,
-        expander_heads_scale=1.0,
-        expander_eos_id=1,
-        expander_max_len=8,
         propagate_key_padding_mask=True,
         aux_lm_loss_weight=0.0,
         top_transformer_config=None,
         top_lm_loss_weight=0.0,
-        use_continuous_expander_inputs=True,
     )
     return model
 
