@@ -509,7 +509,7 @@ def train_loop(
                         [
                             f"Tok/s {short_num(avg_tok_s)}",
                             f"Bytes {short_num(total_bytes_processed)}",
-                            f"ETAt {format_duration(total_eta_sec)}",
+                            f"ETA {format_duration(total_eta_sec)}",
                         ]
                     )
 
