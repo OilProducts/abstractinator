@@ -220,29 +220,15 @@ class MultiheadLatentAttention(nn.Module):
         # 7) output
         return self.out_proj(ctx_lat)  # [B,D]
 
+def _build_time_keep_fn(window: int):
+    return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
 
 @lru_cache(maxsize=64)
-def _cached_sliding_mask(seq_len, window, device):
-    def mask_mod(b, h, q, k):
-        #  k can’t be before q and must be within the look‑back window
-        return (k <= q) & ((q - k) <= window)  # all terms non‑negative
-
-    return create_block_mask(
-        mask_mod,
-        B=None, H=None,
-        Q_LEN=seq_len, KV_LEN=seq_len,
-        BLOCK_SIZE=128,
-        device=device,
-    )
-
-
-def _keep_fn(window: int):
-    """
-    Returns the canonical predicate `keep(b, h, q, k) -> bool`
-    that *allows* keys `k` no more than `window` steps behind `q`,
-    never looking into the future.
-    """
-    return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
+def _cached_flex_sliding_mask(seq_len: int, window: int, device):
+    keep = _build_time_keep_fn(window)
+    return create_block_mask(keep, B=None, H=None,
+                             Q_LEN=seq_len, KV_LEN=seq_len,
+                             BLOCK_SIZE=128, device=device)
 
 
 class SlidingWindowMLA(nn.Module):
@@ -279,12 +265,11 @@ class SlidingWindowMLA(nn.Module):
         """
 
         # --------------------------------------------------------------------- #
-        def _keep_time(_b, _h, q, k):
-            return (k <= q) & ((q - k) <= window)
+        keep_time = _build_time_keep_fn(window)
 
         if use_flex:
-            keep = _keep_time if pad is None else and_masks(
-                _keep_time, lambda b, h, q, k: ~(pad[b, k])
+            keep = keep_time if pad is None else and_masks(
+                keep_time, lambda b, h, _q, k: ~(pad[b, k])
             )
             flex_mask = create_block_mask(
                 keep,

@@ -219,31 +219,78 @@ def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
 # ---------------------------------------------------------------------
 #  Very small LRU for tiled‑query caching
 # ---------------------------------------------------------------------
-@functools.lru_cache(maxsize=32)
-def _cached_tiled_queries(L: int, D: int, S_hat: int, device: torch.device):
-    """
-    Returns tensor (Ŝ·L, D)  _without_ batch dimension.
-    """
-    base = torch.empty((L, D), device=device)   # placeholder; caller will .copy_()
-    return base.repeat_interleave(S_hat, 0)     # (Ŝ·L, D)
+# @functools.lru_cache(maxsize=32)
+# def _cached_tiled_queries(L: int, D: int, S_hat: int, device: torch.device):
+#     """
+#     Returns tensor (Ŝ·L, D)  _without_ batch dimension.
+#     """
+#     base = torch.empty((L, D), device=device)   # placeholder; caller will .copy_()
+#     return base.repeat_interleave(S_hat, 0)     # (Ŝ·L, D)
 
+@functools.lru_cache(maxsize=32)
+def _cached_tiled_template(L: int,
+                           D: int,
+                           S_hat: int,
+                           device: torch.device,
+                           dtype: torch.dtype) -> torch.Tensor:
+    """
+    Returns an **UNINITIALISED** tensor of shape (Ŝ·L, D) *without* batch dim.
+    This buffer is *never* written to; it exists only to avoid
+    reallocating GPU memory every forward pass.
+    """
+    return torch.empty((S_hat * L, D), device=device, dtype=dtype)
 
 def get_tiled_queries(base_queries: torch.Tensor,
                       B: int,
                       S_hat: int) -> torch.Tensor:
     """
-    base_queries : (L,D)  learnable parameter
-    Returns      : (B, Ŝ·L, D)  ready for attention
+    Parameters
+    ----------
+    base_queries : Tensor, shape (L, D)
+        Learnable parameter that changes every optimiser step.
+    B           : int
+        Current batch size.
+    S_hat       : int
+        Number of *segments per query* (how many times to repeat each row).
+
+    Returns
+    -------
+    Tensor, shape (B, Ŝ·L, D), contiguous
+        Ready to be fed into attention.
     """
     L, D = base_queries.shape
-    device = base_queries.device
+    dev, dt = base_queries.device, base_queries.dtype
 
-    tiled = _cached_tiled_queries(L, D, S_hat, device)  # (Ŝ·L, D)
-    # copy learnable contents (one kernel, much cheaper than allocate)
-    # tiled = base_queries.repeat_interleave(S_hat, 0)  # (Ŝ·L, D)
+    # ---- 1. Grab **template** buffer from the cache ------------------------
+    template = _cached_tiled_template(L, D, S_hat, dev, dt)
 
+    # ---- 2. Clone it → fresh storage (fast; no data copy yet) -------------
+    tiled = template.clone()                        # (Ŝ·L, D), version = 0
+
+    # ---- 3. Fill with the current parameter values ------------------------
     tiled.copy_(base_queries.repeat_interleave(S_hat, 0))
+
+    # ---- 4. Add batch dim and broadcast -----------------------------------
     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
+
+
+
+# def get_tiled_queries(base_queries: torch.Tensor,
+#                       B: int,
+#                       S_hat: int) -> torch.Tensor:
+#     """
+#     base_queries : (L,D)  learnable parameter
+#     Returns      : (B, Ŝ·L, D)  ready for attention
+#     """
+#     L, D = base_queries.shape
+#     device = base_queries.device
+#
+#     tiled = _cached_tiled_queries(L, D, S_hat, device).detach()  # (Ŝ·L, D)
+#     # copy learnable contents (one kernel, much cheaper than allocate)
+#     # tiled = base_queries.repeat_interleave(S_hat, 0)  # (Ŝ·L, D)
+#
+#     tiled.copy_(base_queries.repeat_interleave(S_hat, 0))
+#     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
 
 
 
