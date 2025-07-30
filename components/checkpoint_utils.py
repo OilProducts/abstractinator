@@ -75,8 +75,24 @@ def load_base_components(
             if k.startswith("expanders.")
         }
 
-    model.compressors.load_state_dict(compressors_sd, strict=False)
-    model.expanders.load_state_dict(expanders_sd, strict=False)
+    # Load compressors starting from the bottom level.  The saved checkpoint may
+    # contain fewer levels than ``model`` when fine‑tuning a larger hierarchy.
+    def _split_by_module(sd: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        modules: dict[int, dict[str, torch.Tensor]] = {}
+        for k, v in sd.items():
+            idx_str, subkey = k.split(".", 1)
+            modules.setdefault(int(idx_str), {})[subkey] = v
+        return [modules[i] for i in sorted(modules)]
+
+    loaded_comp = _split_by_module(compressors_sd)
+    for src, dst in zip(loaded_comp, model.compressors):
+        dst.load_state_dict(src, strict=False)
+
+    loaded_exp = _split_by_module(expanders_sd)
+    offset = len(model.expanders) - len(loaded_exp)
+    for i, src in enumerate(loaded_exp):
+        dst = model.expanders[offset + i]
+        dst.load_state_dict(src, strict=False)
 
     if freeze:
         model.compressors.requires_grad_(False)
