@@ -55,7 +55,10 @@ class VectorQuantizer(nn.Module):
             # Buffer settings
             self.replacement_buffer_size = replacement_buffer_size
             self.vectors_per_step_to_buffer = vectors_per_step_to_buffer
-            self.register_buffer("replacement_buffer", torch.empty(replacement_buffer_size, D))
+            self.register_buffer(
+                "replacement_buffer",
+                torch.empty(replacement_buffer_size, D).zero_(),
+            )
             self.register_buffer("buffer_idx", torch.tensor(0, dtype=torch.long))
             self.register_buffer("buffer_is_full", torch.tensor(False, dtype=torch.bool))
 
