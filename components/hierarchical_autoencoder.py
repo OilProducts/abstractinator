@@ -416,43 +416,93 @@ class HierarchicalAutoencoder(nn.Module):
     # Helper utilities for the training forward pass
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
-                    kpm: Optional[torch.Tensor], eop_id: int
-                    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Insert ``eop_id`` after positions indicated by ``end_mask``."""
+    # @staticmethod
+    # def _insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
+    #                 kpm: Optional[torch.Tensor], eop_id: int
+    #                 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    #     """Insert ``eop_id`` after positions indicated by ``end_mask``."""
+    #
+    #     B, S = seq.shape
+    #     if S == 0:
+    #         lengths = end_mask.sum(dim=1)
+    #         max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+    #         out = seq.new_full((B, max_len), eop_id)
+    #         out_kpm = None if kpm is None else torch.ones((B, max_len),
+    #                                                       dtype=torch.bool,
+    #                                                       device=seq.device)
+    #         return out, out_kpm
+    #
+    #     end_mask_i = end_mask.to(torch.long)
+    #     end_cumsum = torch.cumsum(end_mask, dim=1)
+    #     lengths = S + end_cumsum[:, -1]
+    #     max_len = int(lengths.max().item())
+    #
+    #     out = seq.new_full((B, max_len), eop_id)
+    #     out_kpm = None
+    #     if kpm is not None:
+    #         out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
+    #
+    #     shift = end_cumsum - end_mask
+    #     token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
+    #     batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
+    #
+    #     out[batch_idx, token_pos] = seq
+    #     if out_kpm is not None:
+    #         out_kpm[batch_idx, token_pos] = kpm
+    #
+    #     eop_pos = token_pos + 1
+    #     mask = end_mask.bool()
+    #     if out_kpm is not None:
+    #         out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
+    #
+    #     return out, out_kpm
 
+    @staticmethod
+    def _insert_eop(
+            seq: torch.Tensor,
+            end_mask: torch.Tensor,
+            kpm: Optional[torch.Tensor],
+            eop_id: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        After every True in `end_mask` insert an EOP token (`eop_id`).
+
+        * seq ................ (B, S)  original codes
+        * end_mask ........... (B, S)  True at last query of each patch
+        * kpm ................ same shape, True = padding
+        """
         B, S = seq.shape
+
+        # ---------- handle empty seq edge-case ----------
         if S == 0:
-            lengths = end_mask.sum(dim=1)
-            max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+            max_len = int(end_mask.sum(dim=1).max().item()) if B > 0 else 0
             out = seq.new_full((B, max_len), eop_id)
-            out_kpm = None if kpm is None else torch.ones((B, max_len),
-                                                          dtype=torch.bool,
-                                                          device=seq.device)
+            out_kpm = None if kpm is None else torch.ones_like(out, dtype=torch.bool)
             return out, out_kpm
 
-        end_cumsum = torch.cumsum(end_mask, dim=1)
-        lengths = S + end_cumsum[:, -1]
+        # ---------- compute per-token shift ----------
+        mask_i = end_mask.to(torch.long)
+        end_cumsum = torch.cumsum(mask_i, dim=1)  # 0,1,2,...
+        shift = end_cumsum - mask_i  # keep token itself unshifted
+
+        # ---------- allocate output ----------
+        lengths = S + end_cumsum[:, -1]  # per-batch final length
         max_len = int(lengths.max().item())
-
         out = seq.new_full((B, max_len), eop_id)
-        out_kpm = None
-        if kpm is not None:
-            out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
 
-        shift = end_cumsum - end_mask
+        # ---------- scatter original tokens ----------
         token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
         batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
-
         out[batch_idx, token_pos] = seq
-        if out_kpm is not None:
-            out_kpm[batch_idx, token_pos] = kpm
 
-        eop_pos = token_pos + 1
-        mask = end_mask.bool()
-        if out_kpm is not None:
-            out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
+        # ---------- optional KPM ----------
+        out_kpm = None
+        if kpm is not None:
+            out_kpm = torch.ones_like(out, dtype=torch.bool)
+            out_kpm[batch_idx, token_pos] = kpm
+            # mark the inserted EOPs as non-padding
+            eop_pos = token_pos + 1
+            out_kpm[batch_idx.expand_as(end_mask)[end_mask], eop_pos[end_mask]] = False
 
         return out, out_kpm
 

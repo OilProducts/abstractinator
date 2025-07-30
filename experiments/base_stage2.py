@@ -7,6 +7,7 @@ exp_config: ExpConfig = deepcopy(_base_exp_config)
 
 exp_config.top_transformer_config = None
 exp_config.num_epochs = 2
+exp_config.num_levels = 2
 exp_config.compressor_level_configs.append(
     CompressorLevelConfig(
         dim=256,
