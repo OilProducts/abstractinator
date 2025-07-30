@@ -9,6 +9,7 @@ from .sliding_window_attention import SlidingWindowTransformerBlock
 from .mla import SlidingWindowMLATransformerBlock
 from .utils import token_entropy, entropy_segments, build_segment_queries_mask, get_tiled_queries, make_seg_mask_fn
 
+# If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
 @torch.compile(dynamic=True)
 class ByteSegmentCompressor(nn.Module):
     """
