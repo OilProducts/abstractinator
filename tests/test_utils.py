@@ -78,6 +78,16 @@ def test_entropy_segments_edge_cases():
     seg2 = entropy_segments(ent2)
     assert seg2.shape == ent2.shape
 
+    # Single token with boundary requested
+    seg1_b, mask1_b = entropy_segments(ent1, return_boundary=True)
+    assert torch.equal(seg1_b, torch.zeros_like(ent1, dtype=torch.long))
+    assert torch.equal(mask1_b, torch.ones_like(ent1, dtype=torch.bool))
+
+    # Empty sequence with boundary requested
+    seg2_b, mask2_b = entropy_segments(ent2, return_boundary=True)
+    assert seg2_b.shape == ent2.shape
+    assert mask2_b.shape == ent2.shape
+
     # Wrong dims
     with pytest.raises(ValueError):
         entropy_segments(torch.tensor([1.0, 2.0, 3.0]))

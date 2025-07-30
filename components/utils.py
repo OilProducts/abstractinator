@@ -152,9 +152,15 @@ def entropy_segments(
     if ent.ndim != 2:
         raise ValueError(f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}")
     if ent.size(1) == 0:
-        return torch.empty_like(ent, dtype=torch.long) # Handle empty sequence case
+        seg_id = torch.empty_like(ent, dtype=torch.long)
+        if return_boundary:
+            return seg_id, torch.empty_like(ent, dtype=torch.bool)
+        return seg_id
     if ent.size(1) == 1:
-        return torch.zeros_like(ent, dtype=torch.long) # Single token sequence is segment 0
+        seg_id = torch.zeros_like(ent, dtype=torch.long) # Single token sequence is segment 0
+        if return_boundary:
+            return seg_id, torch.ones_like(ent, dtype=torch.bool)
+        return seg_id
 
     # Determine where entropy increases compared to the previous token.
     # ent[:, 1:] compares ent[t] with ent[t-1] for t from 1 to S-1.
