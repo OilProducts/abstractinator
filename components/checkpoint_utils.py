@@ -87,17 +87,22 @@ def load_base_components(
     loaded_comp = _split_by_module(compressors_sd)
     for src, dst in zip(loaded_comp, model.compressors):
         dst.load_state_dict(src, strict=False)
+    n_loaded_comp = len(loaded_comp)
 
     loaded_exp = _split_by_module(expanders_sd)
     offset = len(model.expanders) - len(loaded_exp)
+    loaded_exp_indices: list[int] = []
     for i, src in enumerate(loaded_exp):
         dst = model.expanders[offset + i]
         dst.load_state_dict(src, strict=False)
+        loaded_exp_indices.append(offset + i)
 
     if freeze:
-        model.compressors.requires_grad_(False)
-        model.expanders.requires_grad_(False)
-        model.compressors.eval()
-        model.expanders.eval()
+        for i in range(n_loaded_comp):
+            model.compressors[i].requires_grad_(False)
+            model.compressors[i].eval()
+        for idx in loaded_exp_indices:
+            model.expanders[idx].requires_grad_(False)
+            model.expanders[idx].eval()
 
     logger.info("Loaded base components from %s", path)
