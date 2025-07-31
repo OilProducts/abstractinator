@@ -31,6 +31,7 @@ class ByteLevelTokenizer:
         bos_id: int = 256,
         eos_id: int = 257,
         pad_id: int = 258,
+        eop_id: int = 259,
         add_bos: bool = True,
         add_eos: bool = True,
         expected_vocab_size: int | None = None,
@@ -38,6 +39,7 @@ class ByteLevelTokenizer:
         self.bos_id = bos_id
         self.eos_id = eos_id
         self.pad_id = pad_id
+        self.eop_id = eop_id
         self.add_bos = add_bos
         self.add_eos = add_eos
         # Ensure initial_vocab_size in configuration matches this if provided.
