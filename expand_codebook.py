@@ -54,7 +54,7 @@ def main():
     tokenizer = ByteLevelTokenizer(add_bos=True, add_eos=True, expected_vocab_size=exp_cfg.initial_vocab_size)
 
     model = build_model(exp_cfg, device)
-    state = torch.load(args.checkpoint, map_location=device)
+    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     sd = state.get("model_state", state)
     model.load_state_dict(sd, strict=False)
     model.eval()

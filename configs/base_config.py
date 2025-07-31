@@ -139,7 +139,7 @@ class ExpConfig:
     device: str = DEVICE
     flex_attention: bool = FLEX_ATTENTION
     num_levels: int = 1
-    initial_vocab_size: int = 259
+    initial_vocab_size: int = 260
     compressor_level_configs: List[CompressorLevelConfig] = field(
         default_factory=lambda: [CompressorLevelConfig()]
     )
