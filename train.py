@@ -515,13 +515,11 @@ def train_loop(
                     )
 
                     patch_log_parts = []
-                    for lvl in range(1, exp_config.num_levels - 1):
+                    for lvl in range(1, exp_config.num_levels):
+                        label = "Top" if lvl == exp_config.num_levels - 1 else f"L{lvl}"
                         patch_log_parts.append(
-                            f"L{lvl} {short_num(patches_per_second[lvl])}/s {short_num(total_patches_processed_per_level[lvl])}"
+                            f"{label} {short_num(patches_per_second[lvl])}/s {short_num(total_patches_processed_per_level[lvl])}"
                         )
-                    patch_log_parts.append(
-                        f"Top {short_num(patches_per_second[-1])}/s {short_num(total_patches_processed_per_level[-1])}"
-                    )
                     if patch_log_parts:
                         console_log_parts.append("Patches " + ", ".join(patch_log_parts))
 
@@ -534,6 +532,13 @@ def train_loop(
                             f"{p / steps_accumulated:.4f}" for p in accumulators["all_smoothed_perplexities"]
                         ])
                         console_log_parts.append(f"SmoothPPL [{ppl_str}]")
+
+                    for key, value in accumulators["reconstruction_loss_details"].items():
+                        console_log_parts.append(f"{key}:{value / steps_accumulated:.4f}")
+
+                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
+                        for key, value in accumulators["aux_lm_loss_details"].items():
+                            console_log_parts.append(f"{key}:{value / steps_accumulated:.4f}")
 
                     logger.info(" | ".join(console_log_parts))
 
@@ -548,6 +553,9 @@ def train_loop(
                             "loss/top_code_vq_avg_accum": accumulators["top_code_vq_loss"] / steps_accumulated,
                             "learning_rate": optimizer.param_groups[0]["lr"],
                         }
+                        for lvl in range(1, exp_config.num_levels):
+                            metrics_dict[f"performance/patches_per_sec_L{lvl}"] = patches_per_second[lvl]
+                            metrics_dict[f"performance/patches_total_L{lvl}"] = total_patches_processed_per_level[lvl]
                         for key, value in accumulators["top_code_lm_loss_details"].items():
                             metrics_dict[f"loss_detail_avg_accum/{key}"] = value / steps_accumulated
 
