@@ -7,7 +7,7 @@ from .learned_query_attention import LearnedQueryAttention
 from .vector_quantizer import VectorQuantizer
 from .sliding_window_attention import SlidingWindowTransformerBlock
 from .mla import SlidingWindowMLATransformerBlock
-from .utils import token_entropy, entropy_segments, build_segment_queries_mask, get_tiled_queries, make_seg_mask_fn
+from .utils import token_entropy, entropy_segments, build_segment_queries_mask
 
 # If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
 @torch.compile(dynamic=True)
@@ -213,24 +213,12 @@ class ByteSegmentCompressor(nn.Module):
         # Build queries and attention mask for segment-restricted pooling.
         # `self.pooler.query_template` are the L learned base queries (L,D).
         # `self.pooler.num_heads` is used for repeating the attention mask.
-        # queries, seg_attn_mask, valid_segments_mask = build_segment_queries_mask(
-        #     seg_id,
-        #     self.pooler.query_template,
-        #     self.pooler.num_heads
-        # )
 
-        # ── 2b. Build queries & callable mask (memory‑light) ─────────────
-        S_hat = (seg_id.amax(dim=1) + 1).amax()        # SymInt
-        queries = get_tiled_queries(self.pooler.query_template,
-                                    B=seg_id.size(0),
-                                    S_hat=int(S_hat))  # (B,Ŝ·L,D)
-        seg_mask_fn = make_seg_mask_fn(seg_id,
-                                       L=self.num_queries_per_segment)
-        # valid segments: (B,Ŝ) — identical logic, kept dense
-        valid_segments_mask = (
-            torch.arange(S_hat, device=seg_id.device)
-                 .unsqueeze(0)
-                 .lt((seg_id.amax(dim=1) + 1).unsqueeze(1))
+        # ── 2b. Build queries & tensor mask ─────────────
+        queries, seg_attn_mask, valid_segments_mask = build_segment_queries_mask(
+            seg_id,
+            self.pooler.query_template,
+            self.pooler.num_heads,
         )
         # queries: (B, S_hat*L, D) - Tiled learned queries for each potential segment.
         # seg_attn_mask: (B*H, S_hat*L, S_original) - Masks attention outside segments.
@@ -242,7 +230,7 @@ class ByteSegmentCompressor(nn.Module):
         pooled_embeddings, _ = self.pooler(
             x=hidden,                         # Keys and Values from encoder output (B,S,D)
             queries=queries,                  # Segment-specific queries (B, S_hat*L, D)
-            attn_mask=seg_mask_fn,          # Restricts attention within segments
+            attn_mask=seg_attn_mask,         # Restricts attention within segments
             key_padding_mask=key_padding_mask # Masks padded tokens in `hidden`
         ) # pooled_embeddings: (B, S_hat*L, D)
 
