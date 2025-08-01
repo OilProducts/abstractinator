@@ -44,7 +44,7 @@ class ByteLevelTokenizer:
         self.add_eos = add_eos
         # Ensure initial_vocab_size in configuration matches this if provided.
         # vocab_size here would be max(bos,eos,pad) + 1 = 259 for defaults.
-        self.vocab_size = max(bos_id, eos_id, pad_id) + 1
+        self.vocab_size = max(bos_id, eos_id, pad_id, eop_id) + 1
         if expected_vocab_size is not None and self.vocab_size != expected_vocab_size:
             logger.warning(
                 "Tokenizer vocab_size (%s) does not match expected value (%s).",
