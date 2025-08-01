@@ -277,5 +277,7 @@ class ByteSegmentCompressor(nn.Module):
             'current_codebook_perplexity': codebook_perplexity,
             'smoothed_codebook_perplexity': perplexity,
             'pre_vq_embeddings': pooled_embeddings,
+            'seg_id': seg_id,  # (B, S)  integers 0…Ŝ-1
+
         }
         return return_dict
