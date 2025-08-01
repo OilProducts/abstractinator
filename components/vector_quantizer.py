@@ -27,9 +27,9 @@ class VectorQuantizer(nn.Module):
                  max_codes_to_reset_pct: float = 0.1,
                  replacement_buffer_size: int = 65536,
                  vectors_per_step_to_buffer: int = 1024,  # Controls update overhead
-                 bos_token_id: int = 1,
-                 eos_token_id: int = 2,
-                 eop_token_id: int = 0):
+                 bos_token_id: int = 256,
+                 eos_token_id: int = 257,
+                 eop_token_id: int = 259):
         super().__init__()
         self.K = K
         self.D = D
