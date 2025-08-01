@@ -120,9 +120,10 @@ class DecoderBlock(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, key_padding_mask=memory_key_padding_mask)
+        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, attn_mask=cross_attn_mask, key_padding_mask=memory_key_padding_mask)
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -156,6 +157,7 @@ class SimpleDecoder(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -164,6 +166,7 @@ class SimpleDecoder(nn.Module):
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
+                cross_attn_mask=cross_attn_mask,
             )
         return self.final_norm(x)
 
@@ -171,7 +174,7 @@ class SimpleDecoder(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self, d_model: int, num_heads: int, cross_window: int):
+    def __init__(self, d_model: int, num_heads: int, cross_window: int, cross_attn_mask: Optional[torch.Tensor] = None):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
         self.self_attn = MultiHeadAttentionRoPE(d_model, num_heads, causal=True)
@@ -187,15 +190,16 @@ class SlidingDecoderBlock(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, key_padding_mask=memory_key_padding_mask)
+        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, key_padding_mask=memory_key_padding_mask, attn_mask=cross_attn_mask)
         x = x + self.ffn(self.norm3(x))
         return x
 
 
 class SlidingDecoder(nn.Module):
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, cross_attn_mask: Optional[torch.Tensor] = None):
         super().__init__()
         self.layers = nn.ModuleList([
             SlidingDecoderBlock(d_model, num_heads, cross_window) for _ in range(num_layers)
@@ -209,6 +213,7 @@ class SlidingDecoder(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -217,6 +222,7 @@ class SlidingDecoder(nn.Module):
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
+                cross_attn_mask=cross_attn_mask,
             )
         return self.final_norm(x)
 
@@ -337,13 +343,15 @@ class DecoderOnlyExpander(nn.Module):
         N_dec: int = 4,
         H: int = 8,
         cross_window: int = 128,
-        eos_id: int = 1,
+        eos_id: int = 257,
+        eop_id: int = 259,
         max_len: int = 2048,
     ) -> None:
         super().__init__()
         self.K_hi, self.K_lo = K_hi, K_lo
         self.D = D
         self.eos_id = eos_id
+        self.eop_id = eop_id
         self.max_len = max_len
 
         self.emb_hi = nn.Embedding(K_hi, D)
@@ -361,6 +369,7 @@ class DecoderOnlyExpander(nn.Module):
         codes_lo: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = codes_hi.device
         if codes_hi.is_floating_point():
@@ -381,6 +390,7 @@ class DecoderOnlyExpander(nn.Module):
             tgt_mask=tgt_mask,
             tgt_key_padding_mask=adjusted_tgt_kpm,
             memory_key_padding_mask=src_key_padding_mask,
+            cross_attn_mask=attn_mask,
         )
         logits = self.out_proj(dec_out)
         return {"logits": logits}
@@ -389,18 +399,21 @@ class DecoderOnlyExpander(nn.Module):
     def generate(
         self,
         codes_hi: torch.Tensor,
+        codes_lo: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         max_len: Optional[int] = None,
     ) -> torch.Tensor:
         device = codes_hi.device
         current_max_len = max_len if max_len is not None else self.max_len
-
+        current_max_len = 16
         if codes_hi.is_floating_point():
             memory = codes_hi
         else:
             memory = self.emb_hi(codes_hi)
 
-        generated_ids = torch.full((codes_hi.size(0), 1), self.eos_id, dtype=torch.long, device=device)
+        generated_ids = torch.empty((0,0), dtype=torch.long, device=device)
+        generated_ids = codes_lo
+        # generated_ids = torch.empty((codes_hi.size(0), 1), dtype=torch.long, device=device)
 
         for _ in range(current_max_len - 1):
             seq_len = generated_ids.size(1)
@@ -415,6 +428,7 @@ class DecoderOnlyExpander(nn.Module):
             next_logits = self.out_proj(dec_out[:, -1, :])
             next_id = next_logits.argmax(dim=-1, keepdim=True)
             generated_ids = torch.cat([generated_ids, next_id], dim=1)
-            if (next_id == self.eos_id).all():
+            if (next_id == self.eos_id) or (next_id == self.eop_id):
                 break
-        return generated_ids[:, 1:]
+
+        return generated_ids
