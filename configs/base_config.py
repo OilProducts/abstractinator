@@ -118,6 +118,7 @@ class TopTransformerConfig:
     q_comp_dim: Optional[int] = 96  # d_c`
     retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 128
+    pad_to_length: Optional[int] = None
 
 
 @dataclass

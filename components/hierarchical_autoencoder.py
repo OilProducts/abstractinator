@@ -119,6 +119,7 @@ class HierarchicalAutoencoder(nn.Module):
             self.top_transformer_continuous = cfg.get("continuous", True)
             self.top_lm_mse_weight = cfg.get("mse_weight", self.top_lm_mse_weight)
             self.top_lm_ce_weight = cfg.get("ce_weight", self.top_lm_ce_weight)
+            self.top_lm_pad_length = cfg.get("pad_to_length")
 
             self.code_sequence_transformer = CodeSequenceTransformer(
                 embed_dim=embed_dim,
@@ -142,6 +143,7 @@ class HierarchicalAutoencoder(nn.Module):
         else:
             self.code_sequence_transformer = None
             self.top_transformer_continuous = True
+            self.top_lm_pad_length = None
 
         # ---- Configure Expander Stack ----
         if len(expander_level_configs) != num_levels:
@@ -506,6 +508,44 @@ class HierarchicalAutoencoder(nn.Module):
 
         return out, out_kpm
 
+    def _prepare_top_lm_inputs(
+        self,
+        embeddings: torch.Tensor,
+        kpm: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Pad top LM inputs to ``self.top_lm_pad_length`` if set."""
+
+        if self.top_lm_pad_length is None:
+            return embeddings, kpm
+
+        B, S, D = embeddings.size()
+        target_len = self.top_lm_pad_length
+
+        if S > target_len:
+            logger.warning(
+                "top_lm_pad_length=%s smaller than sequence length %s; truncating",
+                target_len,
+                S,
+            )
+            embeddings = embeddings[:, :target_len, :]
+            if kpm is not None:
+                kpm = kpm[:, :target_len]
+            else:
+                kpm = None
+        elif S < target_len:
+            pad_size = target_len - S
+            pad = embeddings.new_zeros(B, pad_size, D)
+            embeddings = torch.cat([embeddings, pad], dim=1)
+
+            pad_mask = torch.ones(B, pad_size, dtype=torch.bool, device=embeddings.device)
+            if kpm is None:
+                kpm = embeddings.new_zeros(B, S, dtype=torch.bool)
+            elif kpm.size(1) < S:
+                kpm = F.pad(kpm, (0, S - kpm.size(1)), value=False)
+            kpm = torch.cat([kpm, pad_mask], dim=1)
+
+        return embeddings, kpm
+
     def _compute_compression_loss(
         self,
         compression_ratios: List[torch.Tensor],
@@ -539,8 +579,13 @@ class HierarchicalAutoencoder(nn.Module):
                 compression_results['all_pre_vq'][-1].numel() > 0):
             cont = compression_results['all_pre_vq'][-1]
             codes = compression_results['all_codes'][-1]
-            transformer_input = cont if self.top_transformer_continuous else F.embedding(
-                codes, self.compressors[-1].vq.codebook
+            transformer_input = (
+                cont
+                if self.top_transformer_continuous
+                else F.embedding(codes, self.compressors[-1].vq.codebook)
+            )
+            transformer_input, kpm_for_top_codes = self._prepare_top_lm_inputs(
+                transformer_input, kpm_for_top_codes
             )
             cst_out = self.code_sequence_transformer(
                 input_embeddings=transformer_input,
@@ -881,6 +926,9 @@ class HierarchicalAutoencoder(nn.Module):
                     generated_cont
                     if self.top_transformer_continuous or generated_codes is None
                     else F.embedding(generated_codes, self.compressors[-1].vq.codebook)
+                )
+                transformer_input, generated_kpm = self._prepare_top_lm_inputs(
+                    transformer_input, generated_kpm
                 )
                 out = self.code_sequence_transformer(
                     input_embeddings=transformer_input,
