@@ -31,6 +31,7 @@ class CodeSequenceTransformer(nn.Module):
         self.vq = vq
         self.use_flex_attention = use_flex_attention
 
+
         self.in_proj = nn.Linear(embed_dim, dim)
         self.encoder = nn.ModuleList(
             [CausalMLATransformerBlock(dim=dim,

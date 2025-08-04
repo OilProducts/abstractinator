@@ -10,6 +10,24 @@ from .code_sequence_transformer import CodeSequenceTransformer
 
 logger = logging.getLogger(__name__)
 
+
+def _fix_len(seq: torch.Tensor,  # (B, S, D) *or* (B, S)
+             kpm: Optional[torch.Tensor],
+             tgt_len: int,
+             pad_val: float | int,
+             ):
+    B, S, *tail = seq.shape
+    if S > tgt_len:  # ---- clip ----
+        seq = seq[:, :tgt_len, ...]
+        kpm = kpm[:, :tgt_len] if kpm is not None else None
+    elif S < tgt_len:  # ---- pad ----
+        pad = (0, 0) * len(tail) + (0, tgt_len - S)
+        seq = F.pad(seq, pad, value=pad_val)
+        if kpm is not None:
+            kpm = F.pad(kpm, (0, tgt_len - S), value=True)
+    return seq, kpm
+
+
 class HierarchicalAutoencoder(nn.Module):
     """Multi-level autoencoder built from compressors and expanders.
 
@@ -539,6 +557,14 @@ class HierarchicalAutoencoder(nn.Module):
                 compression_results['all_pre_vq'][-1].numel() > 0):
             cont = compression_results['all_pre_vq'][-1]
             codes = compression_results['all_codes'][-1]
+            kpm = kpm_for_top_codes  # (B, S?) or None
+
+            top_lm_len = self.top_transformer_config.get("lm_fixed_length", False)
+            if top_lm_len:
+                top_lm_pad_id = self.top_transformer_config.get("lm_pad_id", 258)
+                cont, kpm = _fix_len(cont, kpm, top_lm_len, 0.0)
+                codes, _ = _fix_len(codes, None, top_lm_len, top_lm_pad_id)
+
             transformer_input = cont if self.top_transformer_continuous else F.embedding(
                 codes, self.compressors[-1].vq.codebook
             )
@@ -876,6 +902,12 @@ class HierarchicalAutoencoder(nn.Module):
             while True:
                 if max_len_override is not None and generated_cont.size(1) >= max_len_override:
                     break
+
+                top_lm_len = self.top_transformer_config.get("lm_fixed_length", False)
+                if top_lm_len:
+                    top_lm_pad_id = self.top_transformer_config.get("lm_pad_id", 258)
+                    generated_cont, generated_kpm = _fix_len(generated_cont, generated_kpm, top_lm_len, 0.0)
+                    generated_codes, _ = _fix_len(generated_codes, None, top_lm_len, top_lm_pad_id)
 
                 transformer_input = (
                     generated_cont
