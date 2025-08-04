@@ -118,6 +118,8 @@ class TopTransformerConfig:
     q_comp_dim: Optional[int] = 96  # d_c`
     retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 128
+    lm_fixed_length: Optional[int] = 512 # Fixed length for the top LM input, will be padded if necessary
+    lm_pad_id: int = 258
 
 
 @dataclass
