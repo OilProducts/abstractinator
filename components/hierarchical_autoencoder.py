@@ -570,7 +570,7 @@ class HierarchicalAutoencoder(nn.Module):
             )
             cst_out = self.code_sequence_transformer(
                 input_embeddings=transformer_input,
-                key_padding_mask=kpm_for_top_codes,
+                key_padding_mask=kpm,
             )
             preds_pre_vq = cst_out['predictions_pre_vq']
             vq_loss_top = cst_out['vq_loss']
@@ -940,3 +940,147 @@ class HierarchicalAutoencoder(nn.Module):
         )
 
         return decomp['final_reconstructed_tokens']
+
+
+    # @torch.no_grad()
+    # def generate_bytes(
+    #     self,
+    #     prompt_tokens: torch.Tensor,                       # (B,S₀)
+    #     key_padding_mask: Optional[torch.Tensor] = None,
+    #     *,
+    #     max_top_codes: int = 256,                          # hard stop
+    #     decode_max_len: Optional[int] = None,              # per-segment
+    # ) -> torch.Tensor:
+    #     """
+    #     Autoregressive decoding loop:
+    #
+    #       1. Compress the prompt → top-level code sequence C.
+    #       2. repeat until EOS or `max_top_codes`:
+    #            a. CodeSequenceTransformer predicts **one** next top symbol cᵢ.
+    #            b. Append cᵢ to C.
+    #            c. Decompress *entire* C through all expanders → bytes B.
+    #            d. Emit only the new byte span B[prev_len:].
+    #       3. Return `prompt_tokens ⊕ generated_bytes`.
+    #
+    #     Notes
+    #     -----
+    #     • Works for both continuous and discrete expander inputs.
+    #     • Assumes `self.expander_eos_id` marks the *end of sequence* at the
+    #       bottom level (byte stream).
+    #     """
+    #     self.eval()
+    #
+    #     B = prompt_tokens.size(0)
+    #     device = prompt_tokens.device
+    #     use_cont = self.use_continuous_expander_inputs
+    #
+    #     # ------------------------------------------------------------------
+    #     # 1. Compress the prompt
+    #     # ------------------------------------------------------------------
+    #     comp = self.compress(prompt_tokens, key_padding_mask=key_padding_mask)
+    #     print(f'Current top-level sequence length: {comp["top_codes"].size(1)}') # temp debug output
+    #
+    #     if use_cont:
+    #         top_mem = comp["all_pre_vq"][-1].clone()        # (B, L_top, D)
+    #         top_codes_discrete = None
+    #     else:
+    #         top_mem = comp["top_codes"].clone()             # (B, L_top)
+    #         top_codes_discrete = top_mem.clone()
+    #
+    #     # kpm for transformer (None = no padding)
+    #     top_kpm = comp["final_key_padding_mask"].clone() if comp["final_key_padding_mask"] is not None else None
+    #
+    #     # Keep a running byte buffer
+    #     generated_bytes = prompt_tokens                   # list for torch.cat
+    #     prev_decoded_len = prompt_tokens.size(1)
+    #
+    #     #temp
+    #     from .tokenizer import ByteLevelTokenizer
+    #     tokenizer = ByteLevelTokenizer()
+    #
+    #     tf_inputs = self._prepare_teacher_forcing_inputs(prompt_tokens, key_padding_mask, comp)
+    #     generated_bytes = tf_inputs['targets'][0]
+    #     prev_decoded_len = generated_bytes.size(1)
+    #
+    #     # ------------------------------------------------------------------
+    #     # 2. Main loop
+    #     # ------------------------------------------------------------------
+    #     for _ in range(max_top_codes):
+    #
+    #         # ---- 2a. predict ONE next top symbol -------------------------
+    #         if self.code_sequence_transformer is None:
+    #             raise RuntimeError("top-level transformer not initialised")
+    #
+    #         # Transformer input depends on `continuous` flag
+    #         tr_input = (
+    #             top_mem if (use_cont or top_codes_discrete is None)
+    #             else F.embedding(top_codes_discrete,
+    #                              self.compressors[-1].vq.codebook)
+    #         )
+    #
+    #         tr_out = self.code_sequence_transformer(
+    #             input_embeddings=tr_input,
+    #             key_padding_mask=top_kpm,
+    #         )
+    #
+    #         next_vec  = tr_out["predictions_pre_vq"][:, -1, :]          # (B,D)
+    #         next_idx  = tr_out["indices"][:, -1] if tr_out["indices"] is not None else None
+    #
+    #         # ---- 2b. append to top sequence -----------------------------
+    #         if use_cont:
+    #             top_mem = torch.cat([top_mem, next_vec.unsqueeze(1)], dim=1)
+    #         else:
+    #             if next_idx is None:
+    #                 raise RuntimeError("transformer did not return indices in discrete mode")
+    #             top_mem = torch.cat([top_mem, next_idx.unsqueeze(1)], dim=1)  # codes_hi
+    #             top_codes_discrete = top_mem
+    #
+    #         if top_kpm is not None:                                       # extend KPM with 0-pad
+    #             pad = torch.zeros(B, 1, dtype=top_kpm.dtype, device=device)
+    #             top_kpm = torch.cat([top_kpm, pad], dim=1)
+    #
+    #         # ---- 2c. full downward decode -------------------------------
+    #         decomp_inp = top_mem if use_cont else top_codes_discrete
+    #         decomp = self.decompress(
+    #             top_codes=decomp_inp,
+    #             decomp_codes_lo=generated_bytes,
+    #             top_codes_key_padding_mask=top_kpm,
+    #             targets_for_teacher_forcing=None,             # generation mode
+    #             max_len_override=decode_max_len,
+    #             teacher_forcing_embeddings=None,
+    #         )
+    #         reconstructed = decomp["final_reconstructed_tokens"]        # (B, S_total)
+    #
+    #         # ---- 2d. take only the *new* bytes --------------------------
+    #         new_bytes = reconstructed[:, prev_decoded_len:]              # (B, Δ)
+    #
+    #         # prev_decoded_len = reconstructed.size(1)
+    #         if new_bytes.size(1) == 0:
+    #             # No new bytes generated, stop early
+    #             print("No new bytes generated, stopping early.")
+    #             break
+    #
+    #         # now cat the new bytes to the tensor in generated bytes
+    #         generated_bytes = torch.cat((generated_bytes, new_bytes), dim=1)
+    #
+    #         # if the last byte is EOS, we stop here
+    #         if generated_bytes[:, -1] == self.expander_eos_id:
+    #             print("Last byte is EOS, stopping generation.")
+    #             break
+    #
+    #         # if the last byte is EOP, we remove it, and continue
+    #         # if generated_bytes[:, -1] == self.compressors[-1].vq.eop_token_id:
+    #         #     print("Last byte is EOP, removing it stop generation.")
+    #         #     generated_bytes = generated_bytes[:, :-1]
+    #         #     break
+    #
+    #         # ---- 2e. stopping condition --------------------------------
+    #         if (next_idx is not None) and (next_idx == self.expander_eos_id).all():
+    #             break
+    #
+    #         prev_decoded_len = generated_bytes.size(1)  # update for the next iteration
+    #
+    #     # ------------------------------------------------------------------
+    #     # 3. return prompt + continuation
+    #     # ------------------------------------------------------------------
+    #     return generated_bytes

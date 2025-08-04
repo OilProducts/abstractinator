@@ -225,7 +225,7 @@ class Trainer:
         torch.set_float32_matmul_precision("high")
         torch.set_default_dtype(torch.bfloat16)
         torch.set_printoptions(threshold=100_000)
-        torch._dynamo.config.capture_scalar_outputs = True
+        # torch._dynamo.config.capture_scalar_outputs = True
         # torch._dynamo.config.recompile_limit = 128
 
         (
