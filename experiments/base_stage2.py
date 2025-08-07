@@ -4,8 +4,12 @@ from configs.base_config import DEVICE, N_CPU, exp_config as _base_exp_config, E
 
 # Use defaults from base_config without modification
 exp_config: ExpConfig = deepcopy(_base_exp_config)
+exp_config.dataset_name = "HuggingFaceFW/fineweb-edu"
+exp_config.dataset_config = "sample-10BT"  # Use a small subset for quick testing
+exp_config.dataset_train_split = "train"  # Use only 10% of the training data for quick testing
+exp_config.sample_prompt_for_generation = "The purpose of education is to"
 
-exp_config.top_transformer_config = None
+# exp_config.top_transformer_config = None
 exp_config.num_epochs = 2
 exp_config.num_levels = 2
 exp_config.compressor_level_configs.append(

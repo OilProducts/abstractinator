@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from functools import lru_cache
 from .rope import RotaryCache, apply_rope
 from .swiglu import SwiGLU
-from .sliding_window_attention import SlidingWindowCrossAttention
+from .sliding_window_attention import SlidingWindowCrossAttention, SegmentCausalCrossAttention
 
 
 @lru_cache(maxsize=64)
@@ -157,7 +157,7 @@ class SimpleDecoder(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -166,7 +166,7 @@ class SimpleDecoder(nn.Module):
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
-                cross_attn_mask=cross_attn_mask,
+                # cross_attn_mask=cross_attn_mask,
             )
         return self.final_norm(x)
 
@@ -174,12 +174,14 @@ class SimpleDecoder(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self, d_model: int, num_heads: int, cross_window: int, cross_attn_mask: Optional[torch.Tensor] = None):
+    def __init__(self, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim):
         super().__init__()
         self.norm1 = nn.RMSNorm(d_model)
         self.self_attn = MultiHeadAttentionRoPE(d_model, num_heads, causal=True)
         self.norm2 = nn.RMSNorm(d_model)
-        self.cross_attn = SlidingWindowCrossAttention(d_model, num_heads, window_size=cross_window)
+        self.cross_attn = SegmentCausalCrossAttention(
+            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False)
+        # self.cross_attn = SlidingWindowCrossAttention(d_model, num_heads, window_size=cross_window)
         self.norm3 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, 4 * d_model)
 
@@ -187,22 +189,23 @@ class SlidingDecoderBlock(nn.Module):
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
+        seg_ids: Optional[torch.Tensor] = None,
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, key_padding_mask=memory_key_padding_mask, attn_mask=cross_attn_mask)
+        x = x + self.cross_attn(self.norm2(x), kv_src=memory, seg_id=seg_ids, kv_mask=memory_key_padding_mask, q_pad_mask=tgt_key_padding_mask)
         x = x + self.ffn(self.norm3(x))
         return x
 
 
 class SlidingDecoder(nn.Module):
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, cross_attn_mask: Optional[torch.Tensor] = None):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int):
         super().__init__()
         self.layers = nn.ModuleList([
-            SlidingDecoderBlock(d_model, num_heads, cross_window) for _ in range(num_layers)
+            SlidingDecoderBlock(d_model, num_heads, cross_window, q_dim, kv_dim) for _ in range(num_layers)
         ])
         self.final_norm = nn.RMSNorm(d_model)
 
@@ -213,7 +216,8 @@ class SlidingDecoder(nn.Module):
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        # cross_attn_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -222,7 +226,8 @@ class SlidingDecoder(nn.Module):
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
-                cross_attn_mask=cross_attn_mask,
+                # cross_attn_mask=cross_attn_mask,
+                seg_ids=seg_ids,
             )
         return self.final_norm(x)
 
@@ -339,6 +344,8 @@ class DecoderOnlyExpander(nn.Module):
         self,
         K_hi: int,
         K_lo: int,
+        hi_dim: int = 256, # kv_dim
+        lo_dim: int = 256, # q_dim
         D: int = 256,
         N_dec: int = 4,
         H: int = 8,
@@ -346,18 +353,23 @@ class DecoderOnlyExpander(nn.Module):
         eos_id: int = 257,
         eop_id: int = 259,
         max_len: int = 2048,
+        cross_lookback_bytes: int = 128,
+
     ) -> None:
         super().__init__()
         self.K_hi, self.K_lo = K_hi, K_lo
         self.D = D
+        self.H = H
         self.eos_id = eos_id
         self.eop_id = eop_id
         self.max_len = max_len
+        self.cross_lookback_bytes = cross_lookback_bytes
+        self.cross_window = cross_window
 
         self.emb_hi = nn.Embedding(K_hi, D)
         self.emb_lo = nn.Embedding(K_lo, D)
 
-        self.decoder = SlidingDecoder(N_dec, D, H, cross_window)
+        self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=lo_dim, kv_dim=hi_dim)
         self.out_proj = nn.Linear(D, K_lo)
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
@@ -370,6 +382,7 @@ class DecoderOnlyExpander(nn.Module):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         device = codes_hi.device
         if codes_hi.is_floating_point():
@@ -390,7 +403,8 @@ class DecoderOnlyExpander(nn.Module):
             tgt_mask=tgt_mask,
             tgt_key_padding_mask=adjusted_tgt_kpm,
             memory_key_padding_mask=src_key_padding_mask,
-            cross_attn_mask=attn_mask,
+            # cross_attn_mask=attn_mask,
+            seg_ids=seg_ids,
         )
         logits = self.out_proj(dec_out)
         return {"logits": logits}
@@ -401,6 +415,8 @@ class DecoderOnlyExpander(nn.Module):
         codes_hi: torch.Tensor,
         codes_lo: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
         max_len: Optional[int] = None,
     ) -> torch.Tensor:
         device = codes_hi.device
@@ -424,6 +440,7 @@ class DecoderOnlyExpander(nn.Module):
                 memory,
                 tgt_mask=tgt_mask,
                 memory_key_padding_mask=src_key_padding_mask,
+                seg_ids=seg_ids,
             )
             next_logits = self.out_proj(dec_out[:, -1, :])
             next_id = next_logits.argmax(dim=-1, keepdim=True)

@@ -34,6 +34,7 @@ exp_config.compressor_level_configs.append(
         entropy_abs_threshold=None,
         target_compression_ratio=None,
         compression_loss_weight=1.0,
+        output_length=384,
     ))
 
 exp_config.expander_level_configs.append(
@@ -45,7 +46,9 @@ exp_config.expander_level_configs.append(
         eos_id=1,
         max_len=8192,
         use_decoder_only=True,
-        use_continuous_inputs=False,
+        use_continuous_inputs=True,
+        hi_dim=256,  # High-dimensional input for the expander
+        lo_dim=128,
     ))
 
 exp_config.top_transformer_config = TopTransformerConfig(
