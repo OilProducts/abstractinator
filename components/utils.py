@@ -149,7 +149,7 @@ def entropy_segments(
         seg_id          : (B,S₀)  int64
         patch_end_mask? : (B,S₀)  bool  (True at last token of each segment) IDs ``(B, S)``.
     """
-    increase_delta = 0  # TODO: remove this
+    # increase_delta = 0  # TODO: remove this
     if ent.ndim != 2:
         raise ValueError(f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}")
     if ent.size(1) == 0:

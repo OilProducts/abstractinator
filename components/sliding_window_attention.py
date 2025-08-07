@@ -758,6 +758,13 @@ class StackedSlidingWindowEncoder(nn.Module):
     #     return x.view(B, L, self.n_heads, self.hdim).transpose(1, 2)
 
 
+class AttnCache:
+    """Simple container so we don’t juggle nested dicts."""
+    def __init__(self):
+        self.self_k = self.self_v = None   # self-attn keys/vals
+        self.cross = {}                   # layer_name → {k,v,seg_ptr}
+
+
 class SegmentCausalCrossAttention(nn.Module):
     """
     Query width ≠ KV width version.
@@ -804,8 +811,8 @@ class SegmentCausalCrossAttention(nn.Module):
         seg_id: torch.Tensor,           # (B, Lq) int – mapping q → kv row
         kv_mask: Optional[torch.Tensor] = None,    # (B, Lkv) bool
         q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool
-        incremental_state: Optional[Dict[str, torch.Tensor]] = None,
-    ):
+        cache: Optional[Dict[str, torch.Tensor]] = None,
+        ):
         """
         incremental_state keys (all optional on first call):
 
@@ -814,7 +821,7 @@ class SegmentCausalCrossAttention(nn.Module):
             "seg_ptr" : (B,)  last segment index already in cache
         """
 
-        if incremental_state is None or q.size(1) > 1:          # ----- training path
+        if cache is None or q.size(1) > 1:          # ----- training path
             out = self._full_forward(q, kv_src, seg_id, kv_mask)
             out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
             return out
@@ -823,16 +830,16 @@ class SegmentCausalCrossAttention(nn.Module):
         # Incremental decoding – q is shape (B, 1, D)
         B = q.size(0)
         device = q.device
-        k_cache = incremental_state.get("k")      # maybe None on first token
-        v_cache = incremental_state.get("v")
-        seg_ptr = incremental_state.get("seg_ptr")  # (B,) or None
+        k_cache = cache.get("k")      # maybe None on first token
+        v_cache = cache.get("v")
+        seg_ptr = cache.get("seg_ptr")  # (B,) or None
 
         # Project query
         q_proj = self._split_heads(self.q_proj(q))       # (B,H,1,Dh)
 
         # If this token belongs to a *new* segment: append K/V row to cache
         new_seg = (seg_ptr is None) | (seg_id[:, -1] != seg_ptr)
-        if new_seg.any():
+        if new_seg:  # Perhaps add .any() when we have multiple streams
             # project *one* kv row per *new* segment
             kv_new = kv_src[torch.arange(B, device=device), seg_id[:, -1]]  # (B,D)
 
@@ -871,13 +878,13 @@ class SegmentCausalCrossAttention(nn.Module):
         probs  = self.drop(F.softmax(scores, dim=-1))                   # (B,H,1,Kw)
         out    = (probs.unsqueeze(-1) * v_slice).sum(-2)               # (B,H,1,Dh)
 
-        out = out.transpose(1,2).reshape(B,1,self.d_model)
+        out = out.transpose(1,2).reshape(B,1,self.d_attn)
         out = self.o_proj(out)
 
         # stash updated cache
-        incremental_state["k"]       = k_cache
-        incremental_state["v"]       = v_cache
-        incremental_state["seg_ptr"] = seg_ptr
+        cache["k"]       = k_cache
+        cache["v"]       = v_cache
+        cache["seg_ptr"] = seg_ptr
 
         return out
 
