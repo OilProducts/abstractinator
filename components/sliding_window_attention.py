@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import (
 )
 from .rope import apply_rope
 from .swiglu import SwiGLU
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 
 @lru_cache(maxsize=64)
@@ -330,8 +330,8 @@ class SlidingWindowCrossAttention(nn.Module):
         return get_cross_window_mask(q_len, kv_len, self.window_size, device)
 
     def forward(self,
-                query: torch.Tensor,
-                key: torch.Tensor,
+                query: torch.Tensor,  # codes_lo
+                key: torch.Tensor,  # codes_hi
                 value: torch.Tensor,
                 attn_mask: Optional[torch.Tensor] = None,
                 key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -516,3 +516,423 @@ class StackedSlidingWindowEncoder(nn.Module):
         logits = self.logit_proj(normed_output)  # (B, S, V)
 
         return hidden_states_for_pooling, logits
+
+# class SegmentCausalCrossAttention(nn.Module):
+#     """
+#     Cross-attention where each query token attends to its compressed
+#     segment and up to `lookback` previous segments (causal).
+#
+#     During *training* you pass the whole sequence in one call.
+#     During *generation* you call `forward` with `incremental_state`
+#     (a dict) and a single-token query.
+#
+#     Args
+#     ----
+#     d_model   : model width (must divide `n_heads`)
+#     n_heads   : number of heads
+#     lookback  : how many *earlier* segments each query may see
+#     dropout   : attention-probability dropout
+#     """
+#
+#     def __init__(
+#         self,
+#         d_model:  int,
+#         n_heads:  int,
+#         lookback: int  = 0,
+#         dropout:  float = 0.0,
+#         bias:     bool  = True,
+#     ):
+#         super().__init__()
+#         assert d_model % n_heads == 0
+#         self.d_model   = d_model
+#         self.n_heads   = n_heads
+#         self.hdim      = d_model // n_heads
+#         self.scale     = self.hdim ** -0.5
+#         self.lookback  = lookback
+#
+#         self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+#         self.k_proj = nn.Linear(d_model, d_model, bias=bias)
+#         self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+#         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
+#         self.drop   = nn.Dropout(dropout)
+#
+#     # ------------------------------------------------------------------ #
+#     def forward(
+#         self,
+#         q: torch.Tensor,                # (B, Lq,  D) – OR (B, 1, D) at decode
+#         kv_src: torch.Tensor,           # (B, Lkv, D) – compressed reps
+#         seg_id: torch.Tensor,           # (B, Lq) int – mapping q → kv row
+#         kv_mask: Optional[torch.Tensor] = None,    # (B, Lkv) bool
+#         q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool
+#         incremental_state: Optional[Dict[str, torch.Tensor]] = None,
+#     ):
+#         """
+#         incremental_state keys (all optional on first call):
+#
+#             "k"       : (B, H, Lkv_cache, Dh)
+#             "v"       : (B, H, Lkv_cache, Dh)
+#             "seg_ptr" : (B,)  last segment index already in cache
+#         """
+#
+#         if incremental_state is None or q.size(1) > 1:          # ----- training path
+#             out = self._full_forward(q, kv_src, seg_id, kv_mask)
+#             out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
+#             return out
+#
+#         # ----------------------------------------------------- #
+#         # Incremental decoding – q is shape (B, 1, D)
+#         B = q.size(0)
+#         device = q.device
+#         k_cache = incremental_state.get("k")      # maybe None on first token
+#         v_cache = incremental_state.get("v")
+#         seg_ptr = incremental_state.get("seg_ptr")  # (B,) or None
+#
+#         # Project query
+#         q_proj = self._split_heads(self.q_proj(q))       # (B,H,1,Dh)
+#
+#         # If this token belongs to a *new* segment: append K/V row to cache
+#         new_seg = (seg_ptr is None) | (seg_id[:, -1] != seg_ptr)
+#         if new_seg.any():
+#             # project *one* kv row per *new* segment
+#             kv_new = kv_src[torch.arange(B, device=device), seg_id[:, -1]]  # (B,D)
+#
+#             k_new  = self._split_heads(self.k_proj(kv_new.unsqueeze(1)))     # (B,H,1,Dh)
+#             v_new  = self._split_heads(self.v_proj(kv_new.unsqueeze(1)))
+#
+#             if k_cache is None:                      # first ever row
+#                 k_cache = k_new
+#                 v_cache = v_new
+#             else:                                    # append along Lkv axis
+#                 k_cache = torch.cat([k_cache, k_new], dim=2)
+#                 v_cache = torch.cat([v_cache, v_new], dim=2)
+#
+#             seg_ptr = seg_id[:, -1]                  # update pointer
+#
+#         # Gather indices: own segment and `lookback` previous ones
+#         max_Lkv = k_cache.size(2)
+#         offsets = torch.arange(0, self.lookback + 1, device=device)   # 0..lookback
+#         gather_idx = seg_id[:, -1:].unsqueeze(-1) - offsets           # (B,1,Kw)
+#         gather_idx.clamp_(0, max_Lkv - 1)
+#         Kw = gather_idx.size(-1)
+#
+#         # Expand for heads, gather keys / values
+#         gather_idx = gather_idx.expand(B, self.n_heads, 1, Kw)        # (B,H,1,Kw)
+#         k_slice = k_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+#         v_slice = v_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+#         # shapes (B,H,1,Kw,Dh)
+#
+#         # Attention
+#         scores = (q_proj.unsqueeze(-2) * k_slice).sum(-1) * self.scale  # (B,H,1,Kw)
+#
+#         if kv_mask is not None:
+#             mask_slice = kv_mask.gather(1, gather_idx[:,0,0,:]).view(B,1,1,Kw)
+#             scores.masked_fill_(mask_slice, torch.finfo(scores.dtype).min)
+#
+#         probs  = self.drop(F.softmax(scores, dim=-1))                   # (B,H,1,Kw)
+#         out    = (probs.unsqueeze(-1) * v_slice).sum(-2)               # (B,H,1,Dh)
+#
+#         out = out.transpose(1,2).reshape(B,1,self.d_model)
+#         out = self.o_proj(out)
+#
+#         # stash updated cache
+#         incremental_state["k"]       = k_cache
+#         incremental_state["v"]       = v_cache
+#         incremental_state["seg_ptr"] = seg_ptr
+#
+#         return out
+
+    # ------------------------------------------------------------------ #
+    # def _full_forward(self, q, kv, seg_id, kv_mask):
+    #     """Training / teacher-forcing path (whole sequence)."""
+    #     B, Lq, _  = q.shape
+    #     device    = q.device
+    #
+    #     r         = self.lookback
+    #     qh = self._split_heads(self.q_proj(q))      # (B,H,Lq,Dh)
+    #     kh = self._split_heads(self.k_proj(kv))     # (B,H,Lkv,Dh)
+    #     vh = self._split_heads(self.v_proj(kv))
+    #
+    #     B, H, Lkv, Dh = kh.shape
+    #
+    #     # build gather indices for every position
+    #     offsets = torch.arange(0, r+1, device=device)          # (Kw,)
+    #     gather  = seg_id.unsqueeze(-1) - offsets               # (B,Lq,Kw)
+    #     gather.clamp_(0, kv.size(1)-1)
+    #     Kw      = gather.size(-1)
+    #
+    #     gather = gather.unsqueeze(1).expand(B, self.n_heads, Lq, Kw)   # (B,H,Lq,Kw)
+    #     idx_exp = gather.unsqueeze(-1).expand(-1, -1, -1, -1, Dh)  # (B,H,Lq,Kw,Dh)
+    #
+    #     k_sel = torch.take_along_dim(
+    #         kh.unsqueeze(3).expand(-1, -1, -1, Kw, -1),  # (B,H,Lkv,Kw,Dh)
+    #         idx_exp,  # (B,H,Lq,Kw,Dh)
+    #         dim=2
+    #     )
+    #
+    #     v_sel = torch.take_along_dim(
+    #         vh.unsqueeze(3).expand(-1, -1, -1, Kw, -1),  # (B,H,Lkv,Kw,Dh)
+    #         idx_exp,  # (B,H,Lq,Kw,Dh)
+    #         dim=2
+    #     )
+    #
+    #     # k_sel  = kh.unsqueeze(3).gather(2, gather.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+    #     # v_sel  = vh.unsqueeze(3).gather(2, gather.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+    #
+    #     scores = (qh.unsqueeze(-2) * k_sel).sum(-1) * self.scale       # (B,H,Lq,Kw)
+    #
+    #     if kv_mask is not None:
+    #         mask_sel = kv_mask.gather(1, gather[:,0,0,:]).view(B,1,Lq,Kw)
+    #         scores.masked_fill_(mask_sel, torch.finfo(scores.dtype).min)
+    #
+    #     probs = self.drop(F.softmax(scores, dim=-1))
+    #     out   = (probs.unsqueeze(-1) * v_sel).sum(-2)                  # (B,H,Lq,Dh)
+    #     out   = out.transpose(1,2).reshape(B,Lq,self.d_model)
+    #     return self.o_proj(out)
+    #
+    # def _full_forward(
+    #         self,
+    #         q: torch.Tensor,  # (B, Lq,  D)
+    #         kv: torch.Tensor,  # (B, Lkv, D)
+    #         seg_id: torch.Tensor,  # (B, Lq)   int
+    #         kv_mask: Optional[torch.Tensor] = None  # (B, Lkv) bool
+    # ) -> torch.Tensor:
+    #     """
+    #     Training / teacher-forcing path (whole sequence at once).
+    #     Each query attends to its own compressed segment plus the previous
+    #     `self.lookback` segments (causal).
+    #
+    #     Returns:
+    #         out : (B, Lq, D)
+    #     """
+    #     B, Lq, _ = q.shape
+    #     _, Lkv, _ = kv.shape
+    #     R = self.lookback  # look-back radius
+    #     Dh = self.hdim
+    #     device = q.device
+    #
+    #     # 1. project + split heads
+    #     qh = self._split_heads(self.q_proj(q))  # (B, H, Lq, Dh)
+    #     kh = self._split_heads(self.k_proj(kv))  # (B, H, Lkv, Dh)
+    #     vh = self._split_heads(self.v_proj(kv))  # (B, H, Lkv, Dh)
+    #
+    #     # 2. build (B, Lq, Kw) index tensor of segment rows to fetch
+    #     offsets = torch.arange(0, R + 1, device=device)  # (Kw,)
+    #     gather = seg_id.unsqueeze(-1) - offsets  # (B, Lq, Kw)
+    #     gather.clamp_(0, Lkv - 1)  # keep in-range
+    #     Kw = gather.size(-1)
+    #
+    #     # 3. expand for heads and Dh so we can gather k/v
+    #     idx_exp = gather.unsqueeze(1).unsqueeze(-1)  # (B,1,Lq,Kw,1)
+    #     idx_exp = idx_exp.expand(-1, self.n_heads, -1, -1, Dh)  # (B,H,Lq,Kw,Dh)
+    #
+    #     kh_exp = kh.unsqueeze(3).expand(-1, -1, -1, Kw, -1)  # (B,H,Lkv, Kw,Dh)
+    #     vh_exp = vh.unsqueeze(3).expand(-1, -1, -1, Kw, -1)
+    #
+    #     k_sel = torch.gather(kh_exp, 2, idx_exp)  # (B,H,Lq,Kw,Dh)
+    #     v_sel = torch.gather(vh_exp, 2, idx_exp)  # (B,H,Lq,Kw,Dh)
+    #
+    #     # 4. scaled dot-prod attention
+    #     scores = (qh.unsqueeze(-2) * k_sel).sum(-1) * self.scale  # (B,H,Lq,Kw)
+    #
+    #     # 5. validity / padding mask on K/V rows (optional)
+    #     if kv_mask is not None:
+    #         # gather kv_mask for every (B,Lq,Kw)
+    #         mask_flat = kv_mask.gather(  # (B, Lq*Kw)
+    #             1,
+    #             gather.reshape(B, -1)
+    #         )
+    #         mask_sel = mask_flat.reshape(B, Lq, Kw).unsqueeze(1)  # (B,1,Lq,Kw)
+    #         scores.masked_fill_(mask_sel, torch.finfo(scores.dtype).min)
+    #
+    #     # 6. softmax & value mix
+    #     probs = self.drop(torch.softmax(scores, dim=-1))  # (B,H,Lq,Kw)
+    #     out = (probs.unsqueeze(-1) * v_sel).sum(-2)  # (B,H,Lq,Dh)
+    #
+    #     # 7. merge heads & final projection
+    #     out = out.transpose(1, 2).reshape(B, Lq, self.d_model)  # (B,Lq,D)
+    #     return self.o_proj(out)
+    #
+    # # ------------------------------------------------------------------ #
+    # def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+    #     B, L, _ = x.shape
+    #     return x.view(B, L, self.n_heads, self.hdim).transpose(1, 2)
+
+
+class SegmentCausalCrossAttention(nn.Module):
+    """
+    Query width ≠ KV width version.
+    q_dim     : embedding dim of query stream
+    kv_dim    : embedding dim of compressed memory
+    d_attn    : internal attention dim (must % n_heads == 0)
+    n_heads   : number of heads
+    lookback  : how many earlier segments a query can see
+    """
+
+    def __init__(
+        self,
+        q_dim:     int,
+        kv_dim:    int,
+        d_attn:    int,
+        n_heads:   int,
+        lookback:  int  = 0,
+        dropout:   float = 0.0,
+        bias:      bool  = True,
+    ):
+        super().__init__()
+        assert d_attn % n_heads == 0, "d_attn must be divisible by n_heads"
+        self.q_dim   = d_attn
+        self.kv_dim  = d_attn
+        self.d_attn  = d_attn
+        self.n_heads = n_heads
+        self.hdim    = d_attn // n_heads
+        self.scale   = self.hdim ** -0.5
+        self.lookback = lookback
+
+        # separate input projections
+        self.q_proj = nn.Linear(d_attn,  d_attn, bias=bias)
+        self.k_proj = nn.Linear(d_attn, d_attn, bias=bias)
+        self.v_proj = nn.Linear(d_attn, d_attn, bias=bias)
+
+        # output goes back to the *query* dimensionality
+        self.o_proj = nn.Linear(d_attn, d_attn, bias=bias)
+        self.drop   = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        q: torch.Tensor,                # (B, Lq,  D) – OR (B, 1, D) at decode
+        kv_src: torch.Tensor,           # (B, Lkv, D) – compressed reps
+        seg_id: torch.Tensor,           # (B, Lq) int – mapping q → kv row
+        kv_mask: Optional[torch.Tensor] = None,    # (B, Lkv) bool
+        q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool
+        incremental_state: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        """
+        incremental_state keys (all optional on first call):
+
+            "k"       : (B, H, Lkv_cache, Dh)
+            "v"       : (B, H, Lkv_cache, Dh)
+            "seg_ptr" : (B,)  last segment index already in cache
+        """
+
+        if incremental_state is None or q.size(1) > 1:          # ----- training path
+            out = self._full_forward(q, kv_src, seg_id, kv_mask)
+            out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
+            return out
+
+        # ----------------------------------------------------- #
+        # Incremental decoding – q is shape (B, 1, D)
+        B = q.size(0)
+        device = q.device
+        k_cache = incremental_state.get("k")      # maybe None on first token
+        v_cache = incremental_state.get("v")
+        seg_ptr = incremental_state.get("seg_ptr")  # (B,) or None
+
+        # Project query
+        q_proj = self._split_heads(self.q_proj(q))       # (B,H,1,Dh)
+
+        # If this token belongs to a *new* segment: append K/V row to cache
+        new_seg = (seg_ptr is None) | (seg_id[:, -1] != seg_ptr)
+        if new_seg.any():
+            # project *one* kv row per *new* segment
+            kv_new = kv_src[torch.arange(B, device=device), seg_id[:, -1]]  # (B,D)
+
+            k_new  = self._split_heads(self.k_proj(kv_new.unsqueeze(1)))     # (B,H,1,Dh)
+            v_new  = self._split_heads(self.v_proj(kv_new.unsqueeze(1)))
+
+            if k_cache is None:                      # first ever row
+                k_cache = k_new
+                v_cache = v_new
+            else:                                    # append along Lkv axis
+                k_cache = torch.cat([k_cache, k_new], dim=2)
+                v_cache = torch.cat([v_cache, v_new], dim=2)
+
+            seg_ptr = seg_id[:, -1]                  # update pointer
+
+        # Gather indices: own segment and `lookback` previous ones
+        max_Lkv = k_cache.size(2)
+        offsets = torch.arange(0, self.lookback + 1, device=device)   # 0..lookback
+        gather_idx = seg_id[:, -1:].unsqueeze(-1) - offsets           # (B,1,Kw)
+        gather_idx.clamp_(0, max_Lkv - 1)
+        Kw = gather_idx.size(-1)
+
+        # Expand for heads, gather keys / values
+        gather_idx = gather_idx.expand(B, self.n_heads, 1, Kw)        # (B,H,1,Kw)
+        k_slice = k_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+        v_slice = v_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+        # shapes (B,H,1,Kw,Dh)
+
+        # Attention
+        scores = (q_proj.unsqueeze(-2) * k_slice).sum(-1) * self.scale  # (B,H,1,Kw)
+
+        if kv_mask is not None:
+            mask_slice = kv_mask.gather(1, gather_idx[:,0,0,:]).view(B,1,1,Kw)
+            scores.masked_fill_(mask_slice, torch.finfo(scores.dtype).min)
+
+        probs  = self.drop(F.softmax(scores, dim=-1))                   # (B,H,1,Kw)
+        out    = (probs.unsqueeze(-1) * v_slice).sum(-2)               # (B,H,1,Dh)
+
+        out = out.transpose(1,2).reshape(B,1,self.d_model)
+        out = self.o_proj(out)
+
+        # stash updated cache
+        incremental_state["k"]       = k_cache
+        incremental_state["v"]       = v_cache
+        incremental_state["seg_ptr"] = seg_ptr
+
+        return out
+
+    # ----------------------------- training / teacher-forcing ---------- #
+    def _full_forward(
+        self,
+        q:       torch.Tensor,              # (B, Lq,  q_dim)
+        kv:      torch.Tensor,             # (B, Lkv, kv_dim)
+        seg_id:  torch.Tensor,             # (B, Lq)
+        kv_mask: Optional[torch.Tensor]=None,
+    ) -> torch.Tensor:
+
+        B, Lq, _  = q.shape
+        _, Lkv, _ = kv.shape
+        R, H, Dh  = self.lookback, self.n_heads, self.hdim
+        device    = q.device
+
+        # 1-- projections
+        qh = self._split_heads(self.q_proj(q))      # (B,H,Lq,Dh)
+        kh = self._split_heads(self.k_proj(kv))     # (B,H,Lkv,Dh)
+        vh = self._split_heads(self.v_proj(kv))
+
+        # 2-- segment indices (B,Lq,Kw)
+        offsets = torch.arange(0, R + 1, device=device)          # (Kw,)
+        gather  = seg_id.unsqueeze(-1) - offsets                 # (B,Lq,Kw)
+        gather.clamp_(0, Lkv-1)
+        Kw      = gather.size(-1)
+
+        # 3-- take_along_dim handles broadcasting
+        idx = gather.unsqueeze(1).unsqueeze(-1)                  # (B,1,Lq,Kw,1)
+
+        k_sel = torch.take_along_dim(                            # (B,H,Lq,Kw,Dh)
+            kh.unsqueeze(3), idx.expand(-1,H,-1,-1,Dh), dim=2
+        )
+        v_sel = torch.take_along_dim(
+            vh.unsqueeze(3), idx.expand(-1,H,-1,-1,Dh), dim=2
+        )
+
+        # 4-- attention
+        scores = (qh.unsqueeze(-2) * k_sel).sum(-1) * self.scale # (B,H,Lq,Kw)
+
+        if kv_mask is not None:
+            mask_sel = torch.take_along_dim(
+                kv_mask.unsqueeze(2), gather, dim=1              # (B,Lq,Kw)
+            ).unsqueeze(1)                                       # (B,1,Lq,Kw)
+            scores.masked_fill_(mask_sel, torch.finfo(scores.dtype).min)
+
+        probs = self.drop(torch.softmax(scores, dim=-1))         # (B,H,Lq,Kw)
+        out   = (probs.unsqueeze(-1) * v_sel).sum(-2)            # (B,H,Lq,Dh)
+
+        # 5-- merge heads, project back to q_dim
+        out = out.transpose(1, 2).reshape(B, Lq, self.d_attn)
+        return self.o_proj(out)
+
+    # ---------------------- helpers -------------------- #
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, _ = x.shape
+        return x.view(B, L, self.n_heads, self.hdim).transpose(1, 2)

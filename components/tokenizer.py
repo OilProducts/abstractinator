@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import torch
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -80,3 +81,60 @@ class ByteLevelTokenizer:
         byte_list = [t for t in tokens if 0 <= t < 256]
         return bytes(byte_list).decode("utf-8", errors="ignore")
 
+
+    def encode_batch_fixed_length(
+            texts: list[str],
+            *,
+            tokenizer,
+            seq_len: int,
+            dtype: torch.dtype = torch.int16,  # match your model
+    ):
+        """
+        Vectorised byte-level encoding whose behaviour matches the original
+        per-sample logic (BOS/EOS, truncate-with-EOS, pad-to-seq_len).
+
+        Returns
+        -------
+        input_ids : np.ndarray, shape (B, seq_len), dtype compatible with `dtype`
+        kpm       : np.ndarray, bool mask, True where PAD
+        """
+        to_np = lambda tdtype: torch.empty(0, dtype=tdtype).numpy().dtype
+        np_dtype = to_np(dtype)
+
+        B = len(texts)
+        PAD = tokenizer.pad_id
+        EOS = tokenizer.eos_id
+        BOS = tokenizer.bos_id
+
+        # Pre-allocate with PAD
+        ids = np.full((B, seq_len), PAD, dtype=np_dtype)
+        kpm = np.ones_like(ids, dtype=bool)  # all PAD for now
+
+        for i, t in enumerate(texts):
+            if t is None:
+                t = ""
+            b = t.encode("utf-8", "ignore")
+
+            pos = 0
+            if tokenizer.add_bos:
+                ids[i, pos] = BOS
+                pos += 1
+
+            # Reserve 1 slot for EOS if tokenizer.add_eos
+            reserve = 1 if tokenizer.add_eos else 0
+            take = min(len(b), seq_len - pos - reserve)
+            if take:
+                ids[i, pos: pos + take] = np.frombuffer(b[:take], dtype=np.uint8)
+                pos += take
+
+            # EOS handling (identical to the original loop)
+            if tokenizer.add_eos and pos < seq_len:
+                ids[i, pos] = EOS
+                pos += 1
+            elif tokenizer.add_eos and take < len(b):
+                # truncation case: last position *must* be EOS
+                ids[i, seq_len - 1] = EOS
+
+            kpm[i, :pos] = False  # mark real tokens
+
+        return ids, kpm

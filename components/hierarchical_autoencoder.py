@@ -1,31 +1,58 @@
 import logging
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Any, Optional, Tuple
 
-from .byte_segment_compressor import ByteSegmentCompressor
+from torch import Tensor
+
+from .byte_segment_compressor import ByteSegmentCompressor, CompressorOutput
 from .expander import CodeExpander, DecoderOnlyExpander
 from .code_sequence_transformer import CodeSequenceTransformer
 
 logger = logging.getLogger(__name__)
 
-
-def _fix_len(seq: torch.Tensor,  # (B, S, D) *or* (B, S)
-             kpm: Optional[torch.Tensor],
+def _fix_len(seq: torch.Tensor,           # (B, S, D) *or* (B, S)
+             kpm: Optional[torch.Tensor], # (B, Sₖ) or None
              tgt_len: int,
              pad_val: float | int,
              ):
     B, S, *tail = seq.shape
-    if S > tgt_len:  # ---- clip ----
-        seq = seq[:, :tgt_len, ...]
-        kpm = kpm[:, :tgt_len] if kpm is not None else None
-    elif S < tgt_len:  # ---- pad ----
+
+    # ---- clip both when too long ----
+    if S > tgt_len:
+        seq = seq[:, -tgt_len:, ...]
+        if kpm is not None:
+            kpm = kpm[:, -tgt_len:]
+        return seq, kpm                           # done
+
+    # ---- pad sequence when too short ----
+    if S < tgt_len:
         pad = (0, 0) * len(tail) + (0, tgt_len - S)
         seq = F.pad(seq, pad, value=pad_val)
-        if kpm is not None:
-            kpm = F.pad(kpm, (0, tgt_len - S), value=True)
+
+    # ---- pad kpm independently (if present) ----
+    if kpm is not None:
+        S_kpm = kpm.shape[1]
+        if S_kpm > tgt_len:                       # rare, but mirror clip-logic
+            kpm = kpm[:, -tgt_len:]
+        elif S_kpm < tgt_len:
+            kpm = F.pad(kpm, (0, tgt_len - S_kpm), value=True)
+
     return seq, kpm
+
+
+
+
+def _trim_trailing_pad(seq, kpm):
+    """Remove all-pad suffix so we append inside the fixed window."""
+    if kpm is None:
+        return seq, kpm
+    # every batch item has identical length because we pad uniformly
+    eff_len = int((~kpm).sum(dim=1).max().item())
+    return seq[:, :eff_len, ...], kpm[:, :eff_len]
+
 
 
 class HierarchicalAutoencoder(nn.Module):
@@ -118,6 +145,7 @@ class HierarchicalAutoencoder(nn.Module):
                 entropy_delta=config.get('entropy_delta', 0.2),
                 entropy_abs_threshold=config.get('entropy_abs_threshold'),
                 use_flex_attention=use_flex_attention,
+                output_length=config.get('output_length'),
             )
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])
@@ -192,9 +220,12 @@ class HierarchicalAutoencoder(nn.Module):
                     D=exp_dim,
                     N_dec=n_dec,
                     H=exp_heads,
-                    cross_window=comp_cfg.get("compression_window", comp_cfg.get("window", 128)),
+                    # cross_window=comp_cfg.get("compression_window", comp_cfg.get("window", 128)),
+                    cross_window=1,
                     eos_id=eos_id,
                     max_len=max_len,
+                    hi_dim=exp_cfg.get("hi_dim", 256),
+                    lo_dim=exp_cfg.get("lo_dim", 128),
                 )
             else:
                 expander = CodeExpander(
@@ -208,6 +239,34 @@ class HierarchicalAutoencoder(nn.Module):
                     max_len=max_len,
                 )
             self.expanders.append(expander)
+
+
+    def _compress_one_level(self,
+                            tokens: torch.Tensor,
+                            key_padding_mask: Optional[torch.Tensor] = None,
+                            level: int = 0) -> Dict[str, Any]:
+        """Compress a sequence at a single level.
+
+        Args:
+            tokens: Tensor of raw byte tokens ``(B, S)``.
+            key_padding_mask: Optional boolean mask ``(B, S)`` where ``True``
+                marks padded positions.
+            level: Index of the compressor level to use.
+
+        Returns:
+            Dictionary with keys:
+                ``'codes'`` – output codes for this level;
+                ``'continuous'`` – quantized segment embeddings;
+                ``'pre_vq_embeddings'`` – embeddings prior to vector quantization;
+                ``'vq_loss'`` – vector‑quantization loss for this level;
+                ``'encoder_logits'`` – logits from the encoder (if applicable);
+                ``'seg_id'`` – segment IDs for the input sequence;
+                plus auxiliary statistics used for language‑modeling losses.
+        """
+
+        compressor = self.compressors[level]
+        return compressor(tokens, key_padding_mask=key_padding_mask)
+
 
     def compress(self, tokens: torch.Tensor,
                  key_padding_mask: Optional[torch.Tensor] = None
@@ -234,10 +293,11 @@ class HierarchicalAutoencoder(nn.Module):
                 plus auxiliary statistics used for language‑modeling losses.
         """
         all_codes_list: List[torch.Tensor] = []
-        all_continuous_list: List[torch.Tensor] = []
+        all_vq_embeddings: List[torch.Tensor] = []
         all_pre_vq_list: List[torch.Tensor] = []
         all_input_seq_lengths: List[float] = []
         all_output_seq_lengths: List[float] = []
+        all_seg_ids: List[torch.Tensor] = []
         # Stores valid_masks (per segment) from each compressor to reconstruct KPMs later.
         all_compressor_level_valid_masks: List[Optional[torch.Tensor]] = []
         total_vq_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
@@ -248,12 +308,13 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_input_kpms_list: List[Optional[torch.Tensor]] = []
 
         all_perplexities_list: List[torch.Tensor] = []
-        all_smoothed_perplexities_list: List[Optional[torch.Tensor]] = []
 
         all_patch_end_masks: List[Optional[torch.Tensor]] = []
+        all_first_byte_idx: List[Optional[torch.Tensor]] = []
 
         current_input_tokens = tokens
         current_kpm = key_padding_mask
+        steps: List[CompressorOutput] = []
 
         for i, compressor in enumerate(self.compressors):
             all_compressor_input_tokens_list.append(current_input_tokens) # Store input for aux LM loss
@@ -266,20 +327,21 @@ class HierarchicalAutoencoder(nn.Module):
             all_input_seq_lengths.append(input_seq_len)
 
             comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
-            output_codes = comp_out['codes']
-            all_patch_end_masks.append(comp_out.get('patch_end_mask'))
-            encoder_logits_level_i = comp_out['encoder_logits']
-            all_perplexities_list.append(comp_out['current_codebook_perplexity'])
-            all_smoothed_perplexities_list.append(comp_out.get('smoothed_codebook_perplexity'))
+
+            all_seg_ids.append(comp_out.seg_id)
+            output_codes = comp_out.vq_indices
+            all_patch_end_masks.append(comp_out.patch_end_mask)
+            all_perplexities_list.append(comp_out.vq_perplexity)
+            all_first_byte_idx.append(comp_out.first_byte_idx)
 
             all_codes_list.append(output_codes)
-            all_continuous_list.append(comp_out['continuous'])
-            all_pre_vq_list.append(comp_out['pre_vq_embeddings'])
-            all_encoder_logits_list.append(encoder_logits_level_i)
-            total_vq_loss += comp_out['vq_loss']
+            all_vq_embeddings.append(comp_out.vq_embeddings)
+            all_pre_vq_list.append(comp_out.pre_vq_embeddings)
+            all_encoder_logits_list.append(comp_out.entropy_model_logits)
+            total_vq_loss += comp_out.vq_loss
 
             # valid_mask_for_output from ByteSegmentCompressor is (B, S_hat_segments)
-            valid_mask_for_output_segments = comp_out.get('valid_mask')
+            valid_mask_for_output_segments = comp_out.valid_mask
             all_compressor_level_valid_masks.append(valid_mask_for_output_segments)
 
             num_q_this_level = compressor.num_queries_per_segment  # L value
@@ -294,6 +356,9 @@ class HierarchicalAutoencoder(nn.Module):
 
             current_input_tokens = output_codes
             if self.propagate_key_padding_mask:
+                # This is just inverting the valid mask to get the KPM for the next level
+
+
                 if valid_mask_for_output_segments is not None:
                     # KPM for next level codes: True where segment was NOT valid, repeated for L queries.
                     # Shape: (B, S_hat_segments * L)
@@ -321,7 +386,7 @@ class HierarchicalAutoencoder(nn.Module):
             'top_codes': all_codes_list[-1] if all_codes_list else torch.empty(0,
                                                                               device=tokens.device),
             'all_codes': all_codes_list,
-            'all_continuous': all_continuous_list,
+            'all_continuous': all_vq_embeddings,
             'all_pre_vq': all_pre_vq_list,
             'vq_loss': total_vq_loss,
             'final_key_padding_mask': current_kpm,  # KPM for top_codes
@@ -333,8 +398,9 @@ class HierarchicalAutoencoder(nn.Module):
             'all_compressor_input_tokens': all_compressor_input_tokens_list,
             'all_compressor_input_kpms': all_compressor_input_kpms_list,
             'all_codebook_perplexities': all_perplexities_list,
-            'all_smoothed_perplexities': all_smoothed_perplexities_list,
-            'all_patch_end_masks': all_patch_end_masks
+            'all_patch_end_masks': all_patch_end_masks,
+            'all_seg_ids': all_seg_ids,
+            'all_first_byte_idx': all_first_byte_idx,
         }
 
 
@@ -346,6 +412,10 @@ class HierarchicalAutoencoder(nn.Module):
         target_key_padding_masks: Optional[List[Optional[torch.Tensor]]] = None,
         max_len_override: Optional[int] = None,
         teacher_forcing_embeddings: Optional[List[torch.Tensor]] = None,
+        all_seg_ids: Optional[List[torch.Tensor]] = None,
+        decomp_codes_lo: Optional[torch.Tensor] = None,
+        tf_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        compression_results: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Decode a sequence of top-level codes back to bytes.
 
@@ -402,7 +472,10 @@ class HierarchicalAutoencoder(nn.Module):
                     codes_hi=current_input_codes_hi,
                     codes_lo=target_sequence_for_this_level,
                     src_key_padding_mask=current_src_kpm,  # KPM for codes_hi
-                    tgt_key_padding_mask=tgt_kpm_for_this_level  # KPM for codes_lo (targets)
+                    # src_key_padding_mask=None,
+                    tgt_key_padding_mask=tgt_kpm_for_this_level,  # KPM for codes_lo (targets)
+                    # attn_mask=attn_mask,
+                    seg_ids = compression_results["all_seg_ids"][self.num_levels - 1 - i],
                 )
                 all_output_logits_list.append(exp_out_dict['logits'])
 
@@ -416,8 +489,11 @@ class HierarchicalAutoencoder(nn.Module):
             else:  # Autoregressive generation
                 generated_tokens = expander.generate(
                     codes_hi=current_input_codes_hi,
+                    codes_lo=decomp_codes_lo,
                     src_key_padding_mask=current_src_kpm,  # KPM for codes_hi
-                    max_len=max_len_override
+                    max_len=max_len_override,
+                    all_seg_ids = compression_results["all_seg_ids"][self.num_levels - 1 - i]
+
                 )
                 all_generated_tokens_list.append(generated_tokens)
                 current_input_codes_hi = generated_tokens
@@ -434,95 +510,80 @@ class HierarchicalAutoencoder(nn.Module):
     # Helper utilities for the training forward pass
     # ------------------------------------------------------------------
 
-    # @staticmethod
-    # def _insert_eop(seq: torch.Tensor, end_mask: torch.Tensor,
-    #                 kpm: Optional[torch.Tensor], eop_id: int
-    #                 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    #     """Insert ``eop_id`` after positions indicated by ``end_mask``."""
-    #
-    #     B, S = seq.shape
-    #     if S == 0:
-    #         lengths = end_mask.sum(dim=1)
-    #         max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
-    #         out = seq.new_full((B, max_len), eop_id)
-    #         out_kpm = None if kpm is None else torch.ones((B, max_len),
-    #                                                       dtype=torch.bool,
-    #                                                       device=seq.device)
-    #         return out, out_kpm
-    #
-    #     end_mask_i = end_mask.to(torch.long)
-    #     end_cumsum = torch.cumsum(end_mask, dim=1)
-    #     lengths = S + end_cumsum[:, -1]
-    #     max_len = int(lengths.max().item())
-    #
-    #     out = seq.new_full((B, max_len), eop_id)
-    #     out_kpm = None
-    #     if kpm is not None:
-    #         out_kpm = torch.ones((B, max_len), dtype=torch.bool, device=seq.device)
-    #
-    #     shift = end_cumsum - end_mask
-    #     token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
-    #     batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
-    #
-    #     out[batch_idx, token_pos] = seq
-    #     if out_kpm is not None:
-    #         out_kpm[batch_idx, token_pos] = kpm
-    #
-    #     eop_pos = token_pos + 1
-    #     mask = end_mask.bool()
-    #     if out_kpm is not None:
-    #         out_kpm[batch_idx.expand_as(end_mask)[mask], eop_pos[mask]] = False
-    #
-    #     return out, out_kpm
-
     @staticmethod
     def _insert_eop(
             seq: torch.Tensor,
             end_mask: torch.Tensor,
             kpm: Optional[torch.Tensor],
             eop_id: int,
+            pad_id: int = 0  # ← pass your actual pad value here
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        After every True in `end_mask` insert an EOP token (`eop_id`).
+        Same signature as before but returns tensors of the *same* length S.
 
-        * seq ................ (B, S)  original codes
-        * end_mask ........... (B, S)  True at last query of each patch
-        * kpm ................ same shape, True = padding
+        * seq ............ (B, S) original codes
+        * end_mask ....... (B, S) True at last query of each patch
+        * kpm ............ (B, S) True = padding
         """
         B, S = seq.shape
 
-        # ---------- handle empty seq edge-case ----------
+        # ----- step a: normalise end_mask length -----
+        if end_mask.size(1) != S:
+            if end_mask.size(1) > S:  # clip
+                end_mask = end_mask[:, :S]
+            else:  # pad
+                end_mask = F.pad(end_mask, (0, S - end_mask.size(1)), value=False)
+
+        # no tokens at all -> nothing to do
         if S == 0:
-            max_len = int(end_mask.sum(dim=1).max().item()) if B > 0 else 0
-            out = seq.new_full((B, max_len), eop_id)
-            out_kpm = None if kpm is None else torch.ones_like(out, dtype=torch.bool)
-            return out, out_kpm
+            return seq, kpm
 
-        # ---------- compute per-token shift ----------
+        if kpm is None:
+            raise ValueError("`kpm` is required to keep the length constant.")
+
+        # ----- step b: budget check -----
+        inserts = end_mask.sum(dim=1)  # (B,)
+        pad_slots = kpm.sum(dim=1)  # (B,)
+
+        # Vectorised clip: keep only the first `pad_slots[b]` True values per row
+        mask_i = end_mask.to(torch.long)  # 0/1
+        keep_msk = torch.cumsum(mask_i, dim=1) <= pad_slots.unsqueeze(1)
+        end_mask &= keep_msk  # in-place prune
+
+        # ----- step c: shift map (unchanged) -----
         mask_i = end_mask.to(torch.long)
-        end_cumsum = torch.cumsum(mask_i, dim=1)  # 0,1,2,...
-        shift = end_cumsum - mask_i  # keep token itself unshifted
+        cumsum_end = torch.cumsum(mask_i, dim=1)
+        shift = cumsum_end - mask_i  # (B, S)
 
-        # ---------- allocate output ----------
-        lengths = S + end_cumsum[:, -1]  # per-batch final length
-        max_len = int(lengths.max().item())
-        out = seq.new_full((B, max_len), eop_id)
+        # ----- step d: restrict to real tokens -----
+        data_mask = ~kpm  # True == real token
+        shift_data = shift[data_mask]  # 1-D flattened view
 
-        # ---------- scatter original tokens ----------
-        token_pos = torch.arange(S, device=seq.device).unsqueeze(0) + shift
-        batch_idx = torch.arange(B, device=seq.device).unsqueeze(1)
-        out[batch_idx, token_pos] = seq
+        # ----- allocate outputs (all-pad by default) -----
+        out = seq.new_full((B, S), pad_id)
+        out_kpm = None if kpm is None else torch.ones_like(kpm, dtype=torch.bool)
 
-        # ---------- optional KPM ----------
-        out_kpm = None
-        if kpm is not None:
-            out_kpm = torch.ones_like(out, dtype=torch.bool)
-            out_kpm[batch_idx, token_pos] = kpm
-            # mark the inserted EOPs as non-padding
-            eop_pos = token_pos + 1
-            out_kpm[batch_idx.expand_as(end_mask)[end_mask], eop_pos[end_mask]] = False
+        # conveniences for scatter
+        token_idx = torch.arange(S, device=seq.device).unsqueeze(0).expand(B, -1)
+        batch_idx = torch.arange(B, device=seq.device).unsqueeze(1).expand_as(seq)
+
+        # ----- step e-1: scatter original tokens -----
+        token_pos = token_idx + shift  # (B,S)
+        token_pos_flat = token_pos[data_mask]  # flattened view aligned w/ shift_data
+        out[batch_idx[data_mask], token_pos_flat] = seq[data_mask]
+
+        # ----- step e-2: scatter EOP tokens -----
+        eop_mask = data_mask & end_mask  # positions that need an EOP
+        eop_src_pos = token_idx[eop_mask] + shift[eop_mask] + 1
+        out[batch_idx[eop_mask], eop_src_pos] = eop_id
+
+        # ----- step f: update kpm -----
+        if out_kpm is not None:
+            out_kpm[batch_idx[data_mask], token_pos_flat] = False  # real tokens
+            out_kpm[batch_idx[eop_mask], eop_src_pos] = False  # EOP tokens
 
         return out, out_kpm
+
 
     def _compute_compression_loss(
         self,
@@ -555,15 +616,10 @@ class HierarchicalAutoencoder(nn.Module):
         if (self.code_sequence_transformer is not None and
                 self.top_lm_loss_weight > 0 and
                 compression_results['all_pre_vq'][-1].numel() > 0):
-            cont = compression_results['all_pre_vq'][-1]
+            # cont = compression_results['all_pre_vq'][-1]
+            cont = compression_results['all_continuous'][-1]
             codes = compression_results['all_codes'][-1]
             kpm = kpm_for_top_codes  # (B, S?) or None
-
-            top_lm_len = self.top_transformer_config.get("lm_fixed_length", False)
-            if top_lm_len:
-                top_lm_pad_id = self.top_transformer_config.get("lm_pad_id", 258)
-                cont, kpm = _fix_len(cont, kpm, top_lm_len, 0.0)
-                codes, _ = _fix_len(codes, None, top_lm_len, top_lm_pad_id)
 
             transformer_input = cont if self.top_transformer_continuous else F.embedding(
                 codes, self.compressors[-1].vq.codebook
@@ -580,7 +636,7 @@ class HierarchicalAutoencoder(nn.Module):
                 ce_loss = torch.tensor(0., device=device, dtype=torch.float32)
             else:
                 pred = preds_pre_vq[:, :-1, :]
-                mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
+                mask = kpm[:, 1:] if kpm is not None else None
 
                 target_cont = cont[:, 1:, :]
                 mse_per_tok = F.mse_loss(pred, target_cont, reduction='none').mean(dim=-1)
@@ -618,60 +674,60 @@ class HierarchicalAutoencoder(nn.Module):
 
         return avg_loss, details
 
+
     def _prepare_teacher_forcing_inputs(
-        self,
-        tokens: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor],
-        compression_results: Dict[str, Any]
+            self,
+            # tokens: torch.Tensor,
+            # key_padding_mask: Optional[torch.Tensor],
+            compression_results: Dict[str, Any]
     ) -> Dict[str, Any]:
-        all_compressed_codes = compression_results['all_codes']
-        all_pre_vq = compression_results['all_pre_vq']
-        all_valid_masks = compression_results['all_compressor_level_valid_masks']
-        all_patch_end_masks = compression_results.get('all_patch_end_masks', [])
+        """
+        After this call we guarantee, for every level j (0 = bottom bytes):
+            • targets[j]             : (B, S_j)
+            • target_kpms[j] or None : same shape
+            • seg_ids_matching_j     : same shape  (# used later for attn_mask)
 
-        targets: List[torch.Tensor] = []
-        kpms: List[Optional[torch.Tensor]] = []
+          so downstream code never has to pad/clip again.
+        """
+        all_compressor_input_tokens = compression_results["all_compressor_input_tokens"]
+        all_compressor_input_kpms = compression_results["all_compressor_input_kpms"]
+        all_codes = compression_results["all_codes"]
+        all_pre_vq = compression_results["all_pre_vq"]
+        all_valid = compression_results["all_compressor_level_valid_masks"]
+        all_patch_mask = compression_results["all_patch_end_masks"]
+        seg_ids = compression_results["all_seg_ids"]
+        parent_ids_aligned: list[Tensor] = []
+        start_bytes_aligned: list[Tensor] = []
 
-        for j in range(self.num_levels):
-            target_lvl_idx = self.num_levels - 1 - j
-            target_kpm = None
-            if target_lvl_idx == 0:
-                target = tokens
-                target_kpm = key_padding_mask
-            else:
-                target_code_idx = target_lvl_idx - 1
-                target = all_compressed_codes[target_code_idx]
-                if self.propagate_key_padding_mask:
-                    valid_mask = all_valid_masks[target_code_idx]
-                    if valid_mask is not None:
-                        num_q = self.compressors[target_code_idx].num_queries_per_segment
-                        target_kpm = ~valid_mask.repeat_interleave(num_q, dim=1)
+        targets, kpms, seg_ids_aligned = [], [], []
 
-            patch_mask = None
-            if target_lvl_idx < len(all_patch_end_masks):
-                patch_mask = all_patch_end_masks[target_lvl_idx]
-            if patch_mask is not None and target_lvl_idx > 0:
-                eop_id = self.compressors[target_lvl_idx - 1].vq.eop_token_id
-                target, target_kpm = self._insert_eop(target, patch_mask, target_kpm, eop_id)
+        # ---------- walk from top to bottom ----------
+        for lvl in range(self.num_levels-1, -1, -1):
+            tgt = all_compressor_input_tokens[lvl]
+            kpm = all_compressor_input_kpms[lvl]
 
-            targets.append(target)
-            kpms.append(target_kpm)
+            # ---- insert EOP, if we have a patch mask for this level ----
+            if lvl < len(all_patch_mask) and all_patch_mask[lvl] is not None:
+                eop_id = self.compressors[lvl - 1].vq.eop_token_id
+                pad_id = self.compressors[lvl - 1].vq.padding_token_id
+                tgt, kpm = self._insert_eop(tgt, all_patch_mask[lvl], kpm, eop_id, pad_id)
 
-        if self.use_continuous_expander_inputs:
-            top_codes_for_decompress = all_pre_vq[-1]
-            tf_continuous = [
-                all_pre_vq[self.num_levels - 2 - i]
-                for i in range(self.num_levels - 1)
-            ]
-        else:
-            top_codes_for_decompress = compression_results['top_codes']
-            tf_continuous = None
+            targets.append(tgt)
+            kpms.append(kpm)
+
+        top_codes_for_decompress = (all_pre_vq[-1] if self.use_continuous_expander_inputs
+                                    else compression_results["top_codes"])
+        tf_continuous = ([all_pre_vq[-2 - i] for i in range(self.num_levels - 1)]
+                         if self.use_continuous_expander_inputs else None)
 
         return {
             'targets': targets,
             'target_kpms': kpms,
             'top_codes': top_codes_for_decompress,
             'teacher_forcing_embeddings': tf_continuous,
+            'parent_ids_aligned': parent_ids_aligned,  # NEW
+            'start_bytes_aligned': start_bytes_aligned,  # NEW
+            # 'all_seg_ids': seg_ids_aligned,  # NEW: already padded
         }
 
     def _compute_reconstruction_loss(
@@ -800,7 +856,6 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_input_tokens = compression_results['all_compressor_input_tokens']
         all_compressor_input_kpms = compression_results['all_compressor_input_kpms']
         all_codebook_perplexities = compression_results['all_codebook_perplexities']
-        all_smoothed_perplexities = compression_results['all_smoothed_perplexities']
 
         avg_compression_loss, total_compression_loss_weighted, compression_loss_details = (
             self._compute_compression_loss(compression_ratios, tokens.device)
@@ -810,7 +865,7 @@ class HierarchicalAutoencoder(nn.Module):
             compression_results, kpm_for_top_codes
         )
 
-        tf_inputs = self._prepare_teacher_forcing_inputs(tokens, key_padding_mask, compression_results)
+        tf_inputs = self._prepare_teacher_forcing_inputs(compression_results)
         targets_for_expander_stack = tf_inputs['targets']
         target_kpms_for_expander_stack = tf_inputs['target_kpms']
         top_codes_for_decompress = tf_inputs['top_codes']
@@ -822,6 +877,9 @@ class HierarchicalAutoencoder(nn.Module):
             targets_for_teacher_forcing=targets_for_expander_stack,
             target_key_padding_masks=target_kpms_for_expander_stack,
             teacher_forcing_embeddings=tf_continuous,
+            # all_seg_ids=tf_inputs['all_seg_ids'],
+            tf_inputs=tf_inputs,  # for attn_mask
+            compression_results=compression_results,
         )
 
         avg_reconstruction_loss, reconstruction_loss_details = self._compute_reconstruction_loss(
@@ -861,226 +919,147 @@ class HierarchicalAutoencoder(nn.Module):
             'input_seq_lengths_compressors': input_seq_lengths_c,
             'output_seq_lengths_compressors': output_seq_lengths_c,
             'all_codebook_perplexities': all_codebook_perplexities,
-            'all_smoothed_perplexities': all_smoothed_perplexities,
         }
 
     @torch.no_grad()
-    def generate_bytes(self,
-                       tokens: torch.Tensor,
-                       key_padding_mask: Optional[torch.Tensor] = None,
-                       max_len_override: Optional[int] = None) -> torch.Tensor:
-        """Compress ``tokens`` and decode them autoregressively.
+    def generate_bytes(
+        self,
+        prompt_tokens: torch.Tensor,                       # (B,S₀)
+        key_padding_mask: Optional[torch.Tensor] = None,
+        *,
+        max_top_codes: int = 256,                          # hard stop
+        decode_max_len: Optional[int] = None,              # per-segment
+    ) -> torch.Tensor:
+        """
+        Autoregressive decoding loop:
 
-        The top-level codes are optionally extended using the
-        :class:`CodeSequenceTransformer`.  When
-        ``use_continuous_expander_inputs`` is ``True`` the transformer operates
-        on continuous embeddings and the resulting vectors are fed directly to
-        :meth:`decompress`.  Otherwise the discrete indices predicted by the
-        transformer are gathered and passed to :meth:`decompress`.
+          1. Compress the prompt → top-level code sequence C.
+          2. repeat until EOS or `max_top_codes`:
+               a. CodeSequenceTransformer predicts **one** next top symbol cᵢ.
+               b. Append cᵢ to C.
+               c. Decompress *entire* C through all expanders → bytes B.
+               d. Emit only the new byte span B[prev_len:].
+          3. Return `prompt_tokens ⊕ generated_bytes`.
 
-        Args:
-            tokens: Input byte tokens ``(B, S)``.
-            key_padding_mask: Optional mask marking padded positions.
-            max_len_override: Optional maximum length for generation.
-
-        Returns:
-            Tensor containing the reconstructed byte sequences from the final
-            expander.
+        Notes
+        -----
+        • Works for both continuous and discrete expander inputs.
+        • Assumes `self.expander_eos_id` marks the *end of sequence* at the
+          bottom level (byte stream).
         """
         self.eval()
-        compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
-        top_cont = compression_results['all_pre_vq'][-1]
-        top_codes = compression_results['top_codes']
-        kpm_for_top_expander_input = compression_results['final_key_padding_mask']
 
-        generated_cont = top_cont
-        generated_kpm = kpm_for_top_expander_input
-        generated_codes = top_codes if not self.use_continuous_expander_inputs else None
+        B = prompt_tokens.size(0)
+        device = prompt_tokens.device
+        use_cont = self.use_continuous_expander_inputs
 
-        if self.code_sequence_transformer is not None:
-            # Autoregressively extend using transformer predictions
-            while True:
-                if max_len_override is not None and generated_cont.size(1) >= max_len_override:
-                    break
+        # ------------------------------------------------------------------
+        # 1. Compress the prompt
+        # ------------------------------------------------------------------
+        comp = self.compress(prompt_tokens, key_padding_mask=key_padding_mask)
+        for idx, mask in enumerate(comp["all_compressor_level_valid_masks"]):
+            print(f'mask {idx} valid: {mask.sum().item()}')
+        if use_cont:
+            top_mem = comp["all_pre_vq"][-1].clone()        # (B, L_top, D)
+            top_codes_discrete = None
+        else:
+            top_mem = comp["top_codes"].clone()             # (B, L_top)
+            top_codes_discrete = top_mem.clone()
 
-                top_lm_len = self.top_transformer_config.get("lm_fixed_length", False)
-                if top_lm_len:
-                    top_lm_pad_id = self.top_transformer_config.get("lm_pad_id", 258)
-                    generated_cont, generated_kpm = _fix_len(generated_cont, generated_kpm, top_lm_len, 0.0)
-                    generated_codes, _ = _fix_len(generated_codes, None, top_lm_len, top_lm_pad_id)
+        # kpm for transformer (None = no padding)
+        top_kpm = comp["final_key_padding_mask"].clone() if comp["final_key_padding_mask"] is not None else None
 
-                transformer_input = (
-                    generated_cont
-                    if self.top_transformer_continuous or generated_codes is None
-                    else F.embedding(generated_codes, self.compressors[-1].vq.codebook)
-                )
-                out = self.code_sequence_transformer(
-                    input_embeddings=transformer_input,
-                    key_padding_mask=generated_kpm,
-                )
-                next_vec = out["predictions_pre_vq"][:, -1, :]
-                next_idx = out["indices"][:, -1] if out["indices"] is not None else None
-                generated_cont = torch.cat([generated_cont, next_vec.unsqueeze(1)], dim=1)
-                if generated_codes is not None and next_idx is not None:
-                    generated_codes = torch.cat([generated_codes, next_idx.unsqueeze(1)], dim=1)
-                if generated_kpm is not None:
-                    pad = torch.zeros(generated_kpm.size(0), 1, dtype=generated_kpm.dtype, device=generated_kpm.device)
-                    generated_kpm = torch.cat([generated_kpm, pad], dim=1)
-
-                if next_idx is not None and (next_idx == self.expander_eos_id).all():
-                    break
-
-        decomp_input = generated_cont if self.use_continuous_expander_inputs else generated_codes
-        decomp = self.decompress(
-            top_codes=decomp_input,
-            top_codes_key_padding_mask=generated_kpm,
-            targets_for_teacher_forcing=None,
-            max_len_override=max_len_override,
-            teacher_forcing_embeddings=None,
-        )
-
-        return decomp['final_reconstructed_tokens']
+        # Keep a running byte buffer
+        generated_bytes = prompt_tokens                   # list for torch.cat
+        prev_decoded_len = prompt_tokens.size(1)
 
 
-    # @torch.no_grad()
-    # def generate_bytes(
-    #     self,
-    #     prompt_tokens: torch.Tensor,                       # (B,S₀)
-    #     key_padding_mask: Optional[torch.Tensor] = None,
-    #     *,
-    #     max_top_codes: int = 256,                          # hard stop
-    #     decode_max_len: Optional[int] = None,              # per-segment
-    # ) -> torch.Tensor:
-    #     """
-    #     Autoregressive decoding loop:
-    #
-    #       1. Compress the prompt → top-level code sequence C.
-    #       2. repeat until EOS or `max_top_codes`:
-    #            a. CodeSequenceTransformer predicts **one** next top symbol cᵢ.
-    #            b. Append cᵢ to C.
-    #            c. Decompress *entire* C through all expanders → bytes B.
-    #            d. Emit only the new byte span B[prev_len:].
-    #       3. Return `prompt_tokens ⊕ generated_bytes`.
-    #
-    #     Notes
-    #     -----
-    #     • Works for both continuous and discrete expander inputs.
-    #     • Assumes `self.expander_eos_id` marks the *end of sequence* at the
-    #       bottom level (byte stream).
-    #     """
-    #     self.eval()
-    #
-    #     B = prompt_tokens.size(0)
-    #     device = prompt_tokens.device
-    #     use_cont = self.use_continuous_expander_inputs
-    #
-    #     # ------------------------------------------------------------------
-    #     # 1. Compress the prompt
-    #     # ------------------------------------------------------------------
-    #     comp = self.compress(prompt_tokens, key_padding_mask=key_padding_mask)
-    #     print(f'Current top-level sequence length: {comp["top_codes"].size(1)}') # temp debug output
-    #
-    #     if use_cont:
-    #         top_mem = comp["all_pre_vq"][-1].clone()        # (B, L_top, D)
-    #         top_codes_discrete = None
-    #     else:
-    #         top_mem = comp["top_codes"].clone()             # (B, L_top)
-    #         top_codes_discrete = top_mem.clone()
-    #
-    #     # kpm for transformer (None = no padding)
-    #     top_kpm = comp["final_key_padding_mask"].clone() if comp["final_key_padding_mask"] is not None else None
-    #
-    #     # Keep a running byte buffer
-    #     generated_bytes = prompt_tokens                   # list for torch.cat
-    #     prev_decoded_len = prompt_tokens.size(1)
-    #
-    #     #temp
-    #     from .tokenizer import ByteLevelTokenizer
-    #     tokenizer = ByteLevelTokenizer()
-    #
-    #     tf_inputs = self._prepare_teacher_forcing_inputs(prompt_tokens, key_padding_mask, comp)
-    #     generated_bytes = tf_inputs['targets'][0]
-    #     prev_decoded_len = generated_bytes.size(1)
-    #
-    #     # ------------------------------------------------------------------
-    #     # 2. Main loop
-    #     # ------------------------------------------------------------------
-    #     for _ in range(max_top_codes):
-    #
-    #         # ---- 2a. predict ONE next top symbol -------------------------
-    #         if self.code_sequence_transformer is None:
-    #             raise RuntimeError("top-level transformer not initialised")
-    #
-    #         # Transformer input depends on `continuous` flag
-    #         tr_input = (
-    #             top_mem if (use_cont or top_codes_discrete is None)
-    #             else F.embedding(top_codes_discrete,
-    #                              self.compressors[-1].vq.codebook)
-    #         )
-    #
-    #         tr_out = self.code_sequence_transformer(
-    #             input_embeddings=tr_input,
-    #             key_padding_mask=top_kpm,
-    #         )
-    #
-    #         next_vec  = tr_out["predictions_pre_vq"][:, -1, :]          # (B,D)
-    #         next_idx  = tr_out["indices"][:, -1] if tr_out["indices"] is not None else None
-    #
-    #         # ---- 2b. append to top sequence -----------------------------
-    #         if use_cont:
-    #             top_mem = torch.cat([top_mem, next_vec.unsqueeze(1)], dim=1)
-    #         else:
-    #             if next_idx is None:
-    #                 raise RuntimeError("transformer did not return indices in discrete mode")
-    #             top_mem = torch.cat([top_mem, next_idx.unsqueeze(1)], dim=1)  # codes_hi
-    #             top_codes_discrete = top_mem
-    #
-    #         if top_kpm is not None:                                       # extend KPM with 0-pad
-    #             pad = torch.zeros(B, 1, dtype=top_kpm.dtype, device=device)
-    #             top_kpm = torch.cat([top_kpm, pad], dim=1)
-    #
-    #         # ---- 2c. full downward decode -------------------------------
-    #         decomp_inp = top_mem if use_cont else top_codes_discrete
-    #         decomp = self.decompress(
-    #             top_codes=decomp_inp,
-    #             decomp_codes_lo=generated_bytes,
-    #             top_codes_key_padding_mask=top_kpm,
-    #             targets_for_teacher_forcing=None,             # generation mode
-    #             max_len_override=decode_max_len,
-    #             teacher_forcing_embeddings=None,
-    #         )
-    #         reconstructed = decomp["final_reconstructed_tokens"]        # (B, S_total)
-    #
-    #         # ---- 2d. take only the *new* bytes --------------------------
-    #         new_bytes = reconstructed[:, prev_decoded_len:]              # (B, Δ)
-    #
-    #         # prev_decoded_len = reconstructed.size(1)
-    #         if new_bytes.size(1) == 0:
-    #             # No new bytes generated, stop early
-    #             print("No new bytes generated, stopping early.")
-    #             break
-    #
-    #         # now cat the new bytes to the tensor in generated bytes
-    #         generated_bytes = torch.cat((generated_bytes, new_bytes), dim=1)
-    #
-    #         # if the last byte is EOS, we stop here
-    #         if generated_bytes[:, -1] == self.expander_eos_id:
-    #             print("Last byte is EOS, stopping generation.")
-    #             break
-    #
-    #         # if the last byte is EOP, we remove it, and continue
-    #         # if generated_bytes[:, -1] == self.compressors[-1].vq.eop_token_id:
-    #         #     print("Last byte is EOP, removing it stop generation.")
-    #         #     generated_bytes = generated_bytes[:, :-1]
-    #         #     break
-    #
-    #         # ---- 2e. stopping condition --------------------------------
-    #         if (next_idx is not None) and (next_idx == self.expander_eos_id).all():
-    #             break
-    #
-    #         prev_decoded_len = generated_bytes.size(1)  # update for the next iteration
-    #
-    #     # ------------------------------------------------------------------
-    #     # 3. return prompt + continuation
-    #     # ------------------------------------------------------------------
-    #     return generated_bytes
+        # ------------------------------------------------------------------
+        # 2. Main loop
+        # ------------------------------------------------------------------
+        for _ in range(max_top_codes):
+
+            # ---- 2a. predict ONE next top symbol -------------------------
+            if self.code_sequence_transformer is None:
+                raise RuntimeError("top-level transformer not initialised")
+
+            top_lm_len = self.top_transformer_config.get("lm_fixed_length", False)
+            if top_lm_len:
+                top_lm_pad_id = self.top_transformer_config.get("lm_pad_id", 258)
+                top_mem, top_kpm = _fix_len(top_mem, top_kpm, top_lm_len, 0.0)
+                if not use_cont:
+                    top_codes_discrete, _ = _fix_len(top_codes_discrete, None, top_lm_len, top_lm_pad_id)
+
+            # Transformer input depends on `continuous` flag
+            tr_input = (
+                top_mem if (use_cont or top_codes_discrete is None)
+                else F.embedding(top_codes_discrete,
+                                 self.compressors[-1].vq.codebook)
+            )
+
+            tr_out = self.code_sequence_transformer(
+                input_embeddings=tr_input,
+                key_padding_mask=top_kpm,
+            )
+
+            next_vec  = tr_out["predictions_pre_vq"][:, -1, :]          # (B,D)
+            next_idx  = tr_out["indices"][:, -1] if tr_out["indices"] is not None else None
+
+            # drop the pad tail so we overwrite it, not grow past it
+            top_mem, top_kpm = _trim_trailing_pad(top_mem, top_kpm)
+            if not use_cont:
+                top_codes_discrete, _ = _trim_trailing_pad(top_codes_discrete, top_kpm)
+
+            # ---- 2b. append to top sequence -----------------------------
+            if use_cont:
+                top_mem = torch.cat([top_mem, next_vec.unsqueeze(1)], dim=1)
+            else:
+                if next_idx is None:
+                    raise RuntimeError("transformer did not return indices in discrete mode")
+                top_mem = torch.cat([top_mem, next_idx.unsqueeze(1)], dim=1)  # codes_hi
+                top_codes_discrete = top_mem
+
+            if top_kpm is not None:                                       # extend KPM with 0-pad
+                pad = torch.zeros(B, 1, dtype=top_kpm.dtype, device=device)
+                top_kpm = torch.cat([top_kpm, pad], dim=1)
+
+            # ---- 2c. full downward decode -------------------------------
+            decomp_inp = top_mem if use_cont else top_codes_discrete
+            decomp = self.decompress(
+                top_codes=decomp_inp,
+                decomp_codes_lo=generated_bytes,
+                top_codes_key_padding_mask=top_kpm,
+                targets_for_teacher_forcing=None,             # generation mode
+                max_len_override=decode_max_len,
+                teacher_forcing_embeddings=None,
+                all_seg_ids=comp["all_seg_ids"],
+            )
+            reconstructed = decomp["final_reconstructed_tokens"]        # (B, S_total)
+
+            # ---- 2d. take only the *new* bytes --------------------------
+            new_bytes = reconstructed[:, prev_decoded_len:]              # (B, Δ)
+
+            # prev_decoded_len = reconstructed.size(1)
+            if new_bytes.size(1) == 0:
+                # No new bytes generated, stop early
+                print("No new bytes generated, stopping early.")
+                break
+
+            # now cat the new bytes to the tensor in generated bytes
+            generated_bytes = torch.cat((generated_bytes, new_bytes), dim=1)
+
+            # if the last byte is EOS, we stop here
+            if generated_bytes[:, -1] == self.expander_eos_id:
+                print("Last byte is EOS, stopping generation.")
+                break
+
+            # ---- 2e. stopping condition --------------------------------
+            if (next_idx is not None) and (next_idx == self.expander_eos_id).all():
+                break
+
+            prev_decoded_len = generated_bytes.size(1)  # update for the next iteration
+
+        # ------------------------------------------------------------------
+        # 3. return prompt + continuation
+        # ------------------------------------------------------------------
+        return generated_bytes

@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 from dataclasses import asdict
 import logging
+from functools import partial
 
 # Name for loggers created in this module so logs don't show '__main__'
 LOGGER_NAME = "abstractinator.train"
@@ -40,7 +41,7 @@ from configs.base_config import (
 torch.backends.cuda.enable_flash_sdp(True)   # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
-
+# torch._dynamo.config.recompile_limit = 512
 
 def parse_args() -> argparse.Namespace:
     """Return command line arguments for the training script."""
@@ -305,23 +306,76 @@ def train_loop(
         "\nTokenizing and processing dataset with sequence length %s...",
         exp_config.sequence_length,
     )
+
     tokenized_dataset = raw_dataset.map(
-        tokenize_and_process_examples,
+        partial(
+            tokenize_and_process_examples,
+            sequence_length=exp_config.sequence_length,
+            tokenizer=tokenizer,
+            text_column=exp_config.text_column_name,
+        ),
         batched=True,
-        fn_kwargs={
-            "sequence_length": exp_config.sequence_length,
-            "tokenizer": tokenizer,
-            "text_column": exp_config.text_column_name,
-        },
         remove_columns=raw_dataset.column_names,
-        num_proc=n_cpu,
+        num_proc=8,
+        desc="Byte-tokenising",
     )
-    logger.info("Tokenization complete.")
+
+    # tokenized_dataset.set_format(
+    #     type="torch",
+    #     columns=["input_ids", "labels", "key_padding_mask"],
+    #     dtype=torch.int16,
+    # )
+
+    tokenized_dataset.set_format("torch",
+                                 columns=["input_ids", "labels"],
+                                 dtype=torch.int16)  # let datasets choose per-column dtype
 
     tokenized_dataset.set_format(
         type="torch",
         columns=["input_ids", "labels", "key_padding_mask"],
+        output_all_columns=True,  # keeps prior dtype choices
     )
+    # tokenized_dataset = tokenized_dataset.cast_column("input_ids", "int16")
+    # tokenized_dataset = tokenized_dataset.cast_column("labels", "int16")
+    # key_padding_mask stays bool ➜ no error
+
+    # tokenized_dataset = raw_dataset.map(
+    #     partial(
+    #         tokenize_and_process_examples,
+    #         sequence_length=exp_config.sequence_length,
+    #         tokenizer=tokenizer,
+    #         text_column=exp_config.text_column_name,
+    #     ),
+    #     batched=True,
+    #     remove_columns=raw_dataset.column_names,
+    #     num_proc=8,
+    #     desc="Byte-tokenising",
+    # )
+    #
+    # tokenized_dataset.set_format(
+    #     type="torch",
+    #     columns=["input_ids", "labels", "key_padding_mask"],
+    #     dtype=torch.int16,
+    # )
+
+
+    # tokenized_dataset = raw_dataset.map(
+    #     tokenize_and_process_examples,
+    #     batched=True,
+    #     fn_kwargs={
+    #         "sequence_length": exp_config.sequence_length,
+    #         "tokenizer": tokenizer,
+    #         "text_column": exp_config.text_column_name,
+    #     },
+    #     remove_columns=raw_dataset.column_names,
+    #     num_proc=8,
+    # )
+    # logger.info("Tokenization complete.")
+    #
+    # tokenized_dataset.set_format(
+    #     type="torch",
+    #     columns=["input_ids", "labels", "key_padding_mask"],
+    # )
 
     train_dataloader = DataLoader(
         tokenized_dataset,
@@ -619,12 +673,12 @@ def train_loop(
                             input_gen_kpm = torch.zeros_like(input_gen_tokens, dtype=torch.bool).to(device)
 
                         reconstructed_tokens = model.generate_bytes(
-                            tokens=input_gen_tokens,
+                            prompt_tokens=input_gen_tokens,
                             key_padding_mask=input_gen_kpm,
-                            max_len_override=exp_config.generation_max_len_override,
+                            max_top_codes=exp_config.generation_max_len_override,
                         )
                         reconstructed_text = tokenizer.decode(
-                            reconstructed_tokens.squeeze(0).cpu(), cut_at_eos=True
+                            reconstructed_tokens.squeeze(0).cpu()
                         )
 
                         logger.info("--- Sample Generation at Step %s ---", global_step)

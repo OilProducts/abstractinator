@@ -95,6 +95,7 @@ class CompressorLevelConfig:
     entropy_abs_threshold: Optional[float] = None
     target_compression_ratio: Optional[List[float]] = None
     compression_loss_weight: float = 1.0
+    output_length: int = 512
 
     def __post_init__(self) -> None:
         if self.lm_window is None:
@@ -110,7 +111,7 @@ class TopTransformerConfig:
     num_layers: int = 24
     num_heads: int = 16
     ffn_dim_multiplier: int = 4
-    continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
+    continuous: bool = True  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
     ce_weight: float = 1.0  # Weight for the cross-entropy component of the top LM loss
     head_dim: Optional[int] = 32  # K
@@ -131,7 +132,11 @@ class ExpanderConfig:
     eos_id: int = 1
     max_len: int = 8192
     use_decoder_only: bool = True
-    use_continuous_inputs: bool = False
+    use_continuous_inputs: bool = True
+    cross_window: Optional[int] = 128  # If None, use the same window as the compressor level
+    hi_dim: int = 128 # Dimension of the high-level representation
+    lo_dim: int = 128 # Dimension of the low-level representation
+
 
 
 @dataclass
@@ -155,13 +160,13 @@ class ExpConfig:
     )
     propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
-    batch_size: int = 32
+    batch_size: int = 16
     sequence_length: int = 1024
     num_epochs: int = 1
     max_steps: Optional[int] = None
     log_interval: int = 1
     gradient_clip_norm: float = 1.0
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 1 # 8
     scheduler_type: str = "cosine_with_min_lr"
     warmup_steps: int = 1000
     scheduler_specific_kwargs: Dict[str, Any] = field(
@@ -171,9 +176,9 @@ class ExpConfig:
     dataset_config: Optional[str] = None
     dataset_train_split: str = "train"
     text_column_name: str = "text"
-    generation_interval: int = 50
+    generation_interval: int = 200
     sample_prompt_for_generation: str = "In a land far away, "
-    generation_max_len_override: int = 512
+    generation_max_len_override: int = 128
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"
     resume_from_checkpoint: Optional[str] = None
