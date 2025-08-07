@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from functools import lru_cache
 from .rope import RotaryCache, apply_rope
 from .swiglu import SwiGLU
-from .sliding_window_attention import SlidingWindowCrossAttention, SegmentCausalCrossAttention
+from .sliding_window_attention import SlidingWindowCrossAttention, SegmentCausalCrossAttention, AttnCache
 
 
 @lru_cache(maxsize=64)
@@ -174,8 +174,14 @@ class SimpleDecoder(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim):
+    def __init__(self,
+                 idx: int,
+                 d_model: int,
+                 num_heads: int,
+                 cross_window: int,
+                 q_dim, kv_dim):
         super().__init__()
+        self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
         self.self_attn = MultiHeadAttentionRoPE(d_model, num_heads, causal=True)
         self.norm2 = nn.RMSNorm(d_model)
@@ -190,13 +196,21 @@ class SlidingDecoderBlock(nn.Module):
         x: torch.Tensor,
         memory: torch.Tensor,
         seg_ids: Optional[torch.Tensor] = None,
+        cache: Optional[AttnCache] = None,
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), kv_src=memory, seg_id=seg_ids, kv_mask=memory_key_padding_mask, q_pad_mask=tgt_key_padding_mask)
+
+        cross_cache = None if cache is None else cache.cross.setdefault(self.layer_id, {})
+        x = x + self.cross_attn(self.norm2(x),
+                                kv_src=memory,
+                                seg_id=seg_ids,
+                                kv_mask=memory_key_padding_mask,
+                                q_pad_mask=tgt_key_padding_mask,
+                                cache=cross_cache)
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -204,15 +218,29 @@ class SlidingDecoderBlock(nn.Module):
 class SlidingDecoder(nn.Module):
     def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int):
         super().__init__()
-        self.layers = nn.ModuleList([
-            SlidingDecoderBlock(d_model, num_heads, cross_window, q_dim, kv_dim) for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList()
+        for l_idx in range(num_layers):
+            layer = SlidingDecoderBlock(
+                idx=l_idx,
+                d_model=d_model,
+                num_heads=num_heads,
+                cross_window=cross_window,
+                q_dim=q_dim,
+                kv_dim=kv_dim
+            )
+            self.layers.append(layer)
+
+
+        # self.layers = nn.ModuleList([
+        #     SlidingDecoderBlock(d_model, num_heads, cross_window, q_dim, kv_dim) for _ in range(num_layers)
+        # ])
         self.final_norm = nn.RMSNorm(d_model)
 
     def forward(
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
+        cache: Optional[AttnCache] = None,
         tgt_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
@@ -223,6 +251,7 @@ class SlidingDecoder(nn.Module):
             x = layer(
                 x,
                 memory,
+                cache=cache,
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
@@ -403,49 +432,130 @@ class DecoderOnlyExpander(nn.Module):
             tgt_mask=tgt_mask,
             tgt_key_padding_mask=adjusted_tgt_kpm,
             memory_key_padding_mask=src_key_padding_mask,
-            # cross_attn_mask=attn_mask,
             seg_ids=seg_ids,
         )
         logits = self.out_proj(dec_out)
         return {"logits": logits}
 
+    # @torch.no_grad()
+    # def generate(
+    #     self,
+    #     codes_hi: torch.Tensor,
+    #     codes_lo: torch.Tensor,
+    #     src_key_padding_mask: Optional[torch.Tensor] = None,
+    #     tgt_key_padding_mask: Optional[torch.Tensor] = None,
+    #     seg_ids: Optional[torch.Tensor] = None,
+    #     max_len: Optional[int] = None,
+    # ) -> torch.Tensor:
+    #     cache = AttnCache()
+    #     device = codes_hi.device
+    #     current_max_len = max_len if max_len is not None else self.max_len
+    #     current_max_len = 16
+    #     if codes_hi.is_floating_point():
+    #         memory = codes_hi
+    #     else:
+    #         memory = self.emb_hi(codes_hi)
+    #
+    #     # generated_ids = torch.empty((0,0), dtype=torch.long, device=device)
+    #     generated_ids = codes_lo
+    #     # generated_ids = torch.empty((codes_hi.size(0), 1), dtype=torch.long, device=device)
+    #
+    #     # reconstructing the original sequence
+    #     for _ in range(current_max_len - 1):
+    #         seq_len = generated_ids.size(1)
+    #         dec_inp = self.emb_lo(generated_ids)
+    #         tgt_mask = self._causal_mask(seq_len, device)
+    #         dec_out = self.decoder(
+    #             dec_inp,
+    #             memory,
+    #             cache=cache,
+    #             tgt_mask=tgt_mask,
+    #             tgt_key_padding_mask=tgt_key_padding_mask,
+    #             memory_key_padding_mask=src_key_padding_mask,
+    #             seg_ids=seg_ids,
+    #         )
+    #         next_logits = self.out_proj(dec_out[:, -1, :])
+    #         next_id = next_logits.argmax(dim=-1, keepdim=True)
+    #         # generated_ids = torch.cat([generated_ids, next_id], dim=1)
+    #         # We have to insert the next_id at the end of the non-padded elements
+    #         len_valid = tgt_key_padding_mask.sum(dim=-1)
+    #         only_valid_ids = generated_ids[:, :len_valid]
+    #         generated_ids = torch.cat([only_valid_ids, next_id], dim=1)
+    #         generated_ids =
+    #
+    #         if (next_id == self.eos_id) or (next_id == self.eop_id):
+    #             break
+    #
+    #     return generated_ids
+
     @torch.no_grad()
     def generate(
-        self,
-        codes_hi: torch.Tensor,
-        codes_lo: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        seg_ids: Optional[torch.Tensor] = None,
-        max_len: Optional[int] = None,
+            self,
+            codes_hi: torch.Tensor,
+            codes_lo: torch.Tensor,  # (B, L)  – already padded to L
+            src_key_padding_mask: Optional[torch.Tensor] = None,
+            tgt_key_padding_mask: Optional[torch.Tensor] = None,
+            seg_ids: Optional[torch.Tensor] = None,
+            max_len: Optional[int] = None,
+            max_new_tokens: Optional[int] = None,
+
     ) -> torch.Tensor:
+        """
+        Autoregressively fills the PAD slots of `codes_lo` while keeping its length
+        static.  `tgt_key_padding_mask` must match `codes_lo` (True == PAD).
+        """
         device = codes_hi.device
-        current_max_len = max_len if max_len is not None else self.max_len
-        current_max_len = 16
-        if codes_hi.is_floating_point():
-            memory = codes_hi
-        else:
-            memory = self.emb_hi(codes_hi)
+        B, L = codes_lo.shape
+        budget = max_len if max_len is not None else self.max_len
 
-        generated_ids = torch.empty((0,0), dtype=torch.long, device=device)
-        generated_ids = codes_lo
-        # generated_ids = torch.empty((codes_hi.size(0), 1), dtype=torch.long, device=device)
+        # ── high-level memory ───────────────────────────────────────────────
+        memory = codes_hi if codes_hi.is_floating_point() else self.emb_hi(codes_hi)
 
-        for _ in range(current_max_len - 1):
-            seq_len = generated_ids.size(1)
-            dec_inp = self.emb_lo(generated_ids)
-            tgt_mask = self._causal_mask(seq_len, device)
+        # ensure we have a padding mask to mutate in-place
+        if tgt_key_padding_mask is None:
+            tgt_key_padding_mask = torch.zeros_like(codes_lo, dtype=torch.bool)
+
+        generated = codes_lo.clone()  # (B, L)
+        cache = AttnCache()  # KV-cache for all decoder layers
+
+        for _ in range(budget):
+            # how many non-PAD tokens are present in each sample
+            len_valid = (~tgt_key_padding_mask).sum(dim=1)  # (B,)
+
+            # stop if every sequence is full
+            if (len_valid == L).all():
+                break
+
+            # run the decoder on the *full* sequence
+            dec_inp = self.emb_lo(generated)  # (B, L, D)
+            tgt_mask = self._causal_mask(L, device)
+
             dec_out = self.decoder(
                 dec_inp,
                 memory,
+                cache=cache,
                 tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=src_key_padding_mask,
                 seg_ids=seg_ids,
-            )
-            next_logits = self.out_proj(dec_out[:, -1, :])
-            next_id = next_logits.argmax(dim=-1, keepdim=True)
-            generated_ids = torch.cat([generated_ids, next_id], dim=1)
-            if (next_id == self.eos_id) or (next_id == self.eop_id):
+            )  # (B, L, D)
+
+            # ── logits for the last valid token in each batch ─────
+            gather_idx = (len_valid - 1).unsqueeze(1).unsqueeze(2)  # (B,1,1)
+            last_hid = dec_out.gather(1, gather_idx.expand(-1, 1, dec_out.size(-1))) \
+                .squeeze(1)  # (B, D)
+
+            next_logits = self.out_proj(last_hid)  # (B, K_lo)
+            next_id = next_logits.argmax(dim=-1)  # (B,)
+
+            # ── write `next_id` into the first PAD slot, update mask ────
+            insert_pos = len_valid.unsqueeze(1)  # (B,1)
+            generated.scatter_(1, insert_pos, next_id.unsqueeze(1))
+            tgt_key_padding_mask.scatter_(1, insert_pos, False)
+
+            # optional early-stop on EOS/EOP
+            if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
                 break
 
-        return generated_ids
+        return generated
+

@@ -176,7 +176,7 @@ class ExpConfig:
     dataset_config: Optional[str] = None
     dataset_train_split: str = "train"
     text_column_name: str = "text"
-    generation_interval: int = 200
+    generation_interval: int = 300
     sample_prompt_for_generation: str = "In a land far away, "
     generation_max_len_override: int = 128
     checkpoint_interval: int = 1000

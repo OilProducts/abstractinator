@@ -23,6 +23,8 @@ class CompressorOutput:
     pre_vq_embeddings: torch.Tensor  # Embeddings before VQ
     seg_id: torch.Tensor  # Segment IDs for each token (B, S)
     first_byte_idx: torch.Tensor  # First byte index for each segment (B, S)
+    input_sequence: torch.Tensor
+    input_padding_mask: torch.Tensor
 
 
 # If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
@@ -271,34 +273,6 @@ class ByteSegmentCompressor(nn.Module):
         # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
         # Apply vector quantization to the pooled segment embeddings.
         quantised_embeddings, vq_loss, codebook_indices, perplexity = self.vq(pooled_embeddings)
-        # quantised_embeddings: (B, S_hat*L, D)
-        # vq_loss: scalar
-        # codebook_indices: (B, S_hat*L)
-        # Calculate codebook perplexity
-        # codebook_perplexity = torch.tensor(1.0, device=token_ids.device)  # Default for empty/no codes
-        # if codebook_indices.numel() > 0:
-        #     flat_indices = codebook_indices.reshape(-1)
-        #     # Ensure K is correctly accessed from your VQ instance
-        #     # Assuming self.vq.K holds the codebook size
-        #     num_codebook_vectors = self.vq.K
-        #
-        #     # Clamp indices to be safe, though they should be in range [0, K-1]
-        #     clamped_indices = torch.clamp(flat_indices, 0, num_codebook_vectors - 1)
-        #
-        #     counts = torch.bincount(clamped_indices.long(), minlength=num_codebook_vectors)
-        #
-        #     # Probabilities of using each code
-        #     p_codes = counts.float() / flat_indices.numel()
-        #     # Filter out p=0 for entropy calculation to avoid log(0)
-        #     p_codes_nz = p_codes[p_codes > 0]
-        #
-        #     if p_codes_nz.numel() > 0:  # If any codes were actually used
-        #         entropy_val = -torch.sum(p_codes_nz * torch.log(p_codes_nz))  # Natural log for nats
-        #         codebook_perplexity = torch.exp(entropy_val)  # Perplexity = e^H
-        #     # else: perplexity remains 1.0 (e.g., if flat_indices was empty or all codes had 0 prob somehow)
-        # elif pooled_embeddings.numel() > 0 and pooled_embeddings.size(
-        #         1) == 0:  # Pooled embeddings exist but have 0 query dim
-        #     codebook_perplexity = torch.tensor(1.0, device=token_ids.device)  # No codes to choose from
 
         # Pad outputs to output_length
         pad_id = self.vq.padding_token_id
@@ -326,25 +300,11 @@ class ByteSegmentCompressor(nn.Module):
             vq_loss=vq_loss,                      # Scalar tensor
             vq_perplexity=perplexity,             # Scalar tensor
             valid_mask=valid_segments_mask,       # (B, S)
-            patch_end_mask=patch_end_mask,        # (B, S)
+            patch_end_mask=patch_end_mask,        # (B, S)  # True if this is the last token of a segment
             entropy_model_logits=logits,          # (B, S, vocab_size)
             pre_vq_embeddings=pooled_embeddings,  # (B, S_hat*L, D)
             seg_id=seg_id,                        # (B, S)  integers 0…
             first_byte_idx=first_byte_idx,        # (B, S)
+            input_sequence=token_ids,
+            input_padding_mask=key_padding_mask,
         )
-
-        # Update the return dictionary
-        # return_dict = {
-        #     'continuous': quantised_embeddings,
-        #     'codes': codebook_indices,
-        #     'vq_loss': vq_loss,
-        #     'valid_mask': valid_segments_mask,  # (B, S_hat_segments)
-        #     'patch_end_mask': patch_end_mask,
-        #     'encoder_logits': logits,
-        #     'current_codebook_perplexity': codebook_perplexity,
-        #     'smoothed_codebook_perplexity': perplexity,
-        #     'pre_vq_embeddings': pooled_embeddings,
-        #     'seg_id': seg_id,  # (B, S)  integers 0…Ŝ-1
-        #     'first_byte_idx': first_byte_idx,  # (B, S)  NEW
-        #
-        # }

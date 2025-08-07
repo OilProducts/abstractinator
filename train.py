@@ -490,10 +490,11 @@ def train_loop(
                     accumulators["compression_ratios"][level_idx] += ratio
 
                 batch_sz = tokens.size(0)
-                for level_idx, length in enumerate(output_dict["input_seq_lengths_compressors"]):
-                    accumulators["input_seq_lengths_compressors"][level_idx] += length * batch_sz
-                for level_idx, length in enumerate(output_dict["output_seq_lengths_compressors"]):
-                    accumulators["output_seq_lengths_compressors"][level_idx] += length * batch_sz
+                for level_idx, comp_step in enumerate(output_dict["compression_results"]["steps"]):
+                    accumulators["input_seq_lengths_compressors"][level_idx] += ~comp_step.input_padding_mask.sum() # * batch_sz
+                    accumulators["output_seq_lengths_compressors"][level_idx] += ~comp_step.patch_end_mask.sum() # * batch_sz
+                # for level_idx, length in enumerate(output_dict["output_seq_lengths_compressors"]):
+                #     accumulators["output_seq_lengths_compressors"][level_idx] += length * batch_sz
 
             if "all_codebook_perplexities" in output_dict:
                 for level_idx, perplexity in enumerate(output_dict["all_codebook_perplexities"]):
@@ -676,6 +677,7 @@ def train_loop(
                             prompt_tokens=input_gen_tokens,
                             key_padding_mask=input_gen_kpm,
                             max_top_codes=exp_config.generation_max_len_override,
+                            decode_max_len = 8
                         )
                         reconstructed_text = tokenizer.decode(
                             reconstructed_tokens.squeeze(0).cpu()
