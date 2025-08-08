@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 import math
 from functools import lru_cache
-from typing import Callable, Tuple, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch._dynamo as dynamo

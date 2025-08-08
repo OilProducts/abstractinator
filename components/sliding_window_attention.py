@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 from functools import lru_cache
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
