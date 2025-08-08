@@ -41,7 +41,7 @@ from configs.base_config import (
 torch.backends.cuda.enable_flash_sdp(True)   # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
-# torch._dynamo.config.recompile_limit = 512
+torch._dynamo.config.recompile_limit = 512
 
 def parse_args() -> argparse.Namespace:
     """Return command line arguments for the training script."""
@@ -118,13 +118,6 @@ def initialize_model(
         compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
         expander_level_configs= [asdict(e) for e in exp_config.expander_level_configs],
         initial_vocab_size=exp_config.initial_vocab_size,
-        # expander_dim_scale=exp_config.expander.dim_scale,
-        # expander_num_enc_layers=exp_config.expander.num_enc_layers,
-        # expander_num_dec_layers=exp_config.expander.num_dec_layers,
-        # expander_heads_scale=exp_config.expander.heads_scale,
-        # expander_eos_id=exp_config.expander.eos_id,
-        # expander_max_len=exp_config.expander.max_len,
-        # use_decoder_only_expander=exp_config.expander.use_decoder_only,
         propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
         aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
         top_transformer_config=(
@@ -320,11 +313,6 @@ def train_loop(
         desc="Byte-tokenising",
     )
 
-    # tokenized_dataset.set_format(
-    #     type="torch",
-    #     columns=["input_ids", "labels", "key_padding_mask"],
-    #     dtype=torch.int16,
-    # )
 
     tokenized_dataset.set_format("torch",
                                  columns=["input_ids", "labels"],
@@ -335,47 +323,6 @@ def train_loop(
         columns=["input_ids", "labels", "key_padding_mask"],
         output_all_columns=True,  # keeps prior dtype choices
     )
-    # tokenized_dataset = tokenized_dataset.cast_column("input_ids", "int16")
-    # tokenized_dataset = tokenized_dataset.cast_column("labels", "int16")
-    # key_padding_mask stays bool ➜ no error
-
-    # tokenized_dataset = raw_dataset.map(
-    #     partial(
-    #         tokenize_and_process_examples,
-    #         sequence_length=exp_config.sequence_length,
-    #         tokenizer=tokenizer,
-    #         text_column=exp_config.text_column_name,
-    #     ),
-    #     batched=True,
-    #     remove_columns=raw_dataset.column_names,
-    #     num_proc=8,
-    #     desc="Byte-tokenising",
-    # )
-    #
-    # tokenized_dataset.set_format(
-    #     type="torch",
-    #     columns=["input_ids", "labels", "key_padding_mask"],
-    #     dtype=torch.int16,
-    # )
-
-
-    # tokenized_dataset = raw_dataset.map(
-    #     tokenize_and_process_examples,
-    #     batched=True,
-    #     fn_kwargs={
-    #         "sequence_length": exp_config.sequence_length,
-    #         "tokenizer": tokenizer,
-    #         "text_column": exp_config.text_column_name,
-    #     },
-    #     remove_columns=raw_dataset.column_names,
-    #     num_proc=8,
-    # )
-    # logger.info("Tokenization complete.")
-    #
-    # tokenized_dataset.set_format(
-    #     type="torch",
-    #     columns=["input_ids", "labels", "key_padding_mask"],
-    # )
 
     train_dataloader = DataLoader(
         tokenized_dataset,
@@ -437,6 +384,9 @@ def train_loop(
         return accumulators
 
     accumulators = reset_accumulators(exp_config.num_levels)
+    ppl_ema = [0.0] * exp_config.num_levels
+    ppl_ema_ready = [False] * exp_config.num_levels
+    ppl_alpha = 0.9  # 0.9 carryover, 0.1 new
     tok_s_deque = deque(maxlen=10)
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
@@ -491,18 +441,19 @@ def train_loop(
 
                 batch_sz = tokens.size(0)
                 for level_idx, comp_step in enumerate(output_dict["compression_results"]["steps"]):
-                    accumulators["input_seq_lengths_compressors"][level_idx] += ~comp_step.input_padding_mask.sum() # * batch_sz
-                    accumulators["output_seq_lengths_compressors"][level_idx] += ~comp_step.patch_end_mask.sum() # * batch_sz
-                # for level_idx, length in enumerate(output_dict["output_seq_lengths_compressors"]):
-                #     accumulators["output_seq_lengths_compressors"][level_idx] += length * batch_sz
+                    accumulators["input_seq_lengths_compressors"][level_idx] += (~comp_step.input_padding_mask).sum().item() # * batch_sz
+                    accumulators["output_seq_lengths_compressors"][level_idx] += comp_step.patch_end_mask.sum().item() # * batch_sz
 
             if "all_codebook_perplexities" in output_dict:
                 for level_idx, perplexity in enumerate(output_dict["all_codebook_perplexities"]):
                     accumulators["all_codebook_perplexities"][level_idx] += perplexity.item()
+                    val = float(perplexity) if isinstance(perplexity, (float, int)) else float(perplexity.item())
+                    if not ppl_ema_ready[level_idx]:
+                        ppl_ema[level_idx] = val
+                        ppl_ema_ready[level_idx] = True
+                    else:
+                        ppl_ema[level_idx] = ppl_alpha * ppl_ema[level_idx] + (1.0 - ppl_alpha) * val
 
-            if "all_smoothed_perplexities" in output_dict:
-                for level_idx, smooth_perplexity in enumerate(output_dict["all_smoothed_perplexities"]):
-                    accumulators["all_smoothed_perplexities"][level_idx] += smooth_perplexity.item()
 
             if (i + 1) % exp_config.gradient_accumulation_steps == 0:
                 if exp_config.gradient_clip_norm:
@@ -582,11 +533,11 @@ def train_loop(
                         ratios_str = ", ".join([f"{r / steps_accumulated:.2f}" for r in accumulators["compression_ratios"]])
                         console_log_parts.append(f"Ratios [{ratios_str}]")
 
-                    if "all_smoothed_perplexities" in accumulators and len(accumulators["all_smoothed_perplexities"]) == exp_config.num_levels:
-                        ppl_str = ", ".join([
-                            f"{p / steps_accumulated:.4f}" for p in accumulators["all_smoothed_perplexities"]
-                        ])
-                        console_log_parts.append(f"SmoothPPL [{ppl_str}]")
+                    ppl_str = ", ".join(
+                        f"{ppl_ema[lvl]:.4f}" if ppl_ema_ready[lvl] else "n/a"
+                        for lvl in range(exp_config.num_levels)
+                    )
+                    console_log_parts.append(f"SmoothPPL [{ppl_str}]")
 
                     for key, value in accumulators["reconstruction_loss_details"].items():
                         console_log_parts.append(f"{key}:{value / steps_accumulated:.4f}")
@@ -642,11 +593,9 @@ def train_loop(
                                 codebook_size_L_i = exp_config.compressor_level_configs[level_idx].codebook_size
                                 metrics_dict[f"vq_metrics/codebook_size_L{level_idx}"] = codebook_size_L_i
 
-                        if "all_smoothed_perplexities" in output_dict:
-                            for level_idx in range(exp_config.num_levels):
-                                metrics_dict[f"vq_metrics_avg/smooth_perplexity_L{level_idx}"] = (
-                                    accumulators["all_smoothed_perplexities"][level_idx] / steps_accumulated
-                                )
+                        for lvl in range(exp_config.num_levels):
+                            if ppl_ema_ready[lvl]:
+                                metrics_dict[f"vq_metrics_ema/smooth_perplexity_L{lvl}"] = ppl_ema[lvl]
 
                         mlflow_metric_buffer.append((global_step, metrics_dict))
                         if len(mlflow_metric_buffer) >= exp_config.mlflow_batch_interval:

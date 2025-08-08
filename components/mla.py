@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 from torch import Tensor
 from functools import lru_cache
+import torch._dynamo as dynamo
 
 from .utils import safe_softmax
 from .swiglu import SwiGLU
@@ -24,44 +25,48 @@ def _apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.
     """
     return (x * cos) + (_rotate_half(x) * sin)
 
+import torch
+import torch._dynamo as dynamo
 
 class _RoPECache:
     """
-    Memoises (sin,cos) lookup tables keyed on
-        (seq_len, dim, device, dtype)
-    so we only pay the outer‑product cost once.
+    Cache (sin, cos) per (dim, device, dtype). Grow tables when needed and return slices.
+    Keeping dict size constant avoids Dynamo guards like len(_cache) == N.
     """
-    _cache: dict[tuple[int, int, torch.device, torch.dtype],
-    tuple[torch.Tensor, torch.Tensor]] = {}
+    _cache: dict[tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+    @staticmethod
+    def _build_tables(L: int, dim: int, device: torch.device, out_dtype: torch.dtype):
+        # build in fp32 for accurate sin/cos, then cast
+        inv = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+        t   = torch.arange(L, device=device, dtype=torch.float32)
+        f   = torch.einsum('l,d->ld', t, inv)              # [L, dim/2] fp32
+        sin = f.sin().repeat_interleave(2, dim=-1).contiguous()
+        cos = f.cos().repeat_interleave(2, dim=-1).contiguous()
+        if out_dtype != torch.float32:
+            sin = sin.to(out_dtype)
+            cos = cos.to(out_dtype)
+        return sin, cos
 
     @classmethod
-    def get(
-            cls,
-            seq_len: int,
-            dim: int,
-            device: torch.device,
-            dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (seq_len, dim, device, dtype)
+    @dynamo.disable  # keep Python dict ops & len(_cache) out of the compiled graph
+    def get(cls, need_len: int, dim: int, device: torch.device, dtype: torch.dtype):
+        key = (dim, device, dtype)
         if key not in cls._cache:
-            inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2,
-                                                     device=device,
-                                                     dtype=dtype) / dim))
-            t = torch.arange(seq_len, device=device, dtype=dtype)  # [L]
-            freqs = torch.einsum('l,d->ld', t, inv_freq)  # [L, dim/2]
-            sin = freqs.sin()  # [L, dim/2]
-            cos = freqs.cos()
-
-            # interleave quickly:  (x0,x1,…,x_{d/2-1}) -> (x0,x0,x1,x1,…)
-            sin = sin.repeat_interleave(2, dim=-1)  # [L, dim]
-            cos = cos.repeat_interleave(2, dim=-1)
-
-            cls._cache[key] = (sin, cos)
-        return cls._cache[key]
+            init_len = max(need_len, 1024)  # start big enough to avoid frequent rebuilds
+            sin, cos = cls._build_tables(init_len, dim, device, dtype)
+            cls._cache[key] = (sin, cos, init_len)
+        else:
+            sin, cos, cur_len = cls._cache[key]
+            if need_len > cur_len:
+                new_len = max(cur_len * 2, need_len)
+                sin, cos = cls._build_tables(new_len, dim, device, dtype)
+                cls._cache[key] = (sin, cos, new_len)
+        sin, cos, _ = cls._cache[key]
+        return sin[:need_len], cos[:need_len]
 
     @classmethod
     def clear(cls) -> None:
-        """Call in `load_state_dict()` to avoid stale dtype/device entries."""
         cls._cache.clear()
 
 
@@ -133,16 +138,24 @@ class MultiheadLatentAttention(nn.Module):
         _RoPECache.clear()
         return ret
 
-    # ------------------------------------------------------------------ #
+    def _score_mod_with_pad(self, scores, b, h, q, k):
+        # apply user-provided score_mod first (if any)
+        if self.score_mod is not None:
+            scores = self.score_mod(scores, b, h, q, k)
+
+        pad = getattr(self, "_pad_for_scores", None)
+        if pad is not None:
+            # pad[b, k] shape-broadcasts over the block tile
+            scores = scores.masked_fill(pad[b, k], float("-inf"))
+        return scores
+
     def _flex_attention(self, q_r, k_r, v_c, *, block_mask=None):
-        # q_r : [B, H, S, r]   (S can be 1 or >1)
-        # k_r : [B, H, L, r]
-        # v_c : [B, H, L, d_c]
+        # NOTE: we now always pass score_mod, even when block_mask is present.
         return flex_attention(
             q_r, k_r, v_c,
-            score_mod=self.score_mod if block_mask is None else None,
+            score_mod=self._score_mod_with_pad,
             block_mask=block_mask,
-        )  # -> [B, H, S, d_c]
+        )
 
     def _fallback_attention(
             self,
@@ -243,6 +256,40 @@ class SlidingWindowMLA(nn.Module):
         self.kv_proj = nn.Linear(mla_kwargs.get("dim_q"), self.mla.d_c, bias=False)
         self.o_proj = nn.Linear(mla_kwargs.get("dim_q"), mla_kwargs.get("dim_q"), bias=False)
 
+
+    @staticmethod
+    @dynamo.disable
+    def _make_block_mask(
+        seq_len: int,
+        window: int,
+        pad: Optional[torch.Tensor],
+        device: torch.device,
+        block_size: int,
+        num_heads: int,
+    ):
+        """Eager-only BlockMask builder to avoid Dynamo/Triton miscompiles."""
+        keep_time = _build_time_keep_fn(window)
+
+        if pad is not None:
+            # ensure clean indexing
+            pad = pad.to(torch.bool).contiguous()
+            def _keep_pad(b, h, _q, k):
+                return ~pad[b, k]
+            keep = and_masks(keep_time, _keep_pad)
+            B = int(pad.size(0))
+        else:
+            keep, B = keep_time, None
+
+        return create_block_mask(
+            keep,
+            B=B,
+            H=num_heads,                   # make H explicit
+            Q_LEN=int(seq_len),
+            KV_LEN=int(seq_len),
+            BLOCK_SIZE=int(block_size),
+            device=device,
+        )
+
     def build_sliding_masks(
             self,
             seq_len: int,
@@ -253,39 +300,17 @@ class SlidingWindowMLA(nn.Module):
             block_size: int = 128,
     ) -> Tuple[Optional[Callable], Optional[torch.Tensor]]:
         """
-        Returns `(flex_mask, dense_mask)` – exactly one is not‑None, keyed off
-        `use_flex`.  The logical rule is:
-
-            keep  ⇔  k ≤ q  and  (q − k) ≤ window  and  (not padding)
-
-        * `flex_mask`  – a BlockMask object accepted by FlexAttention
-                         (True → keep / compute)
-        * `dense_mask` – bool tensor broadcastable to [B,H,S,S]
-                         (True → mask‑out / set −∞)
+        Returns (flex_mask, dense_mask). Flex path uses a cached time-only mask.
+        Padding is handled in score_mod, not in the BlockMask.
         """
-
-        # --------------------------------------------------------------------- #
-        keep_time = _build_time_keep_fn(window)
-
         if use_flex:
-            keep = keep_time if pad is None else and_masks(
-                keep_time, lambda b, h, _q, k: ~(pad[b, k])
-            )
-            flex_mask = create_block_mask(
-                keep,
-                B=None if pad is None else pad.size(0),
-                H=None,
-                Q_LEN=seq_len,
-                KV_LEN=seq_len,
-                BLOCK_SIZE=block_size,
-                device=device,
-            )
+            # time-window only; cached (no closure over pad)
+            flex_mask = _cached_flex_sliding_mask(seq_len, window, device)
             return flex_mask, None
 
-        # ---------- dense mask path (fallback) --------------------------------
+        # ---------- dense mask path (fallback) ----------
         q_idx = torch.arange(seq_len, device=device)[:, None]
         k_idx = torch.arange(seq_len, device=device)[None, :]
-
         dense = (k_idx > q_idx) | (k_idx < q_idx - window)  # outside window
         dense = dense.unsqueeze(0).unsqueeze(0)  # [1,1,S,S]
         if pad is not None:
@@ -296,10 +321,11 @@ class SlidingWindowMLA(nn.Module):
         B, S, _ = x.shape
         dev = x.device
 
-        kv_c = self.kv_proj(x)  # [B,S,d_c]
+        kv_c = self.kv_proj(x)
         if key_padding_mask is not None:
             kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.)
 
+        # cache: time-only block mask
         flex_mask, dense_mask = self.build_sliding_masks(
             seq_len=S,
             window=self.window,
@@ -309,11 +335,19 @@ class SlidingWindowMLA(nn.Module):
         )
         block_mask = flex_mask if flex_mask is not None else dense_mask
 
-        ctx = self.mla(x, kv_c, block_mask=block_mask)  # [B,S,D]
+        # NEW: hand pad to MLA to be applied in score_mod inside the kernel
+        self.mla._pad_for_scores = (
+            key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
+        )
+
+        ctx = self.mla(x, kv_c, block_mask=block_mask)
+
+        # optional hygiene: clear the attribute so nothing stale lingers
+        self.mla._pad_for_scores = None
         return ctx
 
 
-@torch.compile
+# @torch.compile
 class SlidingWindowMLATransformerBlock(nn.Module):
     """
     A single Transformer block that uses the Sliding‑Window Multi‑Head Latent
@@ -460,56 +494,29 @@ class CausalMLA(nn.Module):
         # Final linear to mix latent heads back to model space
         self.o_proj = nn.Linear(dim_q, dim_q, bias=False)
 
-    # --------------------------------------------------------------------- #
-    def _build_mask(
-            self,
-            seq_len: int,
-            key_padding_mask: Optional[torch.Tensor],
-            device: torch.device,
-    ):
-        """
-        Returns a `block_mask` suitable for the current back‑end
-        (FlexAttention vs. fallback) and already combined with `key_padding_mask`.
-        """
+    def _build_mask(self, seq_len, key_padding_mask, device):
         if self.mla.use_flex_attention:
-            block_mask = _cached_causal_mask(seq_len, device)
-            if key_padding_mask is not None:
-                pad = key_padding_mask.to(torch.bool)
-
-                def _keep_pad(b, h, q, k):
-                    return ~pad[b, k]
-
-                block_mask = create_block_mask(
-                    and_masks(block_mask.mask_mod, _keep_pad),
-                    B=pad.size(0),
-                    H=None,
-                    Q_LEN=seq_len,
-                    KV_LEN=seq_len,
-                    BLOCK_SIZE=block_mask.BLOCK_SIZE,
-                    device=device,
-                )
-            return block_mask
-
-        # ---------- PyTorch path (boolean tensor) -------------------------
+            return _cached_causal_mask(seq_len, device)  # time-only causal
         block_mask = _boolean_causal_mask(seq_len, device)
         if key_padding_mask is not None:
             block_mask = block_mask | key_padding_mask[:, None, None, :]
         return block_mask
 
-    # --------------------------------------------------------------------- #
 
-    def forward(
-            self,
-            x: torch.Tensor,  # [B,S,D]
-            key_padding_mask: Optional[torch.Tensor] = None,  # [B,S] (True = pad)
-    ) -> torch.Tensor:
+    def forward(self, x, key_padding_mask: Optional[torch.Tensor] = None):
         B, S, _ = x.shape
-        kv_c = self.kv_proj(x)  # [B,S,d_c]
+        kv_c = self.kv_proj(x)
         if key_padding_mask is not None:
             kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.0)
 
         block_mask = self._build_mask(S, key_padding_mask, x.device)
-        ctx = self.mla(x, kv_c, block_mask=block_mask)  # [B,S,D]
+
+        # let score_mod handle padding inside the kernel
+        self.mla._pad_for_scores = (key_padding_mask.to(torch.bool)
+                                    if key_padding_mask is not None else None)
+
+        ctx = self.mla(x, kv_c, block_mask=block_mask)
+        self.mla._pad_for_scores = None
         return self.o_proj(ctx)
 
 
@@ -517,7 +524,7 @@ class CausalMLA(nn.Module):
 # Transformer Block
 # ----------------------------------------------------------------------------- #
 
-@torch.compile
+# @torch.compile
 class CausalMLATransformerBlock(nn.Module):
     """
     Standard Pre‑LN causal Transformer block powered by MLA.

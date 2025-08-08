@@ -5,6 +5,7 @@ import math
 from typing import Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import torch
@@ -197,7 +198,9 @@ def entropy_segments(
     else:
         return seg_id
 
-
+def _compiled(module: nn.Module):
+    # dynamic=True handles S/L changes; instance-local cache avoids shape collisions
+    return torch.compile(module, dynamic=True)
 
 
 def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
@@ -222,17 +225,6 @@ def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
 
     return mask
 
-
-# ---------------------------------------------------------------------
-#  Very small LRU for tiled‑query caching
-# ---------------------------------------------------------------------
-# @functools.lru_cache(maxsize=32)
-# def _cached_tiled_queries(L: int, D: int, S_hat: int, device: torch.device):
-#     """
-#     Returns tensor (Ŝ·L, D)  _without_ batch dimension.
-#     """
-#     base = torch.empty((L, D), device=device)   # placeholder; caller will .copy_()
-#     return base.repeat_interleave(S_hat, 0)     # (Ŝ·L, D)
 
 @functools.lru_cache(maxsize=32)
 def _cached_tiled_template(L: int,
@@ -279,26 +271,6 @@ def get_tiled_queries(base_queries: torch.Tensor,
 
     # ---- 4. Add batch dim and broadcast -----------------------------------
     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
-
-
-
-# def get_tiled_queries(base_queries: torch.Tensor,
-#                       B: int,
-#                       S_hat: int) -> torch.Tensor:
-#     """
-#     base_queries : (L,D)  learnable parameter
-#     Returns      : (B, Ŝ·L, D)  ready for attention
-#     """
-#     L, D = base_queries.shape
-#     device = base_queries.device
-#
-#     tiled = _cached_tiled_queries(L, D, S_hat, device).detach()  # (Ŝ·L, D)
-#     # copy learnable contents (one kernel, much cheaper than allocate)
-#     # tiled = base_queries.repeat_interleave(S_hat, 0)  # (Ŝ·L, D)
-#
-#     tiled.copy_(base_queries.repeat_interleave(S_hat, 0))
-#     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
-
 
 
 

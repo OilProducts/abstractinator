@@ -5,9 +5,10 @@ from typing import Optional, Dict
 from .expander import EncoderBlock
 from .vector_quantizer import VectorQuantizer
 from .mla import CausalMLATransformerBlock
+from .utils import _compiled
 
 
-# @torch.compile
+@torch.compile(dynamic=True)
 class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 
@@ -31,18 +32,21 @@ class CodeSequenceTransformer(nn.Module):
         self.vq = vq
         self.use_flex_attention = use_flex_attention
 
-
         self.in_proj = nn.Linear(embed_dim, dim)
         self.encoder = nn.ModuleList(
-            [CausalMLATransformerBlock(dim=dim,
-                                       num_heads=num_heads,
-                                       ffn_dim_multiplier=ffn_dim_multiplier,
-                                       head_dim=head_dim,
-                                       kv_comp_dim=kv_comp_dim,
-                                       q_comp_dim=q_comp_dim,
-                                       retr_dim=retr_dim,
-                                       use_flex_attention=self.use_flex_attention
-                                       ) for _ in range(num_layers)]
+            [
+                    CausalMLATransformerBlock(dim=dim,
+                                              num_heads=num_heads,
+                                              ffn_dim_multiplier=ffn_dim_multiplier,
+                                              head_dim=head_dim,
+                                              kv_comp_dim=kv_comp_dim,
+                                              q_comp_dim=q_comp_dim,
+                                              retr_dim=retr_dim,
+                                              use_flex_attention=self.use_flex_attention
+                                              )
+                 for _ in range(num_layers)
+
+            ]
         )
         self.final_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, embed_dim)
