@@ -78,7 +78,7 @@ def load_base_components(
         return [modules[i] for i in sorted(modules)]
 
     loaded_comp = _split_by_module(compressors_sd)
-    for src, dst in zip(loaded_comp, model.compressors):
+    for src, dst in zip(loaded_comp, model.compressors, strict=False):
         dst.load_state_dict(src, strict=False)
     n_loaded_comp = len(loaded_comp)
 

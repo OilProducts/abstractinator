@@ -28,8 +28,8 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
-ignore = []
+select = ["E", "F"]
+ignore = ["N803", "N806", "N812"]
 fixable = ["E", "F", "I"]
 
 [tool.ruff.format]

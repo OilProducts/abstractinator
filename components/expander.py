@@ -1,6 +1,6 @@
+from __future__ import annotations
 import math
 from functools import lru_cache
-from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -45,10 +45,10 @@ class MultiHeadAttentionRoPE(nn.Module):
     def forward(
         self,
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        value: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if key is None:
             key = query
@@ -97,7 +97,7 @@ class EncoderBlock(nn.Module):
         self.norm2 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, ffn_dim)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
         x = x + self.ffn(self.norm2(x))
         return x
@@ -117,10 +117,10 @@ class DecoderBlock(nn.Module):
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
-        cross_attn_mask: Optional[torch.Tensor] = None,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        cross_attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
         x = x + self.cross_attn(
@@ -136,7 +136,7 @@ class SimpleEncoder(nn.Module):
         self.layers = nn.ModuleList([EncoderBlock(d_model, num_heads, 4 * d_model) for _ in range(num_layers)])
         self.final_norm = nn.RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         for layer in self.layers:
             x = layer(x, key_padding_mask=key_padding_mask)
         return self.final_norm(x)
@@ -152,9 +152,9 @@ class SimpleDecoder(nn.Module):
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
         # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self.layers:
@@ -189,11 +189,11 @@ class SlidingDecoderBlock(nn.Module):
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
-        seg_ids: Optional[torch.Tensor] = None,
-        cache: Optional[AttnCache] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        seg_ids: torch.Tensor | None = None,
+        cache: AttnCache | None = None,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
         # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
@@ -230,12 +230,12 @@ class SlidingDecoder(nn.Module):
         self,
         x: torch.Tensor,
         memory: torch.Tensor,
-        cache: Optional[AttnCache] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        cache: AttnCache | None = None,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
         # cross_attn_mask: Optional[torch.Tensor] = None,
-        seg_ids: Optional[torch.Tensor] = None,
+        seg_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -288,9 +288,9 @@ class CodeExpander(nn.Module):
         self,
         codes_hi: torch.Tensor,
         codes_lo: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        src_key_padding_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if codes_hi.is_floating_point():
             B, L_hi, _ = codes_hi.shape
             memory_input = codes_hi
@@ -323,8 +323,8 @@ class CodeExpander(nn.Module):
     def generate(
         self,
         codes_hi: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        max_len: Optional[int] = None,
+        src_key_padding_mask: torch.Tensor | None = None,
+        max_len: int | None = None,
     ) -> torch.Tensor:
         if codes_hi.is_floating_point():
             B, L_hi, _ = codes_hi.shape
@@ -399,16 +399,13 @@ class DecoderOnlyExpander(nn.Module):
         self,
         codes_hi: torch.Tensor,
         codes_lo: torch.Tensor,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
-        seg_ids: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        src_key_padding_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        seg_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         device = codes_hi.device
-        if codes_hi.is_floating_point():
-            memory = codes_hi
-        else:
-            memory = self.emb_hi(codes_hi)
+        memory = codes_hi if codes_hi.is_floating_point() else self.emb_hi(codes_hi)
 
         decoder_input_ids = F.pad(codes_lo[:, :-1], (1, 0), value=self.eos_id)
         dec_inp = self.emb_lo(decoder_input_ids)
@@ -433,11 +430,11 @@ class DecoderOnlyExpander(nn.Module):
         self,
         codes_hi: torch.Tensor,
         codes_lo: torch.Tensor,  # (B, L)  – already padded to L
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        seg_ids: Optional[torch.Tensor] = None,
-        max_len: Optional[int] = None,
-        max_new_tokens: Optional[int] = None,
+        src_key_padding_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        seg_ids: torch.Tensor | None = None,
+        max_len: int | None = None,
+        max_new_tokens: int | None = None,
     ) -> torch.Tensor:
         """
         Autoregressively fills the PAD slots of `codes_lo` while keeping its length

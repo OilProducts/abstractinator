@@ -1,5 +1,6 @@
+from __future__ import annotations
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -90,7 +91,7 @@ class LearnedQueryAttention(nn.Module):
         x: torch.Tensor,  # Input context: (B, S, D) for keys & values
         queries: torch.Tensor,  # Pre-built queries: (B, Q_tot, D)
         attn_mask: torch.Tensor,  # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
-        key_padding_mask: Optional[torch.Tensor] = None,  # Key padding mask: (B, S), boolean (True where padded)
+        key_padding_mask: torch.Tensor | None = None,  # Key padding mask: (B, S), boolean (True where padded)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs the forward pass of the Learned Query Attention.

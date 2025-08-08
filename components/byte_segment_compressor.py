@@ -1,5 +1,5 @@
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -60,17 +60,17 @@ class ByteSegmentCompressor(nn.Module):
         dim: int = 256,
         heads: int = 8,  # Num heads for both encoder and pooler
         window: int = 128,  # Window size for shared encoder layers
-        head_dim: Optional[int] = 32,
-        kv_comp_dim: Optional[int] = 32,
-        q_comp_dim: Optional[int] = 48,
-        retr_dim: Optional[int] = 32,
-        lm_window: Optional[int] = None,
-        compression_window: Optional[int] = None,
+        head_dim: int | None = 32,
+        kv_comp_dim: int | None = 32,
+        q_comp_dim: int | None = 48,
+        retr_dim: int | None = 32,
+        lm_window: int | None = None,
+        compression_window: int | None = None,
         num_encoder_layers: int = 3,
         encoder_ffn_dim_multiplier: int = 4,
         num_shared_encoder_layers: int = 0,
-        num_lm_encoder_layers: Optional[int] = None,
-        num_compression_encoder_layers: Optional[int] = None,
+        num_lm_encoder_layers: int | None = None,
+        num_compression_encoder_layers: int | None = None,
         num_queries: int = 1,  # L: Number of queries per segment for the pooler
         codebook_size: int = 512,  # K: Number of codes in VQ codebook
         beta: float = 0.25,  # Beta for VQ commitment loss
@@ -175,7 +175,7 @@ class ByteSegmentCompressor(nn.Module):
             reset_interval=vq_reset_interval,
         )
 
-    def forward(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> CompressorOutput:
+    def forward(self, token_ids: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> CompressorOutput:
         """
         Processes input token IDs to produce compressed segment representations.
 
@@ -243,14 +243,6 @@ class ByteSegmentCompressor(nn.Module):
             first_byte_idx = torch.cummax(first_pos, dim=1).values  # (B,S)
 
         # seg_id now maps each token position to a segment index.
-        # patch_end_mask = torch.zeros_like(seg_id, dtype=torch.bool)
-        # if seg_id.size(1) > 0:
-        #     patch_end_mask[:, :-1] = seg_id[:, 1:] != seg_id[:, :-1]
-        #     patch_end_mask[:, -1] = True
-
-        # Build queries and attention mask for segment-restricted pooling.
-        # `self.pooler.query_template` are the L learned base queries (L,D).
-        # `self.pooler.num_heads` is used for repeating the attention mask.
 
         # ── 2b. Build queries & tensor mask ─────────────
         queries, seg_attn_mask, valid_segments_mask = build_segment_queries_mask(
