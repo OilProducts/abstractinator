@@ -80,6 +80,7 @@ class ByteLevelTokenizer:
         byte_list = [t for t in tokens if 0 <= t < 256]
         return bytes(byte_list).decode("utf-8", errors="ignore")
 
+    @staticmethod
     def encode_batch_fixed_length(
         texts: list[str],
         *,

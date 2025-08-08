@@ -4,7 +4,7 @@ PYTHON ?= python
 
 install-dev:
 	$(PYTHON) -m pip install -r requirements.txt
-	$(PYTHON) -m pip install ruff
+	$(PYTHON) -m pip install -r requirements-dev.txt
 
 format:
 	ruff format .
@@ -14,4 +14,3 @@ lint:
 
 lint-fix:
 	ruff check . --fix
-
