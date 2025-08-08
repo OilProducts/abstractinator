@@ -13,8 +13,9 @@ def build_base_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         }
     ]
     exp_cfg = [
@@ -50,8 +51,9 @@ def build_top_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         }
     ]
     exp_cfg = [
@@ -129,8 +131,9 @@ def build_two_level_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         },
         {
             "dim": 8,
@@ -139,8 +142,9 @@ def build_two_level_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 8,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         },
     ]
     exp_cfg = [

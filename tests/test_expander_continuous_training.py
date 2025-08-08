@@ -12,8 +12,9 @@ def build_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         }
     ]
     exp_cfg = [
@@ -53,13 +54,14 @@ def test_continuous_inputs_to_expanders():
         orig_forward = exp.forward
 
         def make_wrapper(fn):
-            def wrapper(codes_hi, codes_lo, src_key_padding_mask=None, tgt_key_padding_mask=None):
+            def wrapper(codes_hi, codes_lo, src_key_padding_mask=None, tgt_key_padding_mask=None, seg_ids=None):
                 seen_inputs.append(codes_hi)
                 return fn(
                     codes_hi,
                     codes_lo,
                     src_key_padding_mask=src_key_padding_mask,
                     tgt_key_padding_mask=tgt_key_padding_mask,
+                    seg_ids=seg_ids,
                 )
 
             return wrapper

@@ -1,11 +1,13 @@
 import torch
 
-from components.sliding_window_attention import SlidingWindowCrossAttention
+from components.sliding_window_attention import (
+    get_cross_window_mask,
+    SegmentCausalCrossAttention,
+)
 
 
 def test_cross_window_mask():
-    attn = SlidingWindowCrossAttention(embed_dim=4, num_heads=1, window_size=2)
-    mask = attn._cross_window_mask(3, 5, device=torch.device("cpu"))
+    mask = get_cross_window_mask(3, 5, window=2, device=torch.device("cpu"))
     expected = torch.tensor(
         [
             [False, True, True, True, True],
@@ -18,9 +20,9 @@ def test_cross_window_mask():
 
 def test_cross_attention_forward_shape():
     torch.manual_seed(0)
-    attn = SlidingWindowCrossAttention(embed_dim=4, num_heads=2, window_size=1)
+    attn = SegmentCausalCrossAttention(q_dim=4, kv_dim=4, d_attn=4, n_heads=2, lookback=1)
     q = torch.randn(2, 3, 4)
-    k = torch.randn(2, 4, 4)
-    v = torch.randn(2, 4, 4)
-    out = attn(q, k, v)
+    kv = torch.randn(2, 5, 4)
+    seg_id = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    out = attn(q, kv, seg_id)
     assert out.shape == (2, 3, 4)

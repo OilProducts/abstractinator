@@ -12,8 +12,9 @@ def build_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         }
     ]
     exp_cfg = [
@@ -50,12 +51,13 @@ def test_patches_per_token_matches_ratio():
     out = model.forward(tokens, key_padding_mask=kpm)
 
     tokens_total = (~kpm).sum().item()
-    output_len_total = out["output_seq_lengths_compressors"][0] * tokens.size(0)
+    comp = out["compression_results"]
+    comp_step = comp["steps"][0]
+    num_q = model.compressors[0].num_queries_per_segment
+    # effective output length = valid segments * queries per segment
+    output_len_total = (comp_step.valid_mask.sum().item() * num_q)
 
-    tokens_per_second = tokens_total  # assume 1 second elapsed
-    patches_per_second = output_len_total
-
-    ratio_measured = patches_per_second / tokens_per_second
+    ratio_measured = output_len_total / tokens_total
     ratio_reported = out["compression_ratios"][0]
     if isinstance(ratio_reported, torch.Tensor):
         ratio_reported = ratio_reported.item()

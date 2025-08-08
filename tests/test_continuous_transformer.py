@@ -7,7 +7,15 @@ from components.vector_quantizer import VectorQuantizer
 
 def test_continuous_transformer_forward():
     torch.manual_seed(0)
-    vq = VectorQuantizer(K=8, D=4, ema=False, eop_token_id=0)
+    vq = VectorQuantizer(
+        K=8,
+        D=4,
+        ema=False,
+        bos_token_id=0,
+        eos_token_id=0,
+        padding_token_id=0,
+        eop_token_id=0,
+    )
     model = CodeSequenceTransformer(embed_dim=4, dim=8, num_layers=1, num_heads=1, vq=vq)
     x = torch.randn(2, 3, 4)
     out = model(x)
