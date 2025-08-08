@@ -232,37 +232,3 @@ class ResidualVQ(nn.Module):
 
         total_loss = loss0 + loss1
         return z_hat, total_loss, (idx0, idx1), (ppl0, ppl1)
-
-
-class ResidualVQ(nn.Module):
-    """
-    Two-stage residual vector quantiser in a compressed space (d_c).
-    """
-
-    def __init__(self, K0: int, K1: int, D: int = 256, d_c: int = 64, **vq_kwargs):
-        super().__init__()
-        self.down = nn.Linear(D, d_c, bias=False)
-        self.up = nn.Linear(d_c, D, bias=False)
-        self.up.weight = self.down.weight.T  # tie weights (optional)
-
-        # Stage-0 and Stage-1 VQs
-        self.vq0 = VectorQuantizer(K=K0, D=d_c, **vq_kwargs)
-        self.vq1 = VectorQuantizer(K=K1, D=d_c, **vq_kwargs)
-
-        nn.init.orthogonal_(self.down.weight)
-
-    def forward(self, z):
-        """
-        z : (B, Q, D)
-        returns ẑ, total_vq_loss, (idx0, idx1), perplexities
-        """
-        y0 = self.down(z)  # (B,Q,d_c)
-
-        q0, loss0, idx0, ppl0 = self.vq0(y0)
-        r1 = y0 - q0.detach()  # stop grad into q0 path
-
-        q1, loss1, idx1, ppl1 = self.vq1(r1)
-        z_hat = self.up(q0 + q1)
-
-        total_loss = loss0 + loss1
-        return z_hat, total_loss, (idx0, idx1), (ppl0, ppl1)

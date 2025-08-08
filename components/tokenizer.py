@@ -96,7 +96,10 @@ class ByteLevelTokenizer:
         input_ids : np.ndarray, shape (B, seq_len), dtype compatible with `dtype`
         kpm       : np.ndarray, bool mask, True where PAD
         """
-        to_np = lambda tdtype: torch.empty(0, dtype=tdtype).numpy().dtype
+
+        def to_np(tdtype):
+            return torch.empty(0, dtype=tdtype).numpy().dtype
+
         np_dtype = to_np(dtype)
 
         B = len(texts)

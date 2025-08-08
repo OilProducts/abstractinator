@@ -7,10 +7,6 @@ import time
 from dataclasses import asdict
 from functools import partial
 
-# Name for loggers created in this module so logs don't show '__main__'
-LOGGER_NAME = "abstractinator.train"
-
-
 import mlflow  # Logging with MLflow
 import torch
 from datasets import load_dataset  # Import Dataset for the dummy data
@@ -37,6 +33,9 @@ from configs.base_config import (
     ExpConfig,
 )
 from data_utils import tokenize_and_process_examples
+
+# Name for loggers created in this module so logs don't show '__main__'
+LOGGER_NAME = "abstractinator.train"
 
 torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)

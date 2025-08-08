@@ -7,9 +7,9 @@ import os
 
 import torch
 
-logger = logging.getLogger(__name__)
-
 from .hierarchical_autoencoder import HierarchicalAutoencoder
+
+logger = logging.getLogger(__name__)
 
 
 def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 
+import torch
 from lm_eval import evaluator, utils
 
 import components.hae_lm  # registers HierarchicalAELM with lm_eval

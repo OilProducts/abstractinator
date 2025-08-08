@@ -29,13 +29,8 @@ exclude = [
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
-ignore = ["E402", "E731", "F401", "F811", "F821", "F841"]
+ignore = []
 fixable = ["E", "F", "I"]
-
-[tool.ruff.lint.per-file-ignores]
-"components/__init__.py" = ["F401"]
-"components/checkpoint_utils.py" = ["E402"]
-"components/hierarchical_autoencoder.py" = ["F841"]
 
 [tool.ruff.format]
 quote-style = "preserve"
