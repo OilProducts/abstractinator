@@ -238,130 +238,9 @@ class HierarchicalAutoencoder(nn.Module):
                 )
             self.expanders.append(expander)
 
-    @torch.no_grad()
-    def generate_bytes_recursive(
-        self,
-        prompt_tokens: torch.Tensor,  # (1, S₀)
-        key_padding_mask: Optional[torch.Tensor] = None,
-        *,
-        max_top_codes: int = 256,
-        decode_max_len: Optional[int] = None,  # per-patch cap
-    ) -> torch.Tensor:
-        """
-        New recursive AR generator.
-
-        Flow:
-          1) Compress the running byte buffer to get masks/seg_ids.
-          2) Use the top CodeSequenceTransformer to predict ONE next top symbol
-             (continuous by default).
-          3) Decode *one segment* at expander 0 (variable length, ends on EOP),
-             recursively expanding each produced child down to the bottom, where
-             bytes are emitted until EOS/EOP.
-          4) Append the NEW bytes to the global buffer and loop.
-
-        Notes:
-          • Requires B=1 (asserted).
-          • Keeps seg_ids/KPM valid via fresh compression at the start of each top step
-            (for top expander) and safe fabrication for deeper levels.
-        """
-        self.eval()
-        assert prompt_tokens.size(0) == 1, "Generation currently supports B=1."
-
-        # device = prompt_tokens.device
-        use_cont = self.use_continuous_expander_inputs
-
-        # Running byte buffer
-        byte_buf = prompt_tokens.clone()  # (1, S_bytes)
-        byte_kpm = key_padding_mask
-
-        # Helper: run top CST for one step
-        def _predict_one_top_symbol(comp) -> torch.Tensor:
-            # Prepare top input (continuous or discrete)
-            if use_cont:
-                top_mem = comp["all_pre_vq_embeddings"][-1]  # (1, L_top, D)
-            else:
-                top_codes = comp["all_vq_indices"][-1]  # (1, L_top)
-                top_mem = F.embedding(top_codes, self.compressors[-1].vq.codebook)
-
-            top_kpm = comp.get("final_key_padding_mask", None)
-
-            # Optional fixed LM length from config
-            lm_len = 0
-            if self.top_transformer_config and self.top_transformer_config.get("lm_fixed_length"):
-                lm_len = int(self.top_transformer_config["lm_fixed_length"])
-            if lm_len:
-                pad_val = 0.0 if use_cont else self.top_transformer_config.get("lm_pad_id", 258)
-                top_mem, top_kpm = _fix_len(top_mem, top_kpm, lm_len, pad_val)
-
-            cst_out = self.code_sequence_transformer(
-                input_embeddings=top_mem,
-                key_padding_mask=top_kpm,
-            )
-            next_vec = cst_out["predictions_pre_vq"][:, -1, :]  # (1, D)
-            # You can switch to discrete indices if your config says so
-            return next_vec  # continuous by default
-
-        for _ in range(max_top_codes):
-            # 1) Compress the current bytes to build masks for the top expander
-            comp = self.compress(byte_buf, key_padding_mask=byte_kpm)
-
-            # 2) Predict ONE next top symbol
-            if self.code_sequence_transformer is None:
-                raise RuntimeError("Top-level transformer not initialized.")
-            next_top_symbol = _predict_one_top_symbol(comp)  # (1, D)
-
-            # Build the top-level hi sequence = existing top (continuous) + new vector
-            if self.use_continuous_expander_inputs:
-                top_hi = torch.cat(
-                    [comp["all_pre_vq_embeddings"][-1], next_top_symbol.unsqueeze(1)], dim=1
-                )  # (1, L+1, D)
-            else:
-                # If you switch to discrete: use cst_out["indices"][:, -1] and cat as ints
-                raise NotImplementedError("Discrete top-symbol path not wired in here.")
-
-            # 3) Generate one full segment through expander 0, recursively
-            _child_codes = self._gen_segment_at_level(
-                e_idx=0,
-                hi_seq=top_hi,
-                comp_for_masks=comp,  # reuse seg_ids/kpm for top expander
-                decode_max_len=decode_max_len,
-            )
-
-            # 4) Materialize bytes for THIS top symbol by expanding every child down to bottom.
-            #    The recursion already did that; we just need to *reconstruct* bottom bytes
-            #    given the new top_hi (which includes the just-added symbol).
-            #    Easiest (and consistent with your current code): call `decompress(...)`.
-            decomp = self.decompress(
-                top_codes=top_hi,  # continuous
-                top_codes_key_padding_mask=self._maybe_coerce_kpm(
-                    top_hi[..., 0] if top_hi.dim() == 3 else top_hi, comp.get("final_key_padding_mask")
-                ),
-                targets_for_teacher_forcing=None,
-                max_len_override=decode_max_len,
-                teacher_forcing_embeddings=None,
-                all_seg_ids=comp["all_seg_ids"],
-                compression_results=comp,
-            )
-            full_bytes = decomp["final_reconstructed_tokens"]  # (1, S_total)
-            new_bytes = full_bytes[:, byte_buf.size(1) :]  # take the delta
-
-            # If nothing new, stop (shouldn't really happen if expanders behave)
-            if new_bytes.numel() == 0:
-                break
-
-            # Append
-            byte_buf = torch.cat([byte_buf, new_bytes], dim=1)
-
-            # Stop when last byte is EOS or EOP
-            eos_id, eop_id = self._bottom_ids()
-            last = int(byte_buf[0, -1].item())
-            if last == eos_id or last == eop_id:
-                break
-
-            # Keep KPM length in sync (no pads during gen)
-            byte_kpm = self._all_false_kpm_like(byte_buf)
-
-        return byte_buf
+    # NOTE: Deprecated generator `generate_bytes_recursive` removed; use
+    # `generate_bytes` for generation. The recursive variant previously
+    # re-decoded full sequences each step and is intentionally retired.
 
     def _bottom_ids(self) -> Tuple[int, int]:
         """(eos_id, eop_id) for the byte level."""
@@ -409,17 +288,9 @@ class HierarchicalAutoencoder(nn.Module):
             return have
         return self._all_false_kpm_like(want)
 
-    def _bottom_ids(self) -> tuple[int, int]:
-        eos = getattr(self, "bottom_eos_id", getattr(self, "expander_eos_id", 257))
-        eop = getattr(self, "bottom_eop_id", 259)
-        return int(eos), int(eop)
-
-    def _all_false_kpm_like(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(x.size(0), x.size(1), dtype=torch.bool, device=x.device)
-
-    def _seg_ids_like(self, x: torch.Tensor) -> torch.Tensor:
-        B, S = x.shape[:2]
-        return torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+    # NOTE: Duplicate helper definitions removed. Single canonical
+    # implementations of `_bottom_ids`, `_all_false_kpm_like`, and
+    # `_seg_ids_like` are defined above for clarity.
 
     def _maybe_kpm(self, want_len: int, have: Optional[torch.Tensor], device) -> torch.Tensor:
         if have is not None and have.size(1) == want_len and have.size(0) == 1:
@@ -1044,17 +915,11 @@ class HierarchicalAutoencoder(nn.Module):
         max_new = int(decode_max_len) if decode_max_len is not None else int(exp.max_len)
         max_new = max(1, min(max_new, exp.max_len))  # safety
 
-        # ---- build per-call buffers for child's sequence ----
-        # budget = int(decode_max_len) if decode_max_len is not None else int(exp.max_len)
-        # Seed with a single valid token (EOS-as-BOS), rest PAD.
+        # capacity = seed(1) + max_new tokens at most
         L = 1 + max_new
         lo = torch.full((1, L), exp.eos_id, dtype=torch.long, device=device)
         tgt_kpm = torch.ones(1, L, dtype=torch.bool, device=device)
         tgt_kpm[:, 0] = False  # first token is real
-        # tgt_kpm = torch.ones_like(lo, dtype=torch.bool)  # True == PAD
-        # lo[:, 0] = exp.eos_id
-        # tgt_kpm[:, 0] = False
-        # prev_valid = 1
 
         # masks
         # --- correct KPM to match the KV length ---
@@ -1090,14 +955,6 @@ class HierarchicalAutoencoder(nn.Module):
         bottom_bytes = lo.new_zeros(1, 0)
         stop_set = {*self._bottom_ids()} if is_bottom else {int(self.compressors[e_idx - 1].vq.eop_token_id)}
 
-        # # After the call, tgt_kpm has been updated in-place
-        # new_valid = int((~tgt_kpm).sum().item())
-        # if new_valid <= prev_valid:
-        #     # no progress; return empty
-        #     return lo.new_zeros(1, 0, dtype=torch.long)
-
-        # consume newly produced tokens sequentially
-        # bottom_bytes = lo.new_zeros(1, 0, dtype=torch.long)
         for pos in range(1, 1 + steps_taken):
             tok = int(out[0, pos].item())
             if tok in stop_set:  # terminal landed exactly at this position
@@ -1219,7 +1076,32 @@ class HierarchicalAutoencoder(nn.Module):
         max_top_codes: int = 256,
         decode_max_len: Optional[int] = None,
     ) -> torch.Tensor:
-        """Recursive AR: one top symbol → one variable-length segment per level → bytes."""
+        """Generate bytes via segment-wise expansion from top codes.
+
+        This is the canonical generation path. At each step it:
+        - Compresses the current byte buffer to obtain masks/segment IDs.
+        - Uses the top CodeSequenceTransformer to predict one additional top symbol
+          (continuous by default).
+        - Expands that symbol down the hierarchy with the expanders to produce
+          a variable-length segment of new bottom-level bytes.
+        - Appends the new bytes and repeats until EOS/EOP or ``max_top_codes``.
+
+        Args:
+            prompt_tokens: Input bytes with batch size 1, shape (1, S0).
+            key_padding_mask: Optional boolean mask for ``prompt_tokens`` where
+                True marks padding positions; shape (1, S0).
+            max_top_codes: Maximum number of top symbols to generate.
+            decode_max_len: Optional per-step cap on the generated segment length.
+
+        Returns:
+            Tensor of shape (1, S_total) containing the prompt plus generated bytes.
+
+        Notes:
+            - Continuous top-code inputs are used when configured; the discrete
+              path is not currently wired.
+            - The older "full re-decode" generator was removed in favor of this
+              efficient segment-wise method.
+        """
         self.eval()
         assert prompt_tokens.size(0) == 1, "Gen supports B=1 for now."
         # device = prompt_tokens.device
