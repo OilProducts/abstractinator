@@ -95,7 +95,7 @@ def tokenize_and_process_examples(
     tokenizer,
     text_column: str = "text",
 ):
-    ids, kpm = tokenizer.encode_batch(
+    ids, kpm = tokenizer.encode_batch_fixed_length(
         examples[text_column],
         tokenizer=tokenizer,
         seq_len=sequence_length,

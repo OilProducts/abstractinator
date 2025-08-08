@@ -13,8 +13,9 @@ from configs.base_config import (
 # Use defaults from base_config without modification
 exp_config: ExpConfig = deepcopy(_base_exp_config)
 
-exp_config.batch_size = 8
+exp_config.batch_size = 4
 exp_config.gradient_accumulation_steps = 4
+exp_config.sequence_length = 2048
 
 
 exp_config.num_epochs = 2
