@@ -8,7 +8,7 @@ from .learned_query_attention import LearnedQueryAttention
 from .vector_quantizer import VectorQuantizer
 from .sliding_window_attention import SlidingWindowTransformerBlock
 from .mla import SlidingWindowMLATransformerBlock
-from .utils import token_entropy, entropy_segments, build_segment_queries_mask
+from .utils import token_entropy, entropy_segments, build_segment_queries_mask, _compiled
 
 
 @dataclass
@@ -28,7 +28,7 @@ class CompressorOutput:
 
 
 # If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
-# @torch.compile(dynamic=True)
+@torch.compile(dynamic=True)
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
@@ -104,16 +104,18 @@ class ByteSegmentCompressor(nn.Module):
 
         self.shared_layers = nn.ModuleList(
             [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=window,
-                    head_dim = head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
+                _compiled(
+                    SlidingWindowMLATransformerBlock(
+                        dim=dim,
+                        num_heads=heads,
+                        window_size=window,
+                        head_dim = head_dim,
+                        kv_comp_dim=kv_comp_dim,
+                        q_comp_dim=q_comp_dim,
+                        retr_dim=retr_dim,
+                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                        use_flex_attention=self.use_flex_attention,
+                    )
                 )
                 for _ in range(num_shared_encoder_layers)
             ]
@@ -121,16 +123,18 @@ class ByteSegmentCompressor(nn.Module):
 
         self.compression_layers = nn.ModuleList(
             [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=self.compression_window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
+                _compiled(
+                    SlidingWindowMLATransformerBlock(
+                        dim=dim,
+                        num_heads=heads,
+                        window_size=self.compression_window,
+                        head_dim=head_dim,
+                        kv_comp_dim=kv_comp_dim,
+                        q_comp_dim=q_comp_dim,
+                        retr_dim=retr_dim,
+                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                        use_flex_attention=self.use_flex_attention,
+                    )
                 )
                 for _ in range(num_compression_encoder_layers)
             ]
@@ -138,16 +142,18 @@ class ByteSegmentCompressor(nn.Module):
 
         self.lm_layers = nn.ModuleList(
             [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=self.lm_window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
+                _compiled(
+                    SlidingWindowMLATransformerBlock(
+                        dim=dim,
+                        num_heads=heads,
+                        window_size=self.lm_window,
+                        head_dim=head_dim,
+                        kv_comp_dim=kv_comp_dim,
+                        q_comp_dim=q_comp_dim,
+                        retr_dim=retr_dim,
+                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                        use_flex_attention=self.use_flex_attention,
+                    )
                 )
                 for _ in range(num_lm_encoder_layers)
             ]

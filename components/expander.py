@@ -437,57 +437,6 @@ class DecoderOnlyExpander(nn.Module):
         logits = self.out_proj(dec_out)
         return {"logits": logits}
 
-    # @torch.no_grad()
-    # def generate(
-    #     self,
-    #     codes_hi: torch.Tensor,
-    #     codes_lo: torch.Tensor,
-    #     src_key_padding_mask: Optional[torch.Tensor] = None,
-    #     tgt_key_padding_mask: Optional[torch.Tensor] = None,
-    #     seg_ids: Optional[torch.Tensor] = None,
-    #     max_len: Optional[int] = None,
-    # ) -> torch.Tensor:
-    #     cache = AttnCache()
-    #     device = codes_hi.device
-    #     current_max_len = max_len if max_len is not None else self.max_len
-    #     current_max_len = 16
-    #     if codes_hi.is_floating_point():
-    #         memory = codes_hi
-    #     else:
-    #         memory = self.emb_hi(codes_hi)
-    #
-    #     # generated_ids = torch.empty((0,0), dtype=torch.long, device=device)
-    #     generated_ids = codes_lo
-    #     # generated_ids = torch.empty((codes_hi.size(0), 1), dtype=torch.long, device=device)
-    #
-    #     # reconstructing the original sequence
-    #     for _ in range(current_max_len - 1):
-    #         seq_len = generated_ids.size(1)
-    #         dec_inp = self.emb_lo(generated_ids)
-    #         tgt_mask = self._causal_mask(seq_len, device)
-    #         dec_out = self.decoder(
-    #             dec_inp,
-    #             memory,
-    #             cache=cache,
-    #             tgt_mask=tgt_mask,
-    #             tgt_key_padding_mask=tgt_key_padding_mask,
-    #             memory_key_padding_mask=src_key_padding_mask,
-    #             seg_ids=seg_ids,
-    #         )
-    #         next_logits = self.out_proj(dec_out[:, -1, :])
-    #         next_id = next_logits.argmax(dim=-1, keepdim=True)
-    #         # generated_ids = torch.cat([generated_ids, next_id], dim=1)
-    #         # We have to insert the next_id at the end of the non-padded elements
-    #         len_valid = tgt_key_padding_mask.sum(dim=-1)
-    #         only_valid_ids = generated_ids[:, :len_valid]
-    #         generated_ids = torch.cat([only_valid_ids, next_id], dim=1)
-    #         generated_ids =
-    #
-    #         if (next_id == self.eos_id) or (next_id == self.eop_id):
-    #             break
-    #
-    #     return generated_ids
-
     @torch.no_grad()
     def generate(
             self,
@@ -506,7 +455,6 @@ class DecoderOnlyExpander(nn.Module):
         """
         device = codes_hi.device
         B, L = codes_lo.shape
-        budget = max_len if max_len is not None else self.max_len
 
         # ── high-level memory ───────────────────────────────────────────────
         memory = codes_hi if codes_hi.is_floating_point() else self.emb_hi(codes_hi)
@@ -518,7 +466,15 @@ class DecoderOnlyExpander(nn.Module):
         generated = codes_lo.clone()  # (B, L)
         cache = AttnCache()  # KV-cache for all decoder layers
 
-        for _ in range(budget):
+        # remaining capacity per row
+        len_valid = (~tgt_key_padding_mask).sum(dim=1)  # (B,)
+        capacity = (L - len_valid).clamp(min=0)  # (B,)
+        steps_budget = int(capacity.max().item())
+        if max_new_tokens is not None:
+            steps_budget = min(steps_budget, int(max_new_tokens))
+
+
+        for _ in range(steps_budget):
             # how many non-PAD tokens are present in each sample
             len_valid = (~tgt_key_padding_mask).sum(dim=1)  # (B,)
 
