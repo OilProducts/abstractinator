@@ -1,11 +1,12 @@
 import argparse
-import json
 import importlib.util
+import json
 import logging
-from configs.base_config import ExpConfig
 
 from lm_eval import evaluator, utils
+
 import components.hae_lm  # registers HierarchicalAELM with lm_eval
+from configs.base_config import ExpConfig
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,7 @@ def main():
         "--config",
         type=str,
         default=None,
-        help=("Path to configuration file for hier_ae models. If omitted, the "
-              "checkpoint's stored config is used"),
+        help=("Path to configuration file for hier_ae models. If omitted, the checkpoint's stored config is used"),
     )
     parser.add_argument(
         "--tasks",

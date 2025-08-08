@@ -1,14 +1,14 @@
 import argparse
 import importlib.util
-from dataclasses import asdict
 import logging
+from dataclasses import asdict
 
 import torch
 from datasets import load_dataset
 
-from components.tokenizer import ByteLevelTokenizer
 from components.hierarchical_autoencoder import HierarchicalAutoencoder
-from components.utils import token_entropy, entropy_segments
+from components.tokenizer import ByteLevelTokenizer
+from components.utils import entropy_segments, token_entropy
 from data_utils import tokenize_and_process_examples
 
 
@@ -33,8 +33,7 @@ def build_model(exp_cfg, device):
         use_decoder_only_expander=exp_cfg.expander.use_decoder_only,
         propagate_key_padding_mask=exp_cfg.propagate_key_padding_mask,
         aux_lm_loss_weight=exp_cfg.aux_lm_loss_weight,
-        top_transformer_config=(asdict(exp_cfg.top_transformer_config)
-                                if exp_cfg.top_transformer_config else None),
+        top_transformer_config=(asdict(exp_cfg.top_transformer_config) if exp_cfg.top_transformer_config else None),
         top_lm_loss_weight=exp_cfg.top_lm_loss_weight,
         use_continuous_expander_inputs=exp_cfg.expander.use_continuous_inputs,
         top_lm_mse_weight=exp_cfg.top_lm_mse_weight,
@@ -78,7 +77,11 @@ def main():
     tokenized = raw_dataset.map(
         tokenize_and_process_examples,
         batched=True,
-        fn_kwargs={"sequence_length": exp_cfg.sequence_length, "tokenizer": tokenizer, "text_column": exp_cfg.text_column_name},
+        fn_kwargs={
+            "sequence_length": exp_cfg.sequence_length,
+            "tokenizer": tokenizer,
+            "text_column": exp_cfg.text_column_name,
+        },
         remove_columns=raw_dataset.column_names,
         num_proc=1,
     )
@@ -101,7 +104,9 @@ def main():
             out = compressor(input_ids, key_padding_mask=kpm)
             logits = out["encoder_logits"]
             entropy = token_entropy(logits)
-            seg = entropy_segments(entropy, increase_delta=compressor.entropy_delta, abs_threshold=compressor.entropy_abs_threshold)
+            seg = entropy_segments(
+                entropy, increase_delta=compressor.entropy_delta, abs_threshold=compressor.entropy_abs_threshold
+            )
         ids = input_ids.squeeze(0).cpu().tolist()
         seg_ids = seg.squeeze(0).cpu().tolist()
 

@@ -1,11 +1,12 @@
 from copy import deepcopy
+
 from configs.base_config import (
-    DEVICE,
-    N_CPU,
-    exp_config as _base_exp_config,
-    ExpConfig,
     CompressorLevelConfig,
+    ExpConfig,
     TopTransformerConfig,
+)
+from configs.base_config import (
+    exp_config as _base_exp_config,
 )
 
 exp_config: ExpConfig = deepcopy(_base_exp_config)
@@ -16,9 +17,9 @@ exp_config.compressor_level_configs = [
         dim=256,
         heads=8,
         window=128,
-        num_shared_encoder_layers = 0,
-        num_lm_encoder_layers = 2,
-        num_compression_encoder_layers = 2,
+        num_shared_encoder_layers=0,
+        num_lm_encoder_layers=2,
+        num_compression_encoder_layers=2,
         encoder_ffn_dim_multiplier=4,
         max_seq_len_encoder=4096,
         num_queries=1,
@@ -48,6 +49,4 @@ exp_config.batch_size = 8
 exp_config.sequence_length = 2048
 exp_config.dataset_name = "roneneldan/TinyStories"
 exp_config.dataset_config = None
-exp_config.sample_prompt_for_generation = (
-    "Once upon a time, in a land far, far away,"
-)
+exp_config.sample_prompt_for_generation = "Once upon a time, in a land far, far away,"

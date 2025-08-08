@@ -1,24 +1,24 @@
 import logging
-import math
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Any, Optional, Tuple
-
 from torch import Tensor
 
 from .byte_segment_compressor import ByteSegmentCompressor, CompressorOutput
-from .expander import CodeExpander, DecoderOnlyExpander
 from .code_sequence_transformer import CodeSequenceTransformer
-from .utils import _compiled
+from .expander import CodeExpander, DecoderOnlyExpander
 
 logger = logging.getLogger(__name__)
 
-def _fix_len(seq: torch.Tensor,           # (B, S, D) *or* (B, S)
-             kpm: Optional[torch.Tensor], # (B, Sₖ) or None
-             tgt_len: int,
-             pad_val: float | int,
-             ):
+
+def _fix_len(
+    seq: torch.Tensor,  # (B, S, D) *or* (B, S)
+    kpm: Optional[torch.Tensor],  # (B, Sₖ) or None
+    tgt_len: int,
+    pad_val: float | int,
+):
     B, S, *tail = seq.shape
 
     # ---- clip both when too long ----
@@ -26,7 +26,7 @@ def _fix_len(seq: torch.Tensor,           # (B, S, D) *or* (B, S)
         seq = seq[:, -tgt_len:, ...]
         if kpm is not None:
             kpm = kpm[:, -tgt_len:]
-        return seq, kpm                           # done
+        return seq, kpm  # done
 
     # ---- pad sequence when too short ----
     if S < tgt_len:
@@ -36,7 +36,7 @@ def _fix_len(seq: torch.Tensor,           # (B, S, D) *or* (B, S)
     # ---- pad kpm independently (if present) ----
     if kpm is not None:
         S_kpm = kpm.shape[1]
-        if S_kpm > tgt_len:                       # rare, but mirror clip-logic
+        if S_kpm > tgt_len:  # rare, but mirror clip-logic
             kpm = kpm[:, -tgt_len:]
         elif S_kpm < tgt_len:
             kpm = F.pad(kpm, (0, tgt_len - S_kpm), value=True)
@@ -82,19 +82,20 @@ class HierarchicalAutoencoder(nn.Module):
         top_lm_ce_weight: Weight for the cross-entropy component of the top LM loss.
     """
 
-    def __init__(self,
-                 num_levels: int,
-                 compressor_level_configs: List[Dict[str, Any]],
-                 expander_level_configs: List[Dict[str, Any]],
-                 initial_vocab_size: int = 259,
-                 propagate_key_padding_mask: bool = True,
-                 aux_lm_loss_weight: float = 0.1,
-                 top_transformer_config: Optional[Dict[str, Any]] = None,
-                 top_lm_loss_weight: float = 1.0,
-                 top_lm_mse_weight: float = 1.0,
-                 top_lm_ce_weight: float = 1.0,
-                 use_flex_attention: bool = True
-                 ):
+    def __init__(
+        self,
+        num_levels: int,
+        compressor_level_configs: List[Dict[str, Any]],
+        expander_level_configs: List[Dict[str, Any]],
+        initial_vocab_size: int = 259,
+        propagate_key_padding_mask: bool = True,
+        aux_lm_loss_weight: float = 0.1,
+        top_transformer_config: Optional[Dict[str, Any]] = None,
+        top_lm_loss_weight: float = 1.0,
+        top_lm_mse_weight: float = 1.0,
+        top_lm_ce_weight: float = 1.0,
+        use_flex_attention: bool = True,
+    ):
         super().__init__()
 
         if len(compressor_level_configs) != num_levels:
@@ -129,7 +130,6 @@ class HierarchicalAutoencoder(nn.Module):
                 heads=config['heads'],
                 window=config['window'],
                 lm_window=config.get('lm_window'),
-
                 compression_window=config.get('compression_window'),
                 num_encoder_layers=config.get('num_encoder_layers', 3),
                 encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4),
@@ -170,9 +170,9 @@ class HierarchicalAutoencoder(nn.Module):
                 num_layers=cfg.get("num_layers", 4),
                 num_heads=cfg.get("num_heads", 8),
                 ffn_dim_multiplier=cfg.get("ffn_dim_multiplier", 4),
-                kv_comp_dim =cfg.get("kv_comp_dim", 64),  # d_c
-                q_comp_dim = cfg.get("q_comp_dim", 96),  # d_c`
-                retr_dim = cfg.get("retr_dim", 32),  # r
+                kv_comp_dim=cfg.get("kv_comp_dim", 64),  # d_c
+                q_comp_dim=cfg.get("q_comp_dim", 96),  # d_c`
+                retr_dim=cfg.get("retr_dim", 32),  # r
                 vq=self.compressors[-1].vq,
             )
             mode = "continuous" if self.top_transformer_continuous else "discrete"
@@ -238,15 +238,14 @@ class HierarchicalAutoencoder(nn.Module):
                 )
             self.expanders.append(expander)
 
-
     @torch.no_grad()
     def generate_bytes_recursive(
-            self,
-            prompt_tokens: torch.Tensor,  # (1, S₀)
-            key_padding_mask: Optional[torch.Tensor] = None,
-            *,
-            max_top_codes: int = 256,
-            decode_max_len: Optional[int] = None,  # per-patch cap
+        self,
+        prompt_tokens: torch.Tensor,  # (1, S₀)
+        key_padding_mask: Optional[torch.Tensor] = None,
+        *,
+        max_top_codes: int = 256,
+        decode_max_len: Optional[int] = None,  # per-patch cap
     ) -> torch.Tensor:
         """
         New recursive AR generator.
@@ -313,8 +312,9 @@ class HierarchicalAutoencoder(nn.Module):
 
             # Build the top-level hi sequence = existing top (continuous) + new vector
             if self.use_continuous_expander_inputs:
-                top_hi = torch.cat([comp["all_pre_vq_embeddings"][-1], next_top_symbol.unsqueeze(1)],
-                                   dim=1)  # (1, L+1, D)
+                top_hi = torch.cat(
+                    [comp["all_pre_vq_embeddings"][-1], next_top_symbol.unsqueeze(1)], dim=1
+                )  # (1, L+1, D)
             else:
                 # If you switch to discrete: use cst_out["indices"][:, -1] and cat as ints
                 raise NotImplementedError("Discrete top-symbol path not wired in here.")
@@ -333,8 +333,9 @@ class HierarchicalAutoencoder(nn.Module):
             #    Easiest (and consistent with your current code): call `decompress(...)`.
             decomp = self.decompress(
                 top_codes=top_hi,  # continuous
-                top_codes_key_padding_mask=self._maybe_coerce_kpm(top_hi[..., 0] if top_hi.dim() == 3 else top_hi,
-                                                                  comp.get("final_key_padding_mask")),
+                top_codes_key_padding_mask=self._maybe_coerce_kpm(
+                    top_hi[..., 0] if top_hi.dim() == 3 else top_hi, comp.get("final_key_padding_mask")
+                ),
                 targets_for_teacher_forcing=None,
                 max_len_override=decode_max_len,
                 teacher_forcing_embeddings=None,
@@ -342,7 +343,7 @@ class HierarchicalAutoencoder(nn.Module):
                 compression_results=comp,
             )
             full_bytes = decomp["final_reconstructed_tokens"]  # (1, S_total)
-            new_bytes = full_bytes[:, byte_buf.size(1):]  # take the delta
+            new_bytes = full_bytes[:, byte_buf.size(1) :]  # take the delta
 
             # If nothing new, stop (shouldn't really happen if expanders behave)
             if new_bytes.numel() == 0:
@@ -425,10 +426,9 @@ class HierarchicalAutoencoder(nn.Module):
             return have
         return torch.zeros(1, want_len, dtype=torch.bool, device=device)  # all real, no PAD
 
-    def _compress_one_level(self,
-                            tokens: torch.Tensor,
-                            key_padding_mask: Optional[torch.Tensor] = None,
-                            level: int = 0) -> Dict[str, Any]:
+    def _compress_one_level(
+        self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None, level: int = 0
+    ) -> Dict[str, Any]:
         """Compress a sequence at a single level.
 
         Args:
@@ -451,10 +451,7 @@ class HierarchicalAutoencoder(nn.Module):
         compressor = self.compressors[level]
         return compressor(tokens, key_padding_mask=key_padding_mask)
 
-
-    def compress(self, tokens: torch.Tensor,
-                 key_padding_mask: Optional[torch.Tensor] = None
-                 ) -> Dict[str, Any]:
+    def compress(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """Run all compressors on an input sequence.
 
         Args:
@@ -485,7 +482,7 @@ class HierarchicalAutoencoder(nn.Module):
         all_vq_loss_list: List[torch.Tensor] = []
         # Stores valid_masks (per segment) from each compressor to reconstruct KPMs later.
         # all_compressor_level_valid_masks: List[Optional[torch.Tensor]] = []
-        total_vq_loss = torch.tensor(0., device=tokens.device, dtype=torch.float32)
+        total_vq_loss = torch.tensor(0.0, device=tokens.device, dtype=torch.float32)
 
         # For auxiliary LM loss
         all_entropy_model_logits_list: List[torch.Tensor] = []
@@ -502,8 +499,8 @@ class HierarchicalAutoencoder(nn.Module):
         steps: List[CompressorOutput] = []
 
         for i, compressor in enumerate(self.compressors):
-            all_compressor_input_tokens_list.append(current_input_tokens) # Store input for aux LM loss
-            all_compressor_input_kpms_list.append(current_kpm) # Store KPM for aux LM loss
+            all_compressor_input_tokens_list.append(current_input_tokens)  # Store input for aux LM loss
+            all_compressor_input_kpms_list.append(current_kpm)  # Store KPM for aux LM loss
             if current_kpm is not None:
                 input_seq_len = (~current_kpm).sum(dim=1).float().mean().item()
             else:
@@ -531,8 +528,7 @@ class HierarchicalAutoencoder(nn.Module):
 
             if comp_out.valid_mask is not None:
                 # Effective output length based on valid segments * num_queries
-                output_seq_len = (comp_out.valid_mask.sum(
-                    dim=1) * num_q_this_level).float().mean().item()
+                output_seq_len = (comp_out.valid_mask.sum(dim=1) * num_q_this_level).float().mean().item()
             else:
                 output_seq_len = float(comp_out.vq_indices.size(1))
             all_output_seq_lengths.append(output_seq_len)
@@ -541,12 +537,10 @@ class HierarchicalAutoencoder(nn.Module):
             if self.propagate_key_padding_mask:
                 # This is just inverting the valid mask to get the KPM for the next level
 
-
                 if comp_out.valid_mask is not None:
                     # KPM for next level codes: True where segment was NOT valid, repeated for L queries.
                     # Shape: (B, S_hat_segments * L)
-                    current_kpm = ~comp_out.valid_mask.repeat_interleave(
-                        num_q_this_level, dim=1)
+                    current_kpm = ~comp_out.valid_mask.repeat_interleave(num_q_this_level, dim=1)
                 else:
                     if i < self.num_levels - 1:
                         logger.warning(
@@ -561,9 +555,7 @@ class HierarchicalAutoencoder(nn.Module):
             out_len / in_len if in_len > 0 else 0.0
             for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths)
         ]
-        compression_ratios = [
-            tokens.new_tensor(r, dtype=torch.float32) for r in compression_ratios
-        ]
+        compression_ratios = [tokens.new_tensor(r, dtype=torch.float32) for r in compression_ratios]
 
         return {
             'all_vq_indices': all_vq_indices_list,
@@ -585,7 +577,6 @@ class HierarchicalAutoencoder(nn.Module):
             'all_first_byte_idx': all_first_byte_idx,
             'steps': steps,
         }
-
 
     def decompress(
         self,
@@ -631,15 +622,12 @@ class HierarchicalAutoencoder(nn.Module):
 
         is_teacher_forcing = targets_for_teacher_forcing is not None
         if is_teacher_forcing:
-            if targets_for_teacher_forcing is None or len(
-                    targets_for_teacher_forcing) != self.num_levels:
+            if targets_for_teacher_forcing is None or len(targets_for_teacher_forcing) != self.num_levels:
                 raise ValueError("Length of targets_for_teacher_forcing must match num_levels.")
             if target_key_padding_masks and len(target_key_padding_masks) != self.num_levels:
-                raise ValueError(
-                    "Length of target_key_padding_masks must match num_levels if provided.")
+                raise ValueError("Length of target_key_padding_masks must match num_levels if provided.")
             if teacher_forcing_embeddings is not None and len(teacher_forcing_embeddings) != self.num_levels - 1:
-                raise ValueError(
-                    "Length of teacher_forcing_embeddings must be num_levels - 1 when provided.")
+                raise ValueError("Length of teacher_forcing_embeddings must be num_levels - 1 when provided.")
 
         for i in range(self.num_levels):  # From TopExpander to BottomExpander
             expander = self.expanders[i]
@@ -661,8 +649,11 @@ class HierarchicalAutoencoder(nn.Module):
 
                 # 2) Make sure it matches the memory length (Lkv)
                 # (memory is what you pass as codes_hi embedded / continuous)
-                mem = (current_input_codes_hi if current_input_codes_hi.is_floating_point()
-                       else F.embedding(current_input_codes_hi, self.expanders[i].emb_hi.weight))
+                mem = (
+                    current_input_codes_hi
+                    if current_input_codes_hi.is_floating_point()
+                    else F.embedding(current_input_codes_hi, self.expanders[i].emb_hi.weight)
+                )
                 if kv_mask is not None and kv_mask.size(1) != mem.size(1):
                     # clip/pad the *mask* to Lkv (mem.size(1))
                     kv_mask, _ = _fix_len(kv_mask, None, mem.size(1), True)
@@ -694,18 +685,19 @@ class HierarchicalAutoencoder(nn.Module):
                     src_key_padding_mask=current_src_kpm,  # KPM for codes_hi
                     tgt_key_padding_mask=compression_results["steps"][self.num_levels - 1 - i].input_padding_mask,
                     max_len=max_len_override,
-                    seg_ids=compression_results["all_seg_ids"][self.num_levels - 1 - i]
+                    seg_ids=compression_results["all_seg_ids"][self.num_levels - 1 - i],
                 )
                 all_generated_tokens_list.append(generated_tokens)
                 current_input_codes_hi = generated_tokens
                 current_src_kpm = None  # KPM for purely generated sequences is typically None for next stage
 
         if is_teacher_forcing:
-            return {'all_logits': all_output_logits_list,
-                    'final_reconstructed_logits': all_output_logits_list[-1]}
+            return {'all_logits': all_output_logits_list, 'final_reconstructed_logits': all_output_logits_list[-1]}
         else:
-            return {'generated_sequences': all_generated_tokens_list,
-                    'final_reconstructed_tokens': all_generated_tokens_list[-1]}
+            return {
+                'generated_sequences': all_generated_tokens_list,
+                'final_reconstructed_tokens': all_generated_tokens_list[-1],
+            }
 
     # ------------------------------------------------------------------
     # Helper utilities for the training forward pass
@@ -713,11 +705,11 @@ class HierarchicalAutoencoder(nn.Module):
 
     @staticmethod
     def _insert_eop(
-            seq: torch.Tensor,
-            end_mask: torch.Tensor,
-            kpm: Optional[torch.Tensor],
-            eop_id: int,
-            pad_id: int = 0  # ← pass your actual pad value here
+        seq: torch.Tensor,
+        end_mask: torch.Tensor,
+        kpm: Optional[torch.Tensor],
+        eop_id: int,
+        pad_id: int = 0,  # ← pass your actual pad value here
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Same signature as before but returns tensors of the *same* length S.
@@ -785,45 +777,46 @@ class HierarchicalAutoencoder(nn.Module):
 
         return out, out_kpm
 
-
     def _compute_compression_loss(
-        self,
-        compression_ratios: List[torch.Tensor],
-        device: torch.device
+        self, compression_ratios: List[torch.Tensor], device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        total_unweighted = torch.tensor(0., device=device, dtype=torch.float32)
-        total_weighted = torch.tensor(0., device=device, dtype=torch.float32)
+        total_unweighted = torch.tensor(0.0, device=device, dtype=torch.float32)
+        total_weighted = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
         for i, ratio in enumerate(compression_ratios):
             tgt = self.target_compression_ratios[i] if i < len(self.target_compression_ratios) else None
-            loss = torch.tensor(0., device=device, dtype=torch.float32)
+            loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             if tgt is not None:
                 loss = (ratio.mean() - tgt) ** 2
                 total_weighted += self.compression_loss_weights[i] * loss
             total_unweighted += loss
             details[f"compression_loss_L{i}"] = loss
-        avg = total_unweighted / self.num_levels if self.num_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+        avg = (
+            total_unweighted / self.num_levels
+            if self.num_levels > 0
+            else torch.tensor(0.0, device=device, dtype=torch.float32)
+        )
         return avg, total_weighted, details
 
     def _compute_top_code_lm_loss(
-        self,
-        compression_results: Dict[str, Any],
-        kpm_for_top_codes: Optional[torch.Tensor]
+        self, compression_results: Dict[str, Any], kpm_for_top_codes: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = compression_results['all_pre_vq_embeddings'][-1].device
-        avg_loss = torch.tensor(0., device=device, dtype=torch.float32)
+        avg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
 
-        if (self.code_sequence_transformer is not None and
-                self.top_lm_loss_weight > 0 and
-                compression_results['all_pre_vq_embeddings'][-1].numel() > 0):
+        if (
+            self.code_sequence_transformer is not None
+            and self.top_lm_loss_weight > 0
+            and compression_results['all_pre_vq_embeddings'][-1].numel() > 0
+        ):
             # cont = compression_results['all_pre_vq'][-1]
             cont = compression_results['all_vq_embeddings'][-1]
             codes = compression_results['all_vq_indices'][-1]
             kpm = kpm_for_top_codes  # (B, S?) or None
 
-            transformer_input = cont if self.top_transformer_continuous else F.embedding(
-                codes, self.compressors[-1].vq.codebook
+            transformer_input = (
+                cont if self.top_transformer_continuous else F.embedding(codes, self.compressors[-1].vq.codebook)
             )
             cst_out = self.code_sequence_transformer(
                 input_embeddings=transformer_input,
@@ -833,8 +826,8 @@ class HierarchicalAutoencoder(nn.Module):
             vq_loss_top = cst_out['vq_loss']
 
             if cont.size(1) <= 1:
-                mse_loss = torch.tensor(0., device=device, dtype=torch.float32)
-                ce_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             else:
                 pred = preds_pre_vq[:, :-1, :]
                 mask = kpm[:, 1:] if kpm is not None else None
@@ -846,9 +839,7 @@ class HierarchicalAutoencoder(nn.Module):
                 codebook = self.compressors[-1].vq.codebook
                 logits = -torch.cdist(pred, codebook)
                 ce_per_tok = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    target_codes.reshape(-1),
-                    reduction='none'
+                    logits.view(-1, logits.size(-1)), target_codes.reshape(-1), reduction='none'
                 ).view_as(target_codes)
 
                 if mask is not None:
@@ -858,28 +849,20 @@ class HierarchicalAutoencoder(nn.Module):
                         mse_loss = (mse_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
                         ce_loss = (ce_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
                     else:
-                        mse_loss = torch.tensor(0., device=device, dtype=torch.float32)
-                        ce_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                        mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                        ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
                 else:
                     mse_loss = mse_per_tok.mean()
                     ce_loss = ce_per_tok.mean()
 
-            avg_loss = (
-                self.top_lm_mse_weight * mse_loss
-                + self.top_lm_ce_weight * ce_loss
-                + vq_loss_top
-            )
+            avg_loss = self.top_lm_mse_weight * mse_loss + self.top_lm_ce_weight * ce_loss + vq_loss_top
             details['top_code_mse'] = mse_loss
             details['top_code_ce'] = ce_loss
             details['top_code_vq_loss'] = vq_loss_top
 
         return avg_loss, details
 
-
-    def _prepare_teacher_forcing_inputs(
-            self,
-            compression_results: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _prepare_teacher_forcing_inputs(self, compression_results: Dict[str, Any]) -> Dict[str, Any]:
         """
         After this call we guarantee, for every level j (0 = bottom bytes):
             • targets[j]             : (B, S_j)
@@ -901,7 +884,7 @@ class HierarchicalAutoencoder(nn.Module):
         targets, kpms, seg_ids_aligned = [], [], []
 
         # ---------- walk from top to bottom ----------
-        for lvl in range(self.num_levels-1, -1, -1):
+        for lvl in range(self.num_levels - 1, -1, -1):
             tgt = all_compressor_input_tokens[lvl]
             kpm = all_compressor_input_kpms[lvl]
 
@@ -914,12 +897,11 @@ class HierarchicalAutoencoder(nn.Module):
             targets.append(tgt)
             kpms.append(kpm)
 
-        top_codes_for_decompress = (all_pre_vq[-1] if self.use_continuous_expander_inputs
-                                    else all_codes[-1])
+        top_codes_for_decompress = all_pre_vq[-1] if self.use_continuous_expander_inputs else all_codes[-1]
 
-
-        tf_continuous = ([all_pre_vq[-2 - i] for i in range(self.num_levels - 1)]
-                         if self.use_continuous_expander_inputs else None)
+        tf_continuous = (
+            [all_pre_vq[-2 - i] for i in range(self.num_levels - 1)] if self.use_continuous_expander_inputs else None
+        )
 
         return {
             'targets': targets,
@@ -938,7 +920,7 @@ class HierarchicalAutoencoder(nn.Module):
         target_kpms: List[Optional[torch.Tensor]],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = all_logits[0].device if all_logits else torch.device('cpu')
-        total_loss = torch.tensor(0., device=device, dtype=torch.float32)
+        total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
 
         for i in range(self.num_levels):
@@ -972,7 +954,11 @@ class HierarchicalAutoencoder(nn.Module):
             details[level_name] = current_loss
             total_loss += current_loss
 
-        avg_loss = total_loss / self.num_levels if self.num_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+        avg_loss = (
+            total_loss / self.num_levels
+            if self.num_levels > 0
+            else torch.tensor(0.0, device=device, dtype=torch.float32)
+        )
         return avg_loss, details
 
     def _compute_auxiliary_losses(
@@ -983,7 +969,7 @@ class HierarchicalAutoencoder(nn.Module):
         all_compressor_input_kpms: List[Optional[torch.Tensor]],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = tokens.device
-        total_unweighted = torch.tensor(0., device=device, dtype=torch.float32)
+        total_unweighted = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
 
         if self.aux_lm_loss_weight > 0 and all_encoder_logits:
@@ -994,28 +980,30 @@ class HierarchicalAutoencoder(nn.Module):
                 input_kpm_i = all_compressor_input_kpms[i]
 
                 if input_tokens_i.size(1) <= 1:
-                    current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                    current_aux_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
                 else:
                     logits_for_next = encoder_logits_i[:, :-1, :]
                     target_tokens_for_next = input_tokens_i[:, 1:]
                     kpm_for_shifted_targets = input_kpm_i[:, 1:] if input_kpm_i is not None else None
 
                     if logits_for_next.size(1) == 0:
-                        current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                        current_aux_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
                     else:
                         loss_per_tok = F.cross_entropy(
                             logits_for_next.reshape(-1, logits_for_next.size(-1)),
                             target_tokens_for_next.reshape(-1),
-                            reduction='none'
+                            reduction='none',
                         ).view_as(target_tokens_for_next)
 
                         if kpm_for_shifted_targets is not None:
                             loss_mask = ~kpm_for_shifted_targets
                             valid_targets_count = loss_mask.sum()
                             if valid_targets_count > 0:
-                                current_aux_loss = (loss_per_tok * loss_mask).sum() / valid_targets_count.clamp(min=1e-9)
+                                current_aux_loss = (loss_per_tok * loss_mask).sum() / valid_targets_count.clamp(
+                                    min=1e-9
+                                )
                             else:
-                                current_aux_loss = torch.tensor(0., device=device, dtype=torch.float32)
+                                current_aux_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
                         else:
                             current_aux_loss = loss_per_tok.mean()
 
@@ -1024,20 +1012,24 @@ class HierarchicalAutoencoder(nn.Module):
                 details[f"aux_lm_loss_L{i}"] = current_aux_loss
                 total_unweighted += current_aux_loss
 
-            avg_loss = total_unweighted / num_valid_levels if num_valid_levels > 0 else torch.tensor(0., device=device, dtype=torch.float32)
+            avg_loss = (
+                total_unweighted / num_valid_levels
+                if num_valid_levels > 0
+                else torch.tensor(0.0, device=device, dtype=torch.float32)
+            )
         else:
-            avg_loss = torch.tensor(0., device=device, dtype=torch.float32)
+            avg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         return avg_loss, details
 
     @torch.no_grad()
     def _gen_segment_at_level(
-            self,
-            e_idx: int,  # 0 = top expander, L-1 = bottom (bytes)
-            hi_seq: torch.Tensor,  # (1, S_hi) or (1, S_hi, D)
-            *,
-            comp_for_masks: Optional[Dict[str, Any]],  # fresh compress(...) for top, else None
-            decode_max_len: Optional[int],
+        self,
+        e_idx: int,  # 0 = top expander, L-1 = bottom (bytes)
+        hi_seq: torch.Tensor,  # (1, S_hi) or (1, S_hi, D)
+        *,
+        comp_for_masks: Optional[Dict[str, Any]],  # fresh compress(...) for top, else None
+        decode_max_len: Optional[int],
     ) -> torch.Tensor:
         """
         Returns: bottom bytes (1, B_new) generated for this parent segment.
@@ -1045,7 +1037,7 @@ class HierarchicalAutoencoder(nn.Module):
         """
         assert hi_seq.size(0) == 1, "Gen supports B=1 for now."
         exp = self.expanders[e_idx]
-        is_bottom = (e_idx == self.num_levels - 1)
+        is_bottom = e_idx == self.num_levels - 1
         device = hi_seq.device
 
         # per-segment cap we actually want to allow this call to emit
@@ -1096,7 +1088,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         # consume exactly `steps_taken`, not `max_new`
         bottom_bytes = lo.new_zeros(1, 0)
-        stop_set = ({*self._bottom_ids()} if is_bottom else {int(self.compressors[e_idx - 1].vq.eop_token_id)})
+        stop_set = {*self._bottom_ids()} if is_bottom else {int(self.compressors[e_idx - 1].vq.eop_token_id)}
 
         # # After the call, tgt_kpm has been updated in-place
         # new_valid = int((~tgt_kpm).sum().item())
@@ -1110,13 +1102,13 @@ class HierarchicalAutoencoder(nn.Module):
             tok = int(out[0, pos].item())
             if tok in stop_set:  # terminal landed exactly at this position
                 if is_bottom:  # include it at bottom so caller can stop on it
-                    bottom_bytes = torch.cat([bottom_bytes, out[:, pos:pos + 1]], dim=1)
+                    bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
                 break
 
             if is_bottom:
-                bottom_bytes = torch.cat([bottom_bytes, out[:, pos:pos + 1]], dim=1)
+                bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
             else:
-                child_hi = out[:, pos:pos + 1]  # (1,1)
+                child_hi = out[:, pos : pos + 1]  # (1,1)
                 child_bytes = self._gen_segment_at_level(
                     e_idx=e_idx + 1,
                     hi_seq=child_hi,
@@ -1126,9 +1118,7 @@ class HierarchicalAutoencoder(nn.Module):
                 bottom_bytes = torch.cat([bottom_bytes, child_bytes], dim=1)
         return bottom_bytes
 
-    def forward(self, tokens: torch.Tensor,
-                key_padding_mask: Optional[torch.Tensor] = None
-                ) -> Dict[str, Any]:
+    def forward(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """Training forward pass combining compression and reconstruction.
 
         The input tokens are compressed level by level and then decoded back
@@ -1222,12 +1212,12 @@ class HierarchicalAutoencoder(nn.Module):
 
     @torch.no_grad()
     def generate_bytes(
-            self,
-            prompt_tokens: torch.Tensor,  # (1, S0)
-            key_padding_mask: Optional[torch.Tensor] = None,
-            *,
-            max_top_codes: int = 256,
-            decode_max_len: Optional[int] = None,
+        self,
+        prompt_tokens: torch.Tensor,  # (1, S0)
+        key_padding_mask: Optional[torch.Tensor] = None,
+        *,
+        max_top_codes: int = 256,
+        decode_max_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Recursive AR: one top symbol → one variable-length segment per level → bytes."""
         self.eval()

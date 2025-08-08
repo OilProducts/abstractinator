@@ -1,5 +1,6 @@
+
 import torch
-from typing import Dict
+
 
 class RotaryCache:
     _store: dict[tuple[int, int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -15,7 +16,6 @@ class RotaryCache:
             sin = freqs.sin()[None, None, :, :].to(dtype)
             RotaryCache._store[key] = (cos, sin)
         return RotaryCache._store[key]
-
 
 
 def apply_rope(x: torch.Tensor, seq_pos: slice | None = None) -> torch.Tensor:

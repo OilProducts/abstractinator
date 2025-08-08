@@ -16,16 +16,18 @@ def build_model():
             "beta": 0.25,
         }
     ]
-    exp_cfg = [{
-        "dim_scale": 1.0,
-        "num_enc_layers": 1,
-        "num_dec_layers": 1,
-        "heads_scale": 1.0,
-        "eos_id": 1,
-        "max_len": 8,
-        "use_decoder_only": True,
-        "use_continuous_inputs": True,
-    }]
+    exp_cfg = [
+        {
+            "dim_scale": 1.0,
+            "num_enc_layers": 1,
+            "num_dec_layers": 1,
+            "heads_scale": 1.0,
+            "eos_id": 1,
+            "max_len": 8,
+            "use_decoder_only": True,
+            "use_continuous_inputs": True,
+        }
+    ]
     model = HierarchicalAutoencoder(
         num_levels=1,
         compressor_level_configs=comp_cfg,
@@ -53,7 +55,13 @@ def test_continuous_inputs_to_expanders():
         def make_wrapper(fn):
             def wrapper(codes_hi, codes_lo, src_key_padding_mask=None, tgt_key_padding_mask=None):
                 seen_inputs.append(codes_hi)
-                return fn(codes_hi, codes_lo, src_key_padding_mask=src_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+                return fn(
+                    codes_hi,
+                    codes_lo,
+                    src_key_padding_mask=src_key_padding_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                )
+
             return wrapper
 
         exp.forward = make_wrapper(orig_forward)

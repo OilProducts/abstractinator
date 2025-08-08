@@ -1,8 +1,8 @@
 import torch
 
 from components.code_sequence_transformer import CodeSequenceTransformer
-from components.vector_quantizer import VectorQuantizer
 from components.expander import CodeExpander
+from components.vector_quantizer import VectorQuantizer
 
 
 def test_continuous_transformer_forward():
@@ -24,4 +24,3 @@ def test_expander_with_continuous_memory():
     codes_lo = torch.randint(0, 4, (2, 6))
     out = exp(memory, codes_lo)
     assert out["logits"].shape == (2, 6, 4)
-

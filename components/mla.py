@@ -1,20 +1,20 @@
 import math
-from typing import Optional, Tuple, Callable
+from functools import lru_cache
+from typing import Callable, Optional, Tuple
 
 import torch
-import torch.nn as nn
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
-from torch import Tensor
-from functools import lru_cache
 import torch._dynamo as dynamo
+import torch.nn as nn
+from torch import Tensor
+from torch.nn.attention.flex_attention import and_masks, create_block_mask, flex_attention
 
-from .utils import safe_softmax
 from .swiglu import SwiGLU
+from .utils import safe_softmax
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Swap and negate the last‑dimensional halves: (x1, x2) → (‑x2, x1)."""
-    x1, x2 = x[..., : x.size(-1) // 2], x[..., x.size(-1) // 2:]
+    x1, x2 = x[..., : x.size(-1) // 2], x[..., x.size(-1) // 2 :]
     return torch.cat([-x2, x1], dim=-1)
 
 
@@ -25,22 +25,24 @@ def _apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.
     """
     return (x * cos) + (_rotate_half(x) * sin)
 
+
 import torch
-import torch._dynamo as dynamo
+
 
 class _RoPECache:
     """
     Cache (sin, cos) per (dim, device, dtype). Grow tables when needed and return slices.
     Keeping dict size constant avoids Dynamo guards like len(_cache) == N.
     """
+
     _cache: dict[tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, int]] = {}
 
     @staticmethod
     def _build_tables(L: int, dim: int, device: torch.device, out_dtype: torch.dtype):
         # build in fp32 for accurate sin/cos, then cast
         inv = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
-        t   = torch.arange(L, device=device, dtype=torch.float32)
-        f   = torch.einsum('l,d->ld', t, inv)              # [L, dim/2] fp32
+        t = torch.arange(L, device=device, dtype=torch.float32)
+        f = torch.einsum('l,d->ld', t, inv)  # [L, dim/2] fp32
         sin = f.sin().repeat_interleave(2, dim=-1).contiguous()
         cos = f.cos().repeat_interleave(2, dim=-1).contiguous()
         if out_dtype != torch.float32:
@@ -84,15 +86,15 @@ class MultiheadLatentAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            dim_q: int,  # full model width (7168)
-            num_heads: int = 128,
-            head_dim: int = 128,  # K
-            kv_comp_dim: int = 512,  # d_c
-            q_comp_dim: int = 1536,  # d_c'
-            retr_dim: int = 64,  # r
-            score_mod: Optional[Callable] = None,  # Flex mask/bias callback
-            use_flex_attention: bool = True,
+        self,
+        dim_q: int,  # full model width (7168)
+        num_heads: int = 128,
+        head_dim: int = 128,  # K
+        kv_comp_dim: int = 512,  # d_c
+        q_comp_dim: int = 1536,  # d_c'
+        retr_dim: int = 64,  # r
+        score_mod: Optional[Callable] = None,  # Flex mask/bias callback
+        use_flex_attention: bool = True,
     ):
         super().__init__()
         self.h = num_heads
@@ -152,18 +154,20 @@ class MultiheadLatentAttention(nn.Module):
     def _flex_attention(self, q_r, k_r, v_c, *, block_mask=None):
         # NOTE: we now always pass score_mod, even when block_mask is present.
         return flex_attention(
-            q_r, k_r, v_c,
+            q_r,
+            k_r,
+            v_c,
             score_mod=self._score_mod_with_pad,
             block_mask=block_mask,
         )
 
     def _fallback_attention(
-            self,
-            q_r: torch.Tensor,  # [B, H, S, r]
-            k_r: torch.Tensor,  # [B, H, L, r]
-            v_c: torch.Tensor,  # [B, H, L, d_c]
-            *,
-            block_mask: Optional[torch.Tensor] = None,
+        self,
+        q_r: torch.Tensor,  # [B, H, S, r]
+        k_r: torch.Tensor,  # [B, H, L, r]
+        v_c: torch.Tensor,  # [B, H, L, d_c]
+        *,
+        block_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Light‑weight dot‑product attention used when FlexAttention is unavailable.
@@ -189,8 +193,7 @@ class MultiheadLatentAttention(nn.Module):
                 scores = scores.masked_fill(keep, -float('inf'))
                 mask = mask | keep
             else:
-                scores = scores.masked_fill(block_mask, -float(
-                    'inf'))
+                scores = scores.masked_fill(block_mask, -float('inf'))
                 mask = mask | block_mask
 
         # -- 3. softmax & value aggregation ------------------------------------
@@ -227,21 +230,21 @@ class MultiheadLatentAttention(nn.Module):
         ctx_c = self._attn(q_r, k_r, v_c, block_mask=block_mask)  # [B,H,d_c]
 
         # 6) compressed → latent
-        ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv.transpose(1,2))  # [B,H,S,K]
+        ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv.transpose(1, 2))  # [B,H,S,K]
         ctx_lat = ctx_lat.permute(0, 2, 1, 3).reshape(B, S, -1)  # [B,S,H*K]
 
         # 7) output
         return self.out_proj(ctx_lat)  # [B,D]
 
+
 def _build_time_keep_fn(window: int):
     return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
+
 
 @lru_cache(maxsize=64)
 def _cached_flex_sliding_mask(seq_len: int, window: int, device):
     keep = _build_time_keep_fn(window)
-    return create_block_mask(keep, B=None, H=None,
-                             Q_LEN=seq_len, KV_LEN=seq_len,
-                             BLOCK_SIZE=128, device=device)
+    return create_block_mask(keep, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, BLOCK_SIZE=128, device=device)
 
 
 class SlidingWindowMLA(nn.Module):
@@ -255,7 +258,6 @@ class SlidingWindowMLA(nn.Module):
         self.mla = MultiheadLatentAttention(*mla_args, **mla_kwargs)
         self.kv_proj = nn.Linear(mla_kwargs.get("dim_q"), self.mla.d_c, bias=False)
         self.o_proj = nn.Linear(mla_kwargs.get("dim_q"), mla_kwargs.get("dim_q"), bias=False)
-
 
     @staticmethod
     @dynamo.disable
@@ -273,8 +275,10 @@ class SlidingWindowMLA(nn.Module):
         if pad is not None:
             # ensure clean indexing
             pad = pad.to(torch.bool).contiguous()
+
             def _keep_pad(b, h, _q, k):
                 return ~pad[b, k]
+
             keep = and_masks(keep_time, _keep_pad)
             B = int(pad.size(0))
         else:
@@ -283,7 +287,7 @@ class SlidingWindowMLA(nn.Module):
         return create_block_mask(
             keep,
             B=B,
-            H=num_heads,                   # make H explicit
+            H=num_heads,  # make H explicit
             Q_LEN=int(seq_len),
             KV_LEN=int(seq_len),
             BLOCK_SIZE=int(block_size),
@@ -291,13 +295,13 @@ class SlidingWindowMLA(nn.Module):
         )
 
     def build_sliding_masks(
-            self,
-            seq_len: int,
-            window: int,
-            pad: Optional[torch.Tensor],
-            use_flex: bool,
-            device: torch.device,
-            block_size: int = 128,
+        self,
+        seq_len: int,
+        window: int,
+        pad: Optional[torch.Tensor],
+        use_flex: bool,
+        device: torch.device,
+        block_size: int = 128,
     ) -> Tuple[Optional[Callable], Optional[torch.Tensor]]:
         """
         Returns (flex_mask, dense_mask). Flex path uses a cached time-only mask.
@@ -323,7 +327,7 @@ class SlidingWindowMLA(nn.Module):
 
         kv_c = self.kv_proj(x)
         if key_padding_mask is not None:
-            kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.)
+            kv_c = kv_c.masked_fill(key_padding_mask[..., None], 0.0)
 
         # cache: time-only block mask
         flex_mask, dense_mask = self.build_sliding_masks(
@@ -336,9 +340,7 @@ class SlidingWindowMLA(nn.Module):
         block_mask = flex_mask if flex_mask is not None else dense_mask
 
         # NEW: hand pad to MLA to be applied in score_mod inside the kernel
-        self.mla._pad_for_scores = (
-            key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
-        )
+        self.mla._pad_for_scores = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
 
         ctx = self.mla(x, kv_c, block_mask=block_mask)
 
@@ -379,17 +381,17 @@ class SlidingWindowMLATransformerBlock(nn.Module):
     """
 
     def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            window_size: int,
-            *,
-            head_dim: int = 128,
-            kv_comp_dim: int = 512,
-            q_comp_dim: int = 1536,
-            retr_dim: int = 64,
-            ffn_dim_multiplier: int = 4,
-            use_flex_attention: bool = True,
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: int,
+        *,
+        head_dim: int = 128,
+        kv_comp_dim: int = 512,
+        q_comp_dim: int = 1536,
+        retr_dim: int = 64,
+        ffn_dim_multiplier: int = 4,
+        use_flex_attention: bool = True,
     ):
         super().__init__()
 
@@ -415,9 +417,9 @@ class SlidingWindowMLATransformerBlock(nn.Module):
 
     # --------------------------------------------------------------------- #
     def forward(
-            self,
-            x: Tensor,
-            key_padding_mask: Optional[Tensor] = None,
+        self,
+        x: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Args
@@ -454,8 +456,10 @@ def _cached_causal_mask(seq_len: int, device: torch.device):
 
     return create_block_mask(
         _keep,
-        B=None, H=None,
-        Q_LEN=seq_len, KV_LEN=seq_len,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
         BLOCK_SIZE=128,
         device=device,
     )
@@ -502,7 +506,6 @@ class CausalMLA(nn.Module):
             block_mask = block_mask | key_padding_mask[:, None, None, :]
         return block_mask
 
-
     def forward(self, x, key_padding_mask: Optional[torch.Tensor] = None):
         B, S, _ = x.shape
         kv_c = self.kv_proj(x)
@@ -512,8 +515,7 @@ class CausalMLA(nn.Module):
         block_mask = self._build_mask(S, key_padding_mask, x.device)
 
         # let score_mod handle padding inside the kernel
-        self.mla._pad_for_scores = (key_padding_mask.to(torch.bool)
-                                    if key_padding_mask is not None else None)
+        self.mla._pad_for_scores = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
 
         ctx = self.mla(x, kv_c, block_mask=block_mask)
         self.mla._pad_for_scores = None
@@ -523,6 +525,7 @@ class CausalMLA(nn.Module):
 # ----------------------------------------------------------------------------- #
 # Transformer Block
 # ----------------------------------------------------------------------------- #
+
 
 # @torch.compile
 class CausalMLATransformerBlock(nn.Module):
@@ -535,16 +538,16 @@ class CausalMLATransformerBlock(nn.Module):
     """
 
     def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            *,
-            head_dim: int = 128,
-            kv_comp_dim: int = 512,
-            q_comp_dim: int = 1536,
-            retr_dim: int = 64,
-            ffn_dim_multiplier: int = 4,
-            use_flex_attention: bool = True,
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        head_dim: int = 128,
+        kv_comp_dim: int = 512,
+        q_comp_dim: int = 1536,
+        retr_dim: int = 64,
+        ffn_dim_multiplier: int = 4,
+        use_flex_attention: bool = True,
     ):
         super().__init__()
 
@@ -567,9 +570,9 @@ class CausalMLATransformerBlock(nn.Module):
 
     # --------------------------------------------------------------------- #
     def forward(
-            self,
-            x: torch.Tensor,  # [B,S,D]
-            key_padding_mask: Optional[torch.Tensor] = None,
+        self,
+        x: torch.Tensor,  # [B,S,D]
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 1. Causal MLA
         x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)

@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-
+import functools
 import math
-from typing import Tuple
+from typing import Callable, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch
-import functools
-from typing import Callable
 
-def safe_softmax(scores: torch.Tensor,
-                 mask: torch.Tensor,
-                 dim: int = -1) -> torch.Tensor:
+def safe_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     Identical to soft‑max on `scores.masked_fill(mask, -inf)` *except*
     rows where everything is masked yield a zero vector (no NaNs).
@@ -41,8 +36,7 @@ def short_num(n):
     if n == 0:
         return '0'
     # Determine the appropriate suffix index
-    millidx = max(0, min(len(millnames) - 1,
-                         int(math.floor(math.log10(abs(n)) / 3))))
+    millidx = max(0, min(len(millnames) - 1, int(math.floor(math.log10(abs(n)) / 3))))
     # Scale the number down by the appropriate power of 1000
     scaled = n / 10 ** (3 * millidx)
     # Determine the number of decimal places based on the scaled value
@@ -110,7 +104,7 @@ def token_entropy(logits: torch.Tensor) -> torch.Tensor:
 
     # Convert log probabilities to probabilities
     # p will also have the shape: (batch_size, sequence_length, vocab_size)
-    p = log_p.exp() # Equivalent to F.softmax(logits, dim=-1)
+    p = log_p.exp()  # Equivalent to F.softmax(logits, dim=-1)
 
     # Calculate entropy: H(P) = - sum(p * log_p)
     # The product p * log_p is element-wise.
@@ -119,6 +113,7 @@ def token_entropy(logits: torch.Tensor) -> torch.Tensor:
     entropy = -(p * log_p).sum(dim=-1)  # Shape: (batch_size, sequence_length)
 
     return entropy
+
 
 def entropy_segments(
     ent: torch.Tensor,
@@ -152,14 +147,16 @@ def entropy_segments(
     """
     # increase_delta = 0  # TODO: remove this
     if ent.ndim != 2:
-        raise ValueError(f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}")
+        raise ValueError(
+            f"Input entropy tensor `ent` must be 2D (batch_size, sequence_length), but got shape {ent.shape}"
+        )
     if ent.size(1) == 0:
         seg_id = torch.empty_like(ent, dtype=torch.long)
         if return_boundary:
             return seg_id, torch.empty_like(ent, dtype=torch.bool)
         return seg_id
     if ent.size(1) == 1:
-        seg_id = torch.zeros_like(ent, dtype=torch.long) # Single token sequence is segment 0
+        seg_id = torch.zeros_like(ent, dtype=torch.long)  # Single token sequence is segment 0
         if return_boundary:
             return seg_id, torch.ones_like(ent, dtype=torch.bool)
         return seg_id
@@ -173,7 +170,7 @@ def entropy_segments(
 
     # Convert boolean to integer (True -> 1, False -> 0)
     # These are indicators for starting a new segment (incrementing segment ID).
-    inc_indicators = entropy_increased.int() # Shape: (batch_size, sequence_length - 1)
+    inc_indicators = entropy_increased.int()  # Shape: (batch_size, sequence_length - 1)
 
     # Pad the indicators at the beginning of the sequence (dim=1, left side).
     # The first token effectively has no preceding token to compare against,
@@ -187,7 +184,6 @@ def entropy_segments(
     # This creates the segment IDs. Each time `inc` is 1, the segment ID increments.
     seg_id = torch.cumsum(inc, dim=1)  # Shape: (batch_size, sequence_length)
 
-
     if return_boundary:
         # seg_id differs at patch borders
         patch_end = torch.zeros_like(seg_id, dtype=torch.bool)
@@ -197,6 +193,7 @@ def entropy_segments(
         return seg_id, patch_end
     else:
         return seg_id
+
 
 def _compiled(module: nn.Module):
     # dynamic=True handles S/L changes; instance-local cache avoids shape collisions
@@ -211,11 +208,9 @@ def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
     seg_id : (B,S₀)  int64
     L      : queries per segment
     """
-    seg_id = seg_id.contiguous()          # keep a private copy
+    seg_id = seg_id.contiguous()  # keep a private copy
 
-    def mask(b: int, h: int,
-             q_idx: torch.Tensor,
-             k_idx: torch.Tensor) -> torch.Tensor:
+    def mask(b: int, h: int, q_idx: torch.Tensor, k_idx: torch.Tensor) -> torch.Tensor:
         """
         q_idx, k_idx: broadcast‑compatible tensors
         Returns True where attention is **blocked**.
@@ -227,11 +222,7 @@ def make_seg_mask_fn(seg_id: torch.Tensor, L: int) -> Callable:
 
 
 @functools.lru_cache(maxsize=32)
-def _cached_tiled_template(L: int,
-                           D: int,
-                           S_hat: int,
-                           device: torch.device,
-                           dtype: torch.dtype) -> torch.Tensor:
+def _cached_tiled_template(L: int, D: int, S_hat: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
     Returns an **UNINITIALISED** tensor of shape (Ŝ·L, D) *without* batch dim.
     This buffer is *never* written to; it exists only to avoid
@@ -239,9 +230,8 @@ def _cached_tiled_template(L: int,
     """
     return torch.empty((S_hat * L, D), device=device, dtype=dtype)
 
-def get_tiled_queries(base_queries: torch.Tensor,
-                      B: int,
-                      S_hat: int) -> torch.Tensor:
+
+def get_tiled_queries(base_queries: torch.Tensor, B: int, S_hat: int) -> torch.Tensor:
     """
     Parameters
     ----------
@@ -264,7 +254,7 @@ def get_tiled_queries(base_queries: torch.Tensor,
     template = _cached_tiled_template(L, D, S_hat, dev, dt)
 
     # ---- 2. Clone it → fresh storage (fast; no data copy yet) -------------
-    tiled = template.clone()                        # (Ŝ·L, D), version = 0
+    tiled = template.clone()  # (Ŝ·L, D), version = 0
 
     # ---- 3. Fill with the current parameter values ------------------------
     tiled.copy_(base_queries.repeat_interleave(S_hat, 0))
@@ -273,11 +263,10 @@ def get_tiled_queries(base_queries: torch.Tensor,
     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
 
 
-
 def build_segment_queries_mask(
-    seg_id: torch.Tensor,          # [B, S_original]   – integer segment ids
-    query_embed: torch.Tensor,     # [L, D]            – learned query template
-    num_heads: int                 # number of attention heads
+    seg_id: torch.Tensor,  # [B, S_original]   – integer segment ids
+    query_embed: torch.Tensor,  # [L, D]            – learned query template
+    num_heads: int,  # number of attention heads
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct segment-aware queries and attention masks.
 
@@ -302,48 +291,47 @@ def build_segment_queries_mask(
             - ``valid_segments``: Boolean tensor of shape ``(B, S_hat)`` marking
               which segment slots are real for each item in the batch.
     """
-    B, S_original = seg_id.shape          # SymInts
-    L, D          = query_embed.shape
-    device        = seg_id.device
+    B, S_original = seg_id.shape  # SymInts
+    L, D = query_embed.shape
+    device = seg_id.device
 
     # ----------------------------------------------------------------------
     # 1.  Maximum #segments in the batch (scalar SymInt, NOT Python int)
     # ----------------------------------------------------------------------
-    seg_count = seg_id.amax(dim=1) + 1          # (B,)  actual segments per item
-    S_hat     = seg_count.amax()                # 0‑D tensor / SymInt ✔️
+    seg_count = seg_id.amax(dim=1) + 1  # (B,)  actual segments per item
+    S_hat = seg_count.amax()  # 0‑D tensor / SymInt ✔️
 
     # ----------------------------------------------------------------------
     # 2.  Build queries   [B, S_hat * L, D]
     # ----------------------------------------------------------------------
     #   Expand with SymInt S_hat – no Python conversion.
     queries = (
-        query_embed                 # [L, D]
-          .unsqueeze(0)             # [1, L, D]
-          .unsqueeze(0)             # [1, 1, L, D]
-          .expand(B, S_hat, L, D)   # [B, S_hat, L, D]
-          .reshape(B, -1, D)        # [B, S_hat*L, D]
+        query_embed.unsqueeze(0)  # [L, D]  # [1, L, D]
+        .unsqueeze(0)  # [1, 1, L, D]
+        .expand(B, S_hat, L, D)  # [B, S_hat, L, D]
+        .reshape(B, -1, D)  # [B, S_hat*L, D]
     )
 
     # ----------------------------------------------------------------------
     # 3.  Segment‑id for every query   [B, S_hat*L]
     # ----------------------------------------------------------------------
     # Build with arithmetic on SymInts – still no .item().
-    q_positions = torch.arange(queries.shape[1], device=device)   # 0 … S_hat*L‑1
-    seg_for_q   = (q_positions // L).expand(B, -1)                # repeat for batch
+    q_positions = torch.arange(queries.shape[1], device=device)  # 0 … S_hat*L‑1
+    seg_for_q = (q_positions // L).expand(B, -1)  # repeat for batch
 
     # ----------------------------------------------------------------------
     # 4.  Attention mask   [B*num_heads, S_hat*L, S_original]   (True ⇒ BLOCK)
     # ----------------------------------------------------------------------
-    same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])   # broadcast compare
-    att_mask     = (~same_segment).repeat_interleave(num_heads, dim=0)
+    same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])  # broadcast compare
+    att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
 
     # ----------------------------------------------------------------------
     # 5.  Valid segment slots   [B, S_hat]
     # ----------------------------------------------------------------------
     valid_segments = (
-        torch.arange(S_hat, device=device)      # 0 … S_hat‑1   (SymInt end)
-              .unsqueeze(0)
-              .lt(seg_count.unsqueeze(1))       # i < seg_count[b]
+        torch.arange(S_hat, device=device)  # 0 … S_hat‑1   (SymInt end)
+        .unsqueeze(0)
+        .lt(seg_count.unsqueeze(1))  # i < seg_count[b]
     )
 
     return queries, att_mask, valid_segments

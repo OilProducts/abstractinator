@@ -1,52 +1,52 @@
-import os
-import math
-import sys
-import time
 import argparse
 import importlib.util
-from dataclasses import asdict
 import logging
+import math
+import os
+import time
+from dataclasses import asdict
 from functools import partial
 
 # Name for loggers created in this module so logs don't show '__main__'
 LOGGER_NAME = "abstractinator.train"
 
-import torch
-from datasets import load_dataset, Dataset  # Import Dataset for the dummy data
-from torch import optim
-from torch.utils.data import DataLoader
-from typing import List, Dict, Any
-from transformers.optimization import get_scheduler
 
 import mlflow  # Logging with MLflow
+import torch
+from datasets import load_dataset  # Import Dataset for the dummy data
 from mlflow.tracking import MlflowClient
+from torch import optim
+from torch.utils.data import DataLoader
+from transformers.optimization import get_scheduler
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
-from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
+from components.checkpoint_utils import load_base_components, save_base_components
 from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
-from components.utils import short_num, format_duration
+from components.metrics import MlflowBatchLogger, TrainingMetrics
+from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
 from components.tokenizer import ByteLevelTokenizer
-from components.checkpoint_utils import save_base_components, load_base_components
-from components.metrics import TrainingMetrics, MlflowBatchLogger
-from data_utils import tokenize_and_process_examples
-
+from components.utils import short_num
 from configs.base_config import (
     DEVICE as DEFAULT_DEVICE,
+)
+from configs.base_config import (
     N_CPU as DEFAULT_N_CPU,
+)
+from configs.base_config import (
     ExpConfig,
 )
+from data_utils import tokenize_and_process_examples
 
-torch.backends.cuda.enable_flash_sdp(True)   # FlashAttn‑2*
+torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 torch._dynamo.config.recompile_limit = 512
 
+
 def parse_args() -> argparse.Namespace:
     """Return command line arguments for the training script."""
-    parser = argparse.ArgumentParser(
-        description="Training script for HierarchicalAutoencoder"
-    )
+    parser = argparse.ArgumentParser(description="Training script for HierarchicalAutoencoder")
     parser.add_argument(
         "--config",
         type=str,
@@ -115,14 +115,12 @@ def initialize_model(
     model = HierarchicalAutoencoder(
         num_levels=exp_config.num_levels,
         compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
-        expander_level_configs= [asdict(e) for e in exp_config.expander_level_configs],
+        expander_level_configs=[asdict(e) for e in exp_config.expander_level_configs],
         initial_vocab_size=exp_config.initial_vocab_size,
         propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
         aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
         top_transformer_config=(
-            asdict(exp_config.top_transformer_config)
-            if exp_config.top_transformer_config
-            else None
+            asdict(exp_config.top_transformer_config) if exp_config.top_transformer_config else None
         ),
         top_lm_loss_weight=exp_config.top_lm_loss_weight,
         # use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
@@ -312,10 +310,9 @@ def train_loop(
         desc="Byte-tokenising",
     )
 
-
-    tokenized_dataset.set_format("torch",
-                                 columns=["input_ids", "labels"],
-                                 dtype=torch.int16)  # let datasets choose per-column dtype
+    tokenized_dataset.set_format(
+        "torch", columns=["input_ids", "labels"], dtype=torch.int16
+    )  # let datasets choose per-column dtype
 
     tokenized_dataset.set_format(
         type="torch",
@@ -330,9 +327,7 @@ def train_loop(
         pin_memory=True if device == "cuda" else False,
     )
 
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / exp_config.gradient_accumulation_steps
-    )
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config.gradient_accumulation_steps)
     if exp_config.max_steps is not None:
         exp_config.num_training_steps = int(exp_config.max_steps)
     else:
@@ -343,7 +338,9 @@ def train_loop(
         optimizer=optimizer,
         num_warmup_steps=exp_config.warmup_steps,
         num_training_steps=exp_config.num_training_steps,
-        scheduler_specific_kwargs=exp_config.scheduler_specific_kwargs if hasattr(exp_config, "scheduler_specific_kwargs") else {},
+        scheduler_specific_kwargs=exp_config.scheduler_specific_kwargs
+        if hasattr(exp_config, "scheduler_specific_kwargs")
+        else {},
     )
 
     mlflow.log_params(exp_config.as_dict())
@@ -387,7 +384,6 @@ def train_loop(
             loss_for_backward.backward()
 
             metrics.update_from_batch(output_dict, key_padding_mask)
-
 
             if (i + 1) % exp_config.gradient_accumulation_steps == 0:
                 if exp_config.gradient_clip_norm:
@@ -455,11 +451,9 @@ def train_loop(
                             prompt_tokens=input_gen_tokens,
                             key_padding_mask=input_gen_kpm,
                             max_top_codes=exp_config.generation_max_len_override,
-                            decode_max_len = 8
+                            decode_max_len=8,
                         )
-                        reconstructed_text = tokenizer.decode(
-                            reconstructed_tokens.squeeze(0).cpu()
-                        )
+                        reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu())
 
                         logger.info("--- Sample Generation at Step %s ---", global_step)
                         logger.info("Original Prompt:\n%s", sample_text)
@@ -498,7 +492,6 @@ def train_loop(
             exp_config.checkpoint_dir,
             exp_config,
             logger,
-
         )
 
         if exp_config.max_steps is not None and global_step >= exp_config.max_steps:
@@ -517,7 +510,6 @@ def main() -> None:
     args = parse_args()
     trainer = Trainer(args)
     trainer.train()
-
 
 
 if __name__ == "__main__":

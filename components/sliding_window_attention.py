@@ -1,16 +1,18 @@
+from functools import lru_cache
+from typing import Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import lru_cache
-from .utils import safe_softmax
 from torch.nn.attention.flex_attention import (
-    flex_attention,           # fused kernel
-    create_block_mask,        # helper to build sparse mask
-    and_masks
+    and_masks,
+    create_block_mask,  # helper to build sparse mask
+    flex_attention,  # fused kernel
 )
+
 from .rope import apply_rope
 from .swiglu import SwiGLU
-from typing import Optional, Tuple, Dict
+from .utils import safe_softmax
 
 
 @lru_cache(maxsize=64)
@@ -23,6 +25,7 @@ def _cached_cross_window_mask(q_len: int, kv_len: int, window: int) -> torch.Ten
     mask = (rel_pos > 0) | (rel_pos < -window)
     return mask
 
+
 def get_cross_window_mask(
     q_len: int,
     kv_len: int,
@@ -31,6 +34,7 @@ def get_cross_window_mask(
 ) -> torch.Tensor:
     """Return the cached mask on ``device``."""
     return _cached_cross_window_mask(q_len, kv_len, window).to(device)
+
 
 # @torch.compile
 class LocalSlidingWindowAttention(nn.Module):
@@ -62,16 +66,13 @@ class LocalSlidingWindowAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.o_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-
     # ------------------------------------------------------------------ #
     # helper: memo‑cached BlockMask builder
     # ------------------------------------------------------------------ #
     @staticmethod
     def _sliding_block(seq_len: int, window: int, device: torch.device, is_training: bool) -> torch.Tensor:
         cache_key = (seq_len, window, device.index if device.type == "cuda" else -1)
-        cache = LocalSlidingWindowAttention._sliding_block.__dict__.setdefault(
-            "cache", {}
-        )
+        cache = LocalSlidingWindowAttention._sliding_block.__dict__.setdefault("cache", {})
         if cache_key in cache:
             return cache[cache_key]
 
@@ -86,7 +87,7 @@ class LocalSlidingWindowAttention(nn.Module):
             Q_LEN=seq_len,
             KV_LEN=seq_len,
             BLOCK_SIZE=128,
-            _compile=False,           # pre‑compile sparse metadata
+            _compile=False,  # pre‑compile sparse metadata
             device=device,
         )
 
@@ -99,8 +100,8 @@ class LocalSlidingWindowAttention(nn.Module):
     # ------------------------------------------------------------------ #
     def forward(
         self,
-        x: torch.Tensor,                            # (B, S, D)
-        key_padding_mask: Optional[torch.Tensor] = None,   # (B, S) – True = pad
+        x: torch.Tensor,  # (B, S, D)
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) – True = pad
     ) -> torch.Tensor:
         B, S, D = x.shape
         H, d = self.num_heads, self.head_dim
@@ -113,7 +114,7 @@ class LocalSlidingWindowAttention(nn.Module):
         v = self.v_proj(x).view(B, S, H, d).transpose(1, 2).contiguous()
         q = apply_rope(q)
         k = apply_rope(k)
-        q = q * (d ** -0.5)
+        q = q * (d**-0.5)
 
         # block mask ----------------------------------------------------------
         block_mask = self._sliding_block(S, self.window, x.device, self.training)
@@ -141,13 +142,14 @@ class LocalSlidingWindowAttention(nn.Module):
             query=q,
             key=k,
             value=v,
-            block_mask=block_mask,   # ← mandatory kw‑arg
+            block_mask=block_mask,  # ← mandatory kw‑arg
         )
 
         # merge heads + output proj -------------------------------------------
         out = ctx.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
         return out
+
 
 # @torch.compile
 class SlidingWindowAttention(nn.Module):
@@ -170,17 +172,14 @@ class SlidingWindowAttention(nn.Module):
         out_proj (nn.Linear): Final linear projection for the output.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, window_size: int,
-                 bias: bool = True) -> None:
+    def __init__(self, embed_dim: int, num_heads: int, window_size: int, bias: bool = True) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
-            )
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads}).")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.window_size = window_size # Number of *previous* tokens query can attend to
+        self.window_size = window_size  # Number of *previous* tokens query can attend to
 
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -219,10 +218,9 @@ class SlidingWindowAttention(nn.Module):
         mask = (rel_pos > 0) | (rel_pos < -self.window_size)
         return mask  # True means blocked
 
-    def forward(self,
-                x: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None,
-                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Computes sliding-window multi-head attention.
 
@@ -240,7 +238,7 @@ class SlidingWindowAttention(nn.Module):
             torch.Tensor: Output tensor after attention.
                 Shape: (batch_size, sequence_length, embed_dim).
         """
-        B, S, D = x.shape # D is embed_dim
+        B, S, D = x.shape  # D is embed_dim
         if D != self.embed_dim:
             raise ValueError(f"Input embed_dim ({D}) does not match layer embed_dim ({self.embed_dim})")
 
@@ -256,7 +254,7 @@ class SlidingWindowAttention(nn.Module):
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         q = apply_rope(q)
         k = apply_rope(k)
-        q = q * (self.head_dim ** -0.5)
+        q = q * (self.head_dim**-0.5)
 
         # Compute attention scores: (B, num_heads, S, S)
         # (B, H, S, d_h) @ (B, H, d_h, S) -> (B, H, S, S)
@@ -265,7 +263,7 @@ class SlidingWindowAttention(nn.Module):
         # --- Apply masks ---
         # 1. Sliding window mask (causal + fixed window)
         # This mask is (S, S) and applies to all heads and batch items uniformly.
-        combined_mask = self._sliding_window_mask(S, x.device) # (S, S)
+        combined_mask = self._sliding_window_mask(S, x.device)  # (S, S)
 
         # 2. Optional additional attention mask (e.g., for specific blocked patterns)
         if attn_mask is not None:
@@ -279,7 +277,7 @@ class SlidingWindowAttention(nn.Module):
         if key_padding_mask is not None:
             # Expand key_padding_mask from (B, S) to (B, 1, 1, S)
             # This masks columns (keys) corresponding to padded input tokens.
-            expanded_kpm = key_padding_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, S)
+            expanded_kpm = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
             # Combine with OR: if any mask says block, then block.
             # combined_mask (1,1,S,S) | expanded_kpm (B,1,1,S) -> (B,1,S,S) by broadcasting rules
             combined_mask = combined_mask | expanded_kpm
@@ -307,13 +305,10 @@ class SlidingWindowAttention(nn.Module):
 class SlidingWindowCrossAttention(nn.Module):
     """Sliding-window cross attention with separate query and key/value sequences."""
 
-    def __init__(self, embed_dim: int, num_heads: int, window_size: int,
-                 bias: bool = True) -> None:
+    def __init__(self, embed_dim: int, num_heads: int, window_size: int, bias: bool = True) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
-            )
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads}).")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
@@ -324,17 +319,18 @@ class SlidingWindowCrossAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def _cross_window_mask(self, q_len: int, kv_len: int,
-                           device: torch.device) -> torch.Tensor:
+    def _cross_window_mask(self, q_len: int, kv_len: int, device: torch.device) -> torch.Tensor:
         """Mask restricting queries to attend within a retrospective window."""
         return get_cross_window_mask(q_len, kv_len, self.window_size, device)
 
-    def forward(self,
-                query: torch.Tensor,  # codes_lo
-                key: torch.Tensor,  # codes_hi
-                value: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None,
-                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        query: torch.Tensor,  # codes_lo
+        key: torch.Tensor,  # codes_hi
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, S_q, D = query.shape
         if D != self.embed_dim or key.size(2) != self.embed_dim or value.size(2) != self.embed_dim:
             raise ValueError("embed_dim mismatch")
@@ -346,7 +342,7 @@ class SlidingWindowCrossAttention(nn.Module):
 
         q = apply_rope(q)
         k = apply_rope(k)
-        q = q * (self.head_dim ** -0.5)
+        q = q * (self.head_dim**-0.5)
 
         attn_scores = torch.matmul(q, k.transpose(-2, -1))
 
@@ -369,6 +365,7 @@ class SlidingWindowCrossAttention(nn.Module):
 
         return output
 
+
 # @torch.compile
 class SlidingWindowTransformerBlock(nn.Module):
     """
@@ -386,9 +383,9 @@ class SlidingWindowTransformerBlock(nn.Module):
         ffn (nn.Sequential): The feed-forward network.
     """
 
-    def __init__(self, dim: int, num_heads: int, window_size: int,
-                 ffn_dim_multiplier: int = 4,
-                 use_flex_attention: bool = True):
+    def __init__(
+        self, dim: int, num_heads: int, window_size: int, ffn_dim_multiplier: int = 4, use_flex_attention: bool = True
+    ):
         super().__init__()
         # First sub-block: Sliding Window Multi-Head Attention
         self.norm1 = nn.RMSNorm(dim)
@@ -410,8 +407,7 @@ class SlidingWindowTransformerBlock(nn.Module):
         ffn_hidden_dim = dim * ffn_dim_multiplier
         self.ffn = SwiGLU(dim, ffn_hidden_dim)
 
-    def forward(self, x: torch.Tensor,
-                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
 
@@ -438,6 +434,7 @@ class SlidingWindowTransformerBlock(nn.Module):
 
         return x
 
+
 # @torch.compile
 class StackedSlidingWindowEncoder(nn.Module):
     """
@@ -456,28 +453,39 @@ class StackedSlidingWindowEncoder(nn.Module):
             for sliding window attention. Should typically be True only when CUDA
             is available.
     """
-    def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
-                 num_layers: int, ffn_dim_multiplier: int = 4,
-                 use_flex_attention: bool = True):
+
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int,
+        num_heads: int,
+        window_size: int,
+        num_layers: int,
+        ffn_dim_multiplier: int = 4,
+        use_flex_attention: bool = True,
+    ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, dim)
 
-        self.layers = nn.ModuleList([
-            SlidingWindowTransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                ffn_dim_multiplier=ffn_dim_multiplier,
-                use_flex_attention=use_flex_attention
-            ) for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                SlidingWindowTransformerBlock(
+                    dim=dim,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                    ffn_dim_multiplier=ffn_dim_multiplier,
+                    use_flex_attention=use_flex_attention,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
-        self.final_norm = nn.RMSNorm(dim) # Normalization before output projection
-        self.logit_proj = nn.Linear(dim, vocab_size) # Projects to vocabulary size
+        self.final_norm = nn.RMSNorm(dim)  # Normalization before output projection
+        self.logit_proj = nn.Linear(dim, vocab_size)  # Projects to vocabulary size
 
-    def forward(self, token_ids: torch.Tensor,
-                key_padding_mask: Optional[torch.Tensor] = None
-               ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the encoder.
 
@@ -498,7 +506,7 @@ class StackedSlidingWindowEncoder(nn.Module):
         B, S = token_ids.shape
 
         # 1. Token Embeddings
-        x = self.embedding(token_ids) # (B, S, D)
+        x = self.embedding(token_ids)  # (B, S, D)
 
         # 2. (RoPE applied inside attention; no absolute positional encoding)
 
@@ -520,9 +528,10 @@ class StackedSlidingWindowEncoder(nn.Module):
 
 class AttnCache:
     """Simple container so we don’t juggle nested dicts."""
+
     def __init__(self):
-        self.self_k = self.self_v = None   # self-attn keys/vals
-        self.cross = {}                   # layer_name → {k,v,seg_ptr}
+        self.self_k = self.self_v = None  # self-attn keys/vals
+        self.cross = {}  # layer_name → {k,v,seg_ptr}
 
 
 class SegmentCausalCrossAttention(nn.Module):
@@ -537,42 +546,42 @@ class SegmentCausalCrossAttention(nn.Module):
 
     def __init__(
         self,
-        q_dim:     int,
-        kv_dim:    int,
-        d_attn:    int,
-        n_heads:   int,
-        lookback:  int  = 0,
-        dropout:   float = 0.0,
-        bias:      bool  = True,
+        q_dim: int,
+        kv_dim: int,
+        d_attn: int,
+        n_heads: int,
+        lookback: int = 0,
+        dropout: float = 0.0,
+        bias: bool = True,
     ):
         super().__init__()
         assert d_attn % n_heads == 0, "d_attn must be divisible by n_heads"
-        self.q_dim   = d_attn
-        self.kv_dim  = d_attn
-        self.d_attn  = d_attn
+        self.q_dim = d_attn
+        self.kv_dim = d_attn
+        self.d_attn = d_attn
         self.n_heads = n_heads
-        self.hdim    = d_attn // n_heads
-        self.scale   = self.hdim ** -0.5
+        self.hdim = d_attn // n_heads
+        self.scale = self.hdim**-0.5
         self.lookback = lookback
 
         # separate input projections
-        self.q_proj = nn.Linear(d_attn,  d_attn, bias=bias)
+        self.q_proj = nn.Linear(d_attn, d_attn, bias=bias)
         self.k_proj = nn.Linear(d_attn, d_attn, bias=bias)
         self.v_proj = nn.Linear(d_attn, d_attn, bias=bias)
 
         # output goes back to the *query* dimensionality
         self.o_proj = nn.Linear(d_attn, d_attn, bias=bias)
-        self.drop   = nn.Dropout(dropout)
+        self.drop = nn.Dropout(dropout)
 
     def forward(
         self,
-        q: torch.Tensor,                # (B, Lq,  D) – OR (B, 1, D) at decode
-        kv_src: torch.Tensor,           # (B, Lkv, D) – compressed reps
-        seg_id: torch.Tensor,           # (B, Lq) int – mapping q → kv row
-        kv_mask: Optional[torch.Tensor] = None,    # (B, Lkv) bool
+        q: torch.Tensor,  # (B, Lq,  D) – OR (B, 1, D) at decode
+        kv_src: torch.Tensor,  # (B, Lkv, D) – compressed reps
+        seg_id: torch.Tensor,  # (B, Lq) int – mapping q → kv row
+        kv_mask: Optional[torch.Tensor] = None,  # (B, Lkv) bool
         q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool
         cache: Optional[Dict[str, torch.Tensor]] = None,
-        ):
+    ):
         """
         incremental_state keys (all optional on first call):
 
@@ -581,7 +590,7 @@ class SegmentCausalCrossAttention(nn.Module):
             "seg_ptr" : (B,)  last segment index already in cache
         """
 
-        if cache is None or q.size(1) > 1:          # ----- training path
+        if cache is None or q.size(1) > 1:  # ----- training path
             out = self._full_forward(q, kv_src, seg_id, kv_mask)
             out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
             return out
@@ -590,12 +599,12 @@ class SegmentCausalCrossAttention(nn.Module):
         # Incremental decoding – q is shape (B, 1, D)
         B = q.size(0)
         device = q.device
-        k_cache = cache.get("k")      # maybe None on first token
+        k_cache = cache.get("k")  # maybe None on first token
         v_cache = cache.get("v")
         seg_ptr = cache.get("seg_ptr")  # (B,) or None
 
         # Project query
-        q_proj = self._split_heads(self.q_proj(q))       # (B,H,1,Dh)
+        q_proj = self._split_heads(self.q_proj(q))  # (B,H,1,Dh)
 
         # If this token belongs to a *new* segment: append K/V row to cache
         new_seg = (seg_ptr is None) | (seg_id[:, -1] != seg_ptr)
@@ -603,47 +612,47 @@ class SegmentCausalCrossAttention(nn.Module):
             # project *one* kv row per *new* segment
             kv_new = kv_src[torch.arange(B, device=device), seg_id[:, -1]]  # (B,D)
 
-            k_new  = self._split_heads(self.k_proj(kv_new.unsqueeze(1)))     # (B,H,1,Dh)
-            v_new  = self._split_heads(self.v_proj(kv_new.unsqueeze(1)))
+            k_new = self._split_heads(self.k_proj(kv_new.unsqueeze(1)))  # (B,H,1,Dh)
+            v_new = self._split_heads(self.v_proj(kv_new.unsqueeze(1)))
 
-            if k_cache is None:                      # first ever row
+            if k_cache is None:  # first ever row
                 k_cache = k_new
                 v_cache = v_new
-            else:                                    # append along Lkv axis
+            else:  # append along Lkv axis
                 k_cache = torch.cat([k_cache, k_new], dim=2)
                 v_cache = torch.cat([v_cache, v_new], dim=2)
 
-            seg_ptr = seg_id[:, -1]                  # update pointer
+            seg_ptr = seg_id[:, -1]  # update pointer
 
         # Gather indices: own segment and `lookback` previous ones
         max_Lkv = k_cache.size(2)
-        offsets = torch.arange(0, self.lookback + 1, device=device)   # 0..lookback
-        gather_idx = seg_id[:, -1:].unsqueeze(-1) - offsets           # (B,1,Kw)
+        offsets = torch.arange(0, self.lookback + 1, device=device)  # 0..lookback
+        gather_idx = seg_id[:, -1:].unsqueeze(-1) - offsets  # (B,1,Kw)
         gather_idx.clamp_(0, max_Lkv - 1)
         Kw = gather_idx.size(-1)
 
         # Expand for heads, gather keys / values
-        gather_idx = gather_idx.expand(B, self.n_heads, 1, Kw)        # (B,H,1,Kw)
-        k_slice = k_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
-        v_slice = v_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1,-1,-1,-1,self.hdim))
+        gather_idx = gather_idx.expand(B, self.n_heads, 1, Kw)  # (B,H,1,Kw)
+        k_slice = k_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1, -1, -1, -1, self.hdim))
+        v_slice = v_cache.gather(2, gather_idx.unsqueeze(-1).expand(-1, -1, -1, -1, self.hdim))
         # shapes (B,H,1,Kw,Dh)
 
         # Attention
         scores = (q_proj.unsqueeze(-2) * k_slice).sum(-1) * self.scale  # (B,H,1,Kw)
 
         if kv_mask is not None:
-            mask_slice = kv_mask.gather(1, gather_idx[:,0,0,:]).view(B,1,1,Kw)
+            mask_slice = kv_mask.gather(1, gather_idx[:, 0, 0, :]).view(B, 1, 1, Kw)
             scores.masked_fill_(mask_slice, torch.finfo(scores.dtype).min)
 
-        probs  = self.drop(F.softmax(scores, dim=-1))                   # (B,H,1,Kw)
-        out    = (probs.unsqueeze(-1) * v_slice).sum(-2)               # (B,H,1,Dh)
+        probs = self.drop(F.softmax(scores, dim=-1))  # (B,H,1,Kw)
+        out = (probs.unsqueeze(-1) * v_slice).sum(-2)  # (B,H,1,Dh)
 
-        out = out.transpose(1,2).reshape(B,1,self.d_attn)
+        out = out.transpose(1, 2).reshape(B, 1, self.d_attn)
         out = self.o_proj(out)
 
         # stash updated cache
-        cache["k"]       = k_cache
-        cache["v"]       = v_cache
+        cache["k"] = k_cache
+        cache["v"] = v_cache
         cache["seg_ptr"] = seg_ptr
 
         return out
@@ -651,49 +660,48 @@ class SegmentCausalCrossAttention(nn.Module):
     # ----------------------------- training / teacher-forcing ---------- #
     def _full_forward(
         self,
-        q:       torch.Tensor,              # (B, Lq,  q_dim)
-        kv:      torch.Tensor,             # (B, Lkv, kv_dim)
-        seg_id:  torch.Tensor,             # (B, Lq)
-        kv_mask: Optional[torch.Tensor]=None,
+        q: torch.Tensor,  # (B, Lq,  q_dim)
+        kv: torch.Tensor,  # (B, Lkv, kv_dim)
+        seg_id: torch.Tensor,  # (B, Lq)
+        kv_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        B, Lq, _  = q.shape
+        B, Lq, _ = q.shape
         _, Lkv, _ = kv.shape
-        R, H, Dh  = self.lookback, self.n_heads, self.hdim
-        device    = q.device
+        R, H, Dh = self.lookback, self.n_heads, self.hdim
+        device = q.device
 
         # 1-- projections
-        qh = self._split_heads(self.q_proj(q))      # (B,H,Lq,Dh)
-        kh = self._split_heads(self.k_proj(kv))     # (B,H,Lkv,Dh)
+        qh = self._split_heads(self.q_proj(q))  # (B,H,Lq,Dh)
+        kh = self._split_heads(self.k_proj(kv))  # (B,H,Lkv,Dh)
         vh = self._split_heads(self.v_proj(kv))
 
         # 2-- segment indices (B,Lq,Kw)
-        offsets = torch.arange(0, R + 1, device=device)          # (Kw,)
-        gather  = seg_id.unsqueeze(-1) - offsets                 # (B,Lq,Kw)
-        gather.clamp_(0, Lkv-1)
-        Kw      = gather.size(-1)
+        offsets = torch.arange(0, R + 1, device=device)  # (Kw,)
+        gather = seg_id.unsqueeze(-1) - offsets  # (B,Lq,Kw)
+        gather.clamp_(0, Lkv - 1)
+        Kw = gather.size(-1)
 
         # 3-- take_along_dim handles broadcasting
-        idx = gather.unsqueeze(1).unsqueeze(-1)                  # (B,1,Lq,Kw,1)
+        idx = gather.unsqueeze(1).unsqueeze(-1)  # (B,1,Lq,Kw,1)
 
-        k_sel = torch.take_along_dim(                            # (B,H,Lq,Kw,Dh)
-            kh.unsqueeze(3), idx.expand(-1,H,-1,-1,Dh), dim=2
+        k_sel = torch.take_along_dim(  # (B,H,Lq,Kw,Dh)
+            kh.unsqueeze(3), idx.expand(-1, H, -1, -1, Dh), dim=2
         )
-        v_sel = torch.take_along_dim(
-            vh.unsqueeze(3), idx.expand(-1,H,-1,-1,Dh), dim=2
-        )
+        v_sel = torch.take_along_dim(vh.unsqueeze(3), idx.expand(-1, H, -1, -1, Dh), dim=2)
 
         # 4-- attention
-        scores = (qh.unsqueeze(-2) * k_sel).sum(-1) * self.scale # (B,H,Lq,Kw)
+        scores = (qh.unsqueeze(-2) * k_sel).sum(-1) * self.scale  # (B,H,Lq,Kw)
 
         if kv_mask is not None:
             mask_sel = torch.take_along_dim(
-                kv_mask.unsqueeze(2), gather, dim=1              # (B,Lq,Kw)
-            ).unsqueeze(1)                                       # (B,1,Lq,Kw)
+                kv_mask.unsqueeze(2),
+                gather,
+                dim=1,  # (B,Lq,Kw)
+            ).unsqueeze(1)  # (B,1,Lq,Kw)
             scores.masked_fill_(mask_sel, torch.finfo(scores.dtype).min)
 
-        probs = self.drop(torch.softmax(scores, dim=-1))         # (B,H,Lq,Kw)
-        out   = (probs.unsqueeze(-1) * v_sel).sum(-2)            # (B,H,Lq,Dh)
+        probs = self.drop(torch.softmax(scores, dim=-1))  # (B,H,Lq,Kw)
+        out = (probs.unsqueeze(-1) * v_sel).sum(-2)  # (B,H,Lq,Dh)
 
         # 5-- merge heads, project back to q_dim
         out = out.transpose(1, 2).reshape(B, Lq, self.d_attn)

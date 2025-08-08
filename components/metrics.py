@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
-from components.utils import short_num, format_duration
+
+from components.utils import format_duration, short_num
 
 
 @dataclass
@@ -124,8 +125,7 @@ class TrainingMetrics:
         avg_tok_s = sum(self._tok_s_deque) / len(self._tok_s_deque) if self._tok_s_deque else 0.0
 
         patches_per_sec = [
-            (self.output_seq_lengths[lvl] / duration_sec) if duration_sec > 0 else 0.0
-            for lvl in range(self.num_levels)
+            (self.output_seq_lengths[lvl] / duration_sec) if duration_sec > 0 else 0.0 for lvl in range(self.num_levels)
         ]
         for lvl in range(self.num_levels):
             self.total_patches_processed_per_level[lvl] += self.output_seq_lengths[lvl]
@@ -184,9 +184,7 @@ class TrainingMetrics:
             label = "Top" if lvl == self.num_levels - 1 else f"L{lvl}"
             pps_rate = patches_per_second[lvl] if lvl < len(patches_per_second) else 0.0
             pps_total = self.total_patches_processed_per_level[lvl]
-            patch_log_parts.append(
-                f"{label} {short_num(pps_rate)}/s {short_num(pps_total)}"
-            )
+            patch_log_parts.append(f"{label} {short_num(pps_rate)}/s {short_num(pps_total)}")
         if patch_log_parts:
             parts.append("Patches " + ", ".join(patch_log_parts))
 
@@ -195,8 +193,7 @@ class TrainingMetrics:
             parts.append(f"Ratios [{ratios_str}]")
 
         ppl_str = ", ".join(
-            f"{self._ppl_ema.values[lvl]:.4f}" if self._ppl_ema.ready[lvl] else "n/a"
-            for lvl in range(self.num_levels)
+            f"{self._ppl_ema.values[lvl]:.4f}" if self._ppl_ema.ready[lvl] else "n/a" for lvl in range(self.num_levels)
         )
         parts.append(f"SmoothPPL [{ppl_str}]")
 

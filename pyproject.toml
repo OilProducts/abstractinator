@@ -1,0 +1,44 @@
+[project]
+name = "abstractinator"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.0.0",
+    "lm-eval>=0.4.9",
+    "mlflow>=3.1.4",
+    "torch>=2.7.1",
+    "transformers>=4.53.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".venv",
+    ".git",
+    "mlruns",
+    "checkpoints",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E402", "E731", "F401", "F811", "F821", "F841"]
+fixable = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"components/__init__.py" = ["F401"]
+"components/checkpoint_utils.py" = ["E402"]
+"components/hierarchical_autoencoder.py" = ["F841"]
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+skip-magic-trailing-comma = false
+docstring-code-format = true

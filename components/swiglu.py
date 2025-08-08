@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class SwiGLU(nn.Module):
     """Feed-forward block with SwiGLU activation."""
+
     def __init__(self, d_model: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(d_model, hidden_dim * 2)

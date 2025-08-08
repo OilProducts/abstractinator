@@ -1,12 +1,13 @@
 import logging
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Any
-
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
+
 
 # @torch.compile
 class VectorQuantizer(nn.Module):
@@ -15,22 +16,24 @@ class VectorQuantizer(nn.Module):
     performant code resetting.
     """
 
-    def __init__(self,
-                 K: int,
-                 D: int,
-                 beta: float = 0.25,
-                 ema: bool = True,
-                 decay: float = 0.999,
-                 eps: float = 1e-5,
-                 reset_codes: bool = True,
-                 reset_interval: int = 250,
-                 max_codes_to_reset_pct: float = 0.1,
-                 replacement_buffer_size: int = 65536,
-                 vectors_per_step_to_buffer: int = 1024,  # Controls update overhead
-                 bos_token_id: int = 256,
-                 eos_token_id: int = 257,
-                 padding_token_id: int = 258,
-                 eop_token_id: int = 259):
+    def __init__(
+        self,
+        K: int,
+        D: int,
+        beta: float = 0.25,
+        ema: bool = True,
+        decay: float = 0.999,
+        eps: float = 1e-5,
+        reset_codes: bool = True,
+        reset_interval: int = 250,
+        max_codes_to_reset_pct: float = 0.1,
+        replacement_buffer_size: int = 65536,
+        vectors_per_step_to_buffer: int = 1024,  # Controls update overhead
+        bos_token_id: int = 256,
+        eos_token_id: int = 257,
+        padding_token_id: int = 258,
+        eop_token_id: int = 259,
+    ):
         super().__init__()
         self.K = K
         self.D = D
@@ -74,7 +77,7 @@ class VectorQuantizer(nn.Module):
         """Efficiently updates the circular buffer with a subset of new vectors."""
         # --- PERFORMANCE FIX: Subsample vectors to reduce copy overhead ---
         if new_vectors.size(0) > self.vectors_per_step_to_buffer:
-            perm = torch.randperm(new_vectors.size(0), device=new_vectors.device)[:self.vectors_per_step_to_buffer]
+            perm = torch.randperm(new_vectors.size(0), device=new_vectors.device)[: self.vectors_per_step_to_buffer]
             new_vectors = new_vectors[perm]
 
         n_new = new_vectors.size(0)
@@ -87,7 +90,7 @@ class VectorQuantizer(nn.Module):
         else:
             space_left = buff_size - current_idx
             if n_new < space_left:
-                self.replacement_buffer[current_idx: current_idx + n_new] = new_vectors
+                self.replacement_buffer[current_idx : current_idx + n_new] = new_vectors
                 self.buffer_idx.add_(n_new)
             else:
                 self.replacement_buffer[current_idx:] = new_vectors[:space_left]
@@ -101,7 +104,7 @@ class VectorQuantizer(nn.Module):
         if not self.buffer_is_full and self.buffer_idx == 0:
             return
 
-        source_vectors = self.replacement_buffer if self.buffer_is_full else self.replacement_buffer[:self.buffer_idx]
+        source_vectors = self.replacement_buffer if self.buffer_is_full else self.replacement_buffer[: self.buffer_idx]
         num_available_replacements = source_vectors.size(0)
 
         dead_code_candidates_indices = (self.ema_cluster_size < self.min_usage_threshold).nonzero(as_tuple=True)[0]
@@ -146,8 +149,9 @@ class VectorQuantizer(nn.Module):
         self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
         self.ema_weight_sum.mul_(self.decay).add_(dw, alpha=1 - self.decay)
         n_total_clusters = self.ema_cluster_size.sum()
-        stabilized_cluster_size = ((self.ema_cluster_size + self.eps) /
-                                   (n_total_clusters + self.K * self.eps)) * n_total_clusters
+        stabilized_cluster_size = (
+            (self.ema_cluster_size + self.eps) / (n_total_clusters + self.K * self.eps)
+        ) * n_total_clusters
         self.codebook.data.copy_(self.ema_weight_sum / stabilized_cluster_size.unsqueeze(1))
 
     def forward(self, z: torch.Tensor) -> tuple[Tensor | Any, Tensor, Tensor, Any]:
@@ -196,15 +200,15 @@ class VectorQuantizer(nn.Module):
         return z_q_ste, vq_loss, indices.view(B, Q), perplexity.detach()
 
 
-
 class ResidualVQ(nn.Module):
     """
     Two-stage residual vector quantiser in a compressed space (d_c).
     """
+
     def __init__(self, K0: int, K1: int, D: int = 256, d_c: int = 64, **vq_kwargs):
         super().__init__()
         self.down = nn.Linear(D, d_c, bias=False)
-        self.up   = nn.Linear(d_c, D, bias=False)
+        self.up = nn.Linear(d_c, D, bias=False)
         self.up.weight = self.down.weight.T  # tie weights (optional)
 
         # Stage-0 and Stage-1 VQs
@@ -218,10 +222,10 @@ class ResidualVQ(nn.Module):
         z : (B, Q, D)
         returns ẑ, total_vq_loss, (idx0, idx1), perplexities
         """
-        y0 = self.down(z)                     # (B,Q,d_c)
+        y0 = self.down(z)  # (B,Q,d_c)
 
         q0, loss0, idx0, ppl0 = self.vq0(y0)
-        r1 = y0 - q0.detach()                # stop grad into q0 path
+        r1 = y0 - q0.detach()  # stop grad into q0 path
 
         q1, loss1, idx1, ppl1 = self.vq1(r1)
         z_hat = self.up(q0 + q1)
@@ -230,15 +234,15 @@ class ResidualVQ(nn.Module):
         return z_hat, total_loss, (idx0, idx1), (ppl0, ppl1)
 
 
-
 class ResidualVQ(nn.Module):
     """
     Two-stage residual vector quantiser in a compressed space (d_c).
     """
+
     def __init__(self, K0: int, K1: int, D: int = 256, d_c: int = 64, **vq_kwargs):
         super().__init__()
         self.down = nn.Linear(D, d_c, bias=False)
-        self.up   = nn.Linear(d_c, D, bias=False)
+        self.up = nn.Linear(d_c, D, bias=False)
         self.up.weight = self.down.weight.T  # tie weights (optional)
 
         # Stage-0 and Stage-1 VQs
@@ -252,10 +256,10 @@ class ResidualVQ(nn.Module):
         z : (B, Q, D)
         returns ẑ, total_vq_loss, (idx0, idx1), perplexities
         """
-        y0 = self.down(z)                     # (B,Q,d_c)
+        y0 = self.down(z)  # (B,Q,d_c)
 
         q0, loss0, idx0, ppl0 = self.vq0(y0)
-        r1 = y0 - q0.detach()                # stop grad into q0 path
+        r1 = y0 - q0.detach()  # stop grad into q0 path
 
         q1, loss1, idx1, ppl1 = self.vq1(r1)
         z_hat = self.up(q0 + q1)
