@@ -2,7 +2,6 @@ import os
 import math
 import sys
 import time
-from collections import defaultdict, deque
 import argparse
 import importlib.util
 from dataclasses import asdict
@@ -21,7 +20,6 @@ from transformers.optimization import get_scheduler
 
 import mlflow  # Logging with MLflow
 from mlflow.tracking import MlflowClient
-from mlflow.entities import Metric
 
 # Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
@@ -30,6 +28,7 @@ from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.utils import short_num, format_duration
 from components.tokenizer import ByteLevelTokenizer
 from components.checkpoint_utils import save_base_components, load_base_components
+from components.metrics import TrainingMetrics, MlflowBatchLogger
 from data_utils import tokenize_and_process_examples
 
 from configs.base_config import (
@@ -271,7 +270,7 @@ def train_loop(
     mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
     mlflow_client = MlflowClient()
     mlflow_run_id = mlflow_run.info.run_id
-    mlflow_metric_buffer = []
+    mlflow_logger = MlflowBatchLogger(mlflow_client, mlflow_run_id, exp_config.mlflow_batch_interval)
 
     tokenizer = ByteLevelTokenizer(
         add_bos=True,
@@ -358,36 +357,11 @@ def train_loop(
     if device == "cuda":
         torch.cuda.synchronize()
     training_start_time = time.time()
-    total_bytes_processed = 0
-    total_patches_processed_per_level = [0.0] * exp_config.num_levels
-
-    def reset_accumulators(num_levels):
-        accumulators = {
-            "total_loss": 0.0,
-            "vq_loss": 0.0,
-            "avg_reconstruction_loss": 0.0,
-            "reconstruction_loss_details": defaultdict(float),
-            "avg_aux_lm_loss": 0.0,
-            "aux_lm_loss_details": defaultdict(float),
-            "compression_ratios": [0.0] * num_levels,
-            "input_seq_lengths_compressors": [0.0] * num_levels,
-            "output_seq_lengths_compressors": [0.0] * num_levels,
-            "all_codebook_perplexities": [0.0] * num_levels,
-            "all_smoothed_perplexities": [0.0] * num_levels,
-            "non_padded_tokens": 0,
-            "count": 0,
-            "avg_top_code_lm_loss": 0.0,
-            "top_code_lm_loss_details": defaultdict(float),
-            "top_code_mse": 0.0,
-            "top_code_vq_loss": 0.0,
-        }
-        return accumulators
-
-    accumulators = reset_accumulators(exp_config.num_levels)
-    ppl_ema = [0.0] * exp_config.num_levels
-    ppl_ema_ready = [False] * exp_config.num_levels
-    ppl_alpha = 0.9  # 0.9 carryover, 0.1 new
-    tok_s_deque = deque(maxlen=10)
+    metrics = TrainingMetrics(
+        num_levels=exp_config.num_levels,
+        aux_lm_enabled=exp_config.get("aux_lm_loss_weight", 0.0) > 0,
+        top_lm_enabled=exp_config.get("top_lm_loss_weight", 0.0) > 0,
+    )
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
 
@@ -412,47 +386,7 @@ def train_loop(
             loss_for_backward = total_loss / exp_config.gradient_accumulation_steps
             loss_for_backward.backward()
 
-            accumulators["total_loss"] += total_loss.item()
-            accumulators["vq_loss"] += output_dict["vq_loss"].item()
-            accumulators["avg_reconstruction_loss"] += output_dict["avg_reconstruction_loss"].item()
-            accumulators["count"] += 1
-            accumulators["non_padded_tokens"] += (~key_padding_mask).sum().item()
-
-            for key, value in output_dict["reconstruction_loss_details"].items():
-                accumulators["reconstruction_loss_details"][key] += value.item()
-
-            if "avg_aux_lm_loss" in output_dict and exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                accumulators["avg_aux_lm_loss"] += output_dict["avg_aux_lm_loss"].item()
-                for key, value in output_dict["aux_lm_loss_details"].items():
-                    accumulators["aux_lm_loss_details"][key] += value.item()
-
-            if "avg_top_code_lm_loss" in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
-                accumulators["avg_top_code_lm_loss"] += output_dict["avg_top_code_lm_loss"].item()
-                for key, value in output_dict["top_code_lm_loss_details"].items():
-                    accumulators["top_code_lm_loss_details"][key] += value.item()
-                    if key == "top_code_mse":
-                        accumulators["top_code_mse"] += value.item()
-                    elif key == "top_code_vq_loss":
-                        accumulators["top_code_vq_loss"] += value.item()
-
-            if "compression_ratios" in output_dict:
-                for level_idx, ratio in enumerate(output_dict["compression_ratios"]):
-                    accumulators["compression_ratios"][level_idx] += ratio
-
-                batch_sz = tokens.size(0)
-                for level_idx, comp_step in enumerate(output_dict["compression_results"]["steps"]):
-                    accumulators["input_seq_lengths_compressors"][level_idx] += (~comp_step.input_padding_mask).sum().item() # * batch_sz
-                    accumulators["output_seq_lengths_compressors"][level_idx] += comp_step.patch_end_mask.sum().item() # * batch_sz
-
-            if "all_codebook_perplexities" in output_dict:
-                for level_idx, perplexity in enumerate(output_dict["all_codebook_perplexities"]):
-                    accumulators["all_codebook_perplexities"][level_idx] += perplexity.item()
-                    val = float(perplexity) if isinstance(perplexity, (float, int)) else float(perplexity.item())
-                    if not ppl_ema_ready[level_idx]:
-                        ppl_ema[level_idx] = val
-                        ppl_ema_ready[level_idx] = True
-                    else:
-                        ppl_ema[level_idx] = ppl_alpha * ppl_ema[level_idx] + (1.0 - ppl_alpha) * val
+            metrics.update_from_batch(output_dict, key_padding_mask)
 
 
             if (i + 1) % exp_config.gradient_accumulation_steps == 0:
@@ -467,148 +401,43 @@ def train_loop(
                 current_time = time.time()
                 duration_accumulation_window = current_time - time_of_last_optimizer_step_event
 
-                tokens_processed_this_window = accumulators["non_padded_tokens"]
-                tokens_per_second = tokens_processed_this_window / duration_accumulation_window
-                tok_s_deque.append(tokens_per_second)
-                avg_tok_s = sum(tok_s_deque) / len(tok_s_deque)
-
-                patches_processed_this_window = accumulators["output_seq_lengths_compressors"]
-                patches_per_second = [p / duration_accumulation_window for p in patches_processed_this_window]
-                for lvl, cnt in enumerate(patches_processed_this_window):
-                    total_patches_processed_per_level[lvl] += cnt
-
-                total_bytes_processed += tokens_processed_this_window
+                tp = metrics.throughput(duration_accumulation_window)
+                tokens_per_second = tp.tokens_per_second
+                avg_tok_s = tp.avg_tokens_per_second
+                patches_per_second = tp.patches_per_second_per_level
                 total_progress = (global_step + 1) / exp_config.num_training_steps
                 total_elapsed = current_time - training_start_time
                 total_eta_sec = (total_elapsed / total_progress - total_elapsed) if total_progress > 0 else 0
 
-                steps_accumulated = accumulators["count"]
+                steps_accumulated = metrics.count
 
                 if steps_accumulated > 0:
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                    console_log_parts = [
-                        f"{timestamp}",
-                        f"Epoch {epoch + 1}/{exp_config.num_epochs}",
-                        f"OptStep {global_step}",
-                        f"MB {i + 1}/{total_minibatches_in_epoch}",
-                        f"Loss {accumulators['total_loss'] / steps_accumulated:.4f}",
-                        f"Reco {accumulators['avg_reconstruction_loss'] / steps_accumulated:.4f}",
-                        f"VQ {accumulators['vq_loss'] / steps_accumulated:.4f}",
-                    ]
-
-                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0 and "avg_aux_lm_loss" in accumulators:
-                        console_log_parts.append(
-                            f"AuxLM {accumulators['avg_aux_lm_loss'] / steps_accumulated:.4f}"
-                        )
-
-                    if "avg_top_code_lm_loss" in output_dict and exp_config.get("top_lm_loss_weight", 0.0) > 0:
-                        console_log_parts.append(
-                            f"TopLM {output_dict['avg_top_code_lm_loss'].item():.4f}"
-                        )
-                        if "top_code_lm_loss_details" in output_dict:
-                            tcld = output_dict["top_code_lm_loss_details"]
-                            if "top_code_mse" in tcld:
-                                console_log_parts.append(f"TopMSE {tcld['top_code_mse'].item():.4f}")
-                            if "top_code_vq_loss" in tcld:
-                                console_log_parts.append(f"TopVQ {tcld['top_code_vq_loss'].item():.4f}")
-
-                    console_log_parts.extend(
-                        [
-                            f"Tok/s {short_num(avg_tok_s)}",
-                            f"Bytes {short_num(total_bytes_processed)}",
-                            f"ETA {format_duration(total_eta_sec)}",
-                        ]
+                    console_log_parts = metrics.console_parts(
+                        timestamp=timestamp,
+                        epoch=epoch + 1,
+                        num_epochs=exp_config.num_epochs,
+                        global_step=global_step,
+                        minibatch_index=i + 1,
+                        total_minibatches=total_minibatches_in_epoch,
+                        avg_tok_s=avg_tok_s,
+                        total_eta_sec=total_eta_sec,
+                        patches_per_second=patches_per_second,
                     )
+                    if console_log_parts:
+                        logger.info(" | ".join(console_log_parts))
 
-                    patch_log_parts = []
-                    for lvl in range(1, exp_config.num_levels):
-                        label = "Top" if lvl == exp_config.num_levels - 1 else f"L{lvl}"
-                        patch_log_parts.append(
-                            f"{label} {short_num(patches_per_second[lvl])}/s {short_num(total_patches_processed_per_level[lvl])}"
+                    if global_step % exp_config.log_interval == 0 and metrics.count > 0:
+                        codebook_sizes = [c.codebook_size for c in exp_config.compressor_level_configs]
+                        metrics_dict = metrics.metrics_dict(
+                            learning_rate=optimizer.param_groups[0]["lr"],
+                            tokens_per_second=tokens_per_second,
+                            patches_per_second=patches_per_second,
+                            codebook_sizes=codebook_sizes,
                         )
-                    if patch_log_parts:
-                        console_log_parts.append("Patches " + ", ".join(patch_log_parts))
+                        mlflow_logger.log(global_step, metrics_dict)
 
-                    if "compression_ratios" in accumulators and len(accumulators["compression_ratios"]) == exp_config.num_levels:
-                        ratios_str = ", ".join([f"{r / steps_accumulated:.2f}" for r in accumulators["compression_ratios"]])
-                        console_log_parts.append(f"Ratios [{ratios_str}]")
-
-                    ppl_str = ", ".join(
-                        f"{ppl_ema[lvl]:.4f}" if ppl_ema_ready[lvl] else "n/a"
-                        for lvl in range(exp_config.num_levels)
-                    )
-                    console_log_parts.append(f"SmoothPPL [{ppl_str}]")
-
-                    for key, value in accumulators["reconstruction_loss_details"].items():
-                        console_log_parts.append(f"{key}:{value / steps_accumulated:.4f}")
-
-                    if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                        for key, value in accumulators["aux_lm_loss_details"].items():
-                            console_log_parts.append(f"{key}:{value / steps_accumulated:.4f}")
-
-                    logger.info(" | ".join(console_log_parts))
-
-                    if global_step % exp_config.log_interval == 0 and accumulators["count"] > 0:
-                        metrics_dict = {
-                            "loss/total_avg_accum": accumulators["total_loss"] / steps_accumulated,
-                            "loss/vq_avg_accum": accumulators["vq_loss"] / steps_accumulated,
-                            "loss/reconstruction_avg_accum": accumulators["avg_reconstruction_loss"] / steps_accumulated,
-                            "performance/tokens_per_sec": tokens_per_second,
-                            "loss/top_code_lm_avg_accum": accumulators["avg_top_code_lm_loss"] / steps_accumulated,
-                            "loss/top_code_mse_avg_accum": accumulators["top_code_mse"] / steps_accumulated,
-                            "loss/top_code_vq_avg_accum": accumulators["top_code_vq_loss"] / steps_accumulated,
-                            "learning_rate": optimizer.param_groups[0]["lr"],
-                        }
-                        for lvl in range(1, exp_config.num_levels):
-                            metrics_dict[f"performance/patches_per_sec_L{lvl}"] = patches_per_second[lvl]
-                            metrics_dict[f"performance/patches_total_L{lvl}"] = total_patches_processed_per_level[lvl]
-                        for key, value in accumulators["top_code_lm_loss_details"].items():
-                            metrics_dict[f"loss_detail_avg_accum/{key}"] = value / steps_accumulated
-
-                        for key, value in accumulators["reconstruction_loss_details"].items():
-                            metrics_dict[f"loss_detail_avg_accum/{key}"] = value / steps_accumulated
-
-                        if exp_config.get("aux_lm_loss_weight", 0.0) > 0:
-                            metrics_dict["loss/aux_lm_avg_accum"] = accumulators["avg_aux_lm_loss"] / steps_accumulated
-                            for key, value in accumulators["aux_lm_loss_details"].items():
-                                metrics_dict[f"loss_detail_avg_accum/{key}"] = value / steps_accumulated
-
-                        if "compression_ratios" in output_dict:
-                            for level_idx in range(exp_config.num_levels):
-                                metrics_dict[f"compression_avg/ratio_L{level_idx}"] = (
-                                    accumulators["compression_ratios"][level_idx] / steps_accumulated
-                                )
-                                metrics_dict[f"compression_avg/input_len_L{level_idx}"] = (
-                                    accumulators["input_seq_lengths_compressors"][level_idx] / steps_accumulated
-                                )
-                                metrics_dict[f"compression_avg/output_len_L{level_idx}"] = (
-                                    accumulators["output_seq_lengths_compressors"][level_idx] / steps_accumulated
-                                )
-
-                        if "all_codebook_perplexities" in output_dict:
-                            for level_idx in range(exp_config.num_levels):
-                                metrics_dict[f"vq_metrics_avg/perplexity_L{level_idx}"] = (
-                                    accumulators["all_codebook_perplexities"][level_idx] / steps_accumulated
-                                )
-                                codebook_size_L_i = exp_config.compressor_level_configs[level_idx].codebook_size
-                                metrics_dict[f"vq_metrics/codebook_size_L{level_idx}"] = codebook_size_L_i
-
-                        for lvl in range(exp_config.num_levels):
-                            if ppl_ema_ready[lvl]:
-                                metrics_dict[f"vq_metrics_ema/smooth_perplexity_L{lvl}"] = ppl_ema[lvl]
-
-                        mlflow_metric_buffer.append((global_step, metrics_dict))
-                        if len(mlflow_metric_buffer) >= exp_config.mlflow_batch_interval:
-                            timestamp_ms = int(time.time() * 1000)
-                            metrics_entities = []
-                            for step_id, mdict in mlflow_metric_buffer:
-                                metrics_entities.extend(
-                                    [Metric(key=k, value=v, timestamp=timestamp_ms, step=step_id) for k, v in mdict.items()]
-                                )
-                            mlflow_client.log_batch(mlflow_run_id, metrics=metrics_entities)
-                            mlflow_metric_buffer = []
-
-                accumulators = reset_accumulators(exp_config.num_levels)
+                metrics.reset_window()
                 time_of_last_optimizer_step_event = current_time
 
                 if global_step > 0 and global_step % exp_config.generation_interval == 0:
@@ -678,14 +507,7 @@ def train_loop(
     logger.info("Training finished.")
     if exp_config.save_base_components_path:
         save_base_components(model, exp_config.save_base_components_path)
-    if mlflow_metric_buffer:
-        timestamp_ms = int(time.time() * 1000)
-        metrics_entities = []
-        for step_id, mdict in mlflow_metric_buffer:
-            metrics_entities.extend(
-                [Metric(key=k, value=v, timestamp=timestamp_ms, step=step_id) for k, v in mdict.items()]
-            )
-        mlflow_client.log_batch(mlflow_run_id, metrics=metrics_entities)
+    mlflow_logger.flush()
     mlflow.end_run()
 
 
@@ -700,4 +522,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
