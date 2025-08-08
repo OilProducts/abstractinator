@@ -267,7 +267,7 @@ class HierarchicalAutoencoder(nn.Module):
         self.eval()
         assert prompt_tokens.size(0) == 1, "Generation currently supports B=1."
 
-        device = prompt_tokens.device
+        # device = prompt_tokens.device
         use_cont = self.use_continuous_expander_inputs
 
         # Running byte buffer
@@ -320,7 +320,7 @@ class HierarchicalAutoencoder(nn.Module):
                 raise NotImplementedError("Discrete top-symbol path not wired in here.")
 
             # 3) Generate one full segment through expander 0, recursively
-            child_codes = self._gen_segment_at_level(
+            _child_codes = self._gen_segment_at_level(
                 e_idx=0,
                 hi_seq=top_hi,
                 comp_for_masks=comp,  # reuse seg_ids/kpm for top expander
@@ -735,7 +735,7 @@ class HierarchicalAutoencoder(nn.Module):
             raise ValueError("`kpm` is required to keep the length constant.")
 
         # ----- step b: budget check -----
-        inserts = end_mask.sum(dim=1)  # (B,)
+        _inserts = end_mask.sum(dim=1)  # (B,)
         pad_slots = kpm.sum(dim=1)  # (B,)
 
         # Vectorised clip: keep only the first `pad_slots[b]` True values per row
@@ -750,7 +750,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         # ----- step d: restrict to real tokens -----
         data_mask = ~kpm  # True == real token
-        shift_data = shift[data_mask]  # 1-D flattened view
+        _shift_data = shift[data_mask]  # 1-D flattened view
 
         # ----- allocate outputs (all-pad by default) -----
         out = seq.new_full((B, S), pad_id)
@@ -881,7 +881,7 @@ class HierarchicalAutoencoder(nn.Module):
         parent_ids_aligned: list[Tensor] = []
         start_bytes_aligned: list[Tensor] = []
 
-        targets, kpms, seg_ids_aligned = [], [], []
+        targets, kpms, _seg_ids_aligned = [], [], []
 
         # ---------- walk from top to bottom ----------
         for lvl in range(self.num_levels - 1, -1, -1):
@@ -1222,7 +1222,7 @@ class HierarchicalAutoencoder(nn.Module):
         """Recursive AR: one top symbol → one variable-length segment per level → bytes."""
         self.eval()
         assert prompt_tokens.size(0) == 1, "Gen supports B=1 for now."
-        device = prompt_tokens.device
+        # device = prompt_tokens.device
         use_cont = self.use_continuous_expander_inputs
 
         byte_buf = prompt_tokens.clone()  # running bytes

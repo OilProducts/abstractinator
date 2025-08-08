@@ -679,7 +679,7 @@ class SegmentCausalCrossAttention(nn.Module):
         offsets = torch.arange(0, R + 1, device=device)  # (Kw,)
         gather = seg_id.unsqueeze(-1) - offsets  # (B,Lq,Kw)
         gather.clamp_(0, Lkv - 1)
-        Kw = gather.size(-1)
+        _kw = gather.size(-1)
 
         # 3-- take_along_dim handles broadcasting
         idx = gather.unsqueeze(1).unsqueeze(-1)  # (B,1,Lq,Kw,1)

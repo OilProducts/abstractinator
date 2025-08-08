@@ -26,9 +26,6 @@ def _apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.
     return (x * cos) + (_rotate_half(x) * sin)
 
 
-import torch
-
-
 class _RoPECache:
     """
     Cache (sin, cos) per (dim, device, dtype). Grow tables when needed and return slices.
