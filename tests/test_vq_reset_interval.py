@@ -10,9 +10,10 @@ def test_vq_reset_interval_configured():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
             "vq_reset_interval": 99,
+            "output_length": 8,
         }
     ]
     exp_cfg = [

@@ -5,7 +5,16 @@ from components.vector_quantizer import VectorQuantizer
 
 def test_vector_quantizer_forward_no_ema():
     torch.manual_seed(0)
-    vq = VectorQuantizer(K=8, D=4, ema=False, eop_token_id=0)
+    # Use small special-token IDs so K can be small in tests
+    vq = VectorQuantizer(
+        K=8,
+        D=4,
+        ema=False,
+        bos_token_id=0,
+        eos_token_id=0,
+        padding_token_id=0,
+        eop_token_id=0,
+    )
     x = torch.randn(2, 3, 4)
     z_q, vq_loss, indices, perplexity = vq(x)
     assert z_q.shape == x.shape

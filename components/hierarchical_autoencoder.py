@@ -528,22 +528,19 @@ class HierarchicalAutoencoder(nn.Module):
                     else F.embedding(current_input_codes_hi, self.expanders[i].emb_hi.weight)
                 )
                 if kv_mask is not None:
-                    # We assume L = 1 (one query per segment) for teacher-forcing.
-                    # That means memory length (Lkv) should equal the number of segments (valid_mask length).
-                    # If they differ, it indicates num_queries_per_segment > 1 (L > 1),
-                    # which would require either:
-                    #   • building a query-level kv_mask via repeat_interleave of the segment mask, or
-                    #   • reducing memory to segment-level (one row per segment) before cross-attention.
-                    # Since this project prioritizes compression (L=1) and we do not support L>1 in TF yet,
-                    # assert to catch accidental mismatches early.
-                    assert (
-                        kv_mask.size(1) == mem.size(1)
-                    ), (
-                        "Teacher-forcing kv_mask length mismatch with memory. "
-                        "This likely indicates num_queries_per_segment > 1. "
-                        "For L>1 you must either expand kv_mask to query length or "
-                        "reduce memory to one row per segment."
-                    )
+                    # Align kv_mask with memory length. For L=1, we allow simple clip/pad.
+                    # If L>1, a mismatch likely means you need a query-level mask.
+                    num_q = self.compressors[self.num_levels - 1 - i].num_queries_per_segment
+                    if kv_mask.size(1) != mem.size(1):
+                        if num_q == 1:
+                            kv_mask, _ = _fix_len(kv_mask, None, mem.size(1), True)
+                        else:
+                            assert (
+                                kv_mask.size(1) == mem.size(1)
+                            ), (
+                                "Teacher-forcing kv_mask length mismatch with memory for L>1. "
+                                "Either expand kv_mask per query or reduce memory to one row per segment."
+                            )
 
                 # 3) Call the expander with the segment-level KV mask
                 exp_out_dict = expander(
@@ -783,7 +780,7 @@ class HierarchicalAutoencoder(nn.Module):
             kpm = all_compressor_input_kpms[lvl]
 
             # ---- insert EOP, if we have a patch mask for this level ----
-            if lvl < len(all_patch_mask) and all_patch_mask[lvl] is not None:
+            if lvl < len(all_patch_mask) and all_patch_mask[lvl] is not None and kpm is not None:
                 eop_id = self.compressors[lvl - 1].vq.eop_token_id
                 pad_id = self.compressors[lvl - 1].vq.padding_token_id
                 tgt, kpm = self._insert_eop(tgt, all_patch_mask[lvl], kpm, eop_id, pad_id)

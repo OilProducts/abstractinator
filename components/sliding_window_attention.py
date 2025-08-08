@@ -594,7 +594,8 @@ class SegmentCausalCrossAttention(nn.Module):
 
         if cache is None or q.size(1) > 1:  # ----- training path
             out = self._full_forward(q, kv_src, seg_id, kv_mask)
-            out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
+            if q_pad_mask is not None:
+                out.masked_fill_(q_pad_mask.unsqueeze(-1), 0.0)  # zero out padded queries
             return out
 
         # ----------------------------------------------------- #

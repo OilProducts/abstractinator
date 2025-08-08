@@ -12,10 +12,11 @@ def build_model(target):
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
             "target_compression_ratio": target,
             "compression_loss_weight": 1.0,
+            "output_length": 8,
         }
     ]
     exp_cfg = [

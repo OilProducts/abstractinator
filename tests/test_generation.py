@@ -12,8 +12,9 @@ def build_model():
             "num_encoder_layers": 1,
             "encoder_ffn_dim_multiplier": 2,
             "num_queries": 1,
-            "codebook_size": 4,
+            "codebook_size": 512,
             "beta": 0.25,
+            "output_length": 8,
         }
     ]
     exp_cfg = [
@@ -54,7 +55,7 @@ def test_generate_bytes_longer_than_compressed():
     kpm = torch.zeros_like(tokens, dtype=torch.bool)
 
     comp_res = model.compress(tokens, key_padding_mask=kpm)
-    compressed_len = comp_res["top_codes"].size(1)
+    compressed_len = comp_res["all_vq_indices"][-1].size(1)
 
-    out = model.generate_bytes(tokens, key_padding_mask=kpm, max_len_override=5)
+    out = model.generate_bytes(tokens, key_padding_mask=kpm, decode_max_len=5)
     assert out.size(1) > compressed_len
