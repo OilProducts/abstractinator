@@ -1,6 +1,7 @@
+from __future__ import annotations
 import math
 from functools import lru_cache
-from typing import Callable, Optional, Tuple
+from typing import Callable, Tuple, Optional
 
 import torch
 import torch._dynamo as dynamo
@@ -90,7 +91,7 @@ class MultiheadLatentAttention(nn.Module):
         kv_comp_dim: int = 512,  # d_c
         q_comp_dim: int = 1536,  # d_c'
         retr_dim: int = 64,  # r
-        score_mod: Optional[Callable] = None,  # Flex mask/bias callback
+        score_mod: Callable | None = None,  # Flex mask/bias callback
         use_flex_attention: bool = True,
     ):
         super().__init__()
@@ -148,7 +149,7 @@ class MultiheadLatentAttention(nn.Module):
             scores = scores.masked_fill(pad[b, k], float("-inf"))
         return scores
 
-    def _flex_attention(self, q_r, k_r, v_c, *, block_mask=None):
+    def _flex_attention(self, q_r, k_r, v_c, *, block_mask: torch.Tensor | None = None):
         # NOTE: we now always pass score_mod, even when block_mask is present.
         return flex_attention(
             q_r,

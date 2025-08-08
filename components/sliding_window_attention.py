@@ -1,5 +1,6 @@
+from __future__ import annotations
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -101,7 +102,7 @@ class LocalSlidingWindowAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (B, S, D)
-        key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) – True = pad
+        key_padding_mask: torch.Tensor | None = None,  # (B, S) – True = pad
     ) -> torch.Tensor:
         B, S, D = x.shape
         H, d = self.num_heads, self.head_dim
@@ -219,7 +220,7 @@ class SlidingWindowAttention(nn.Module):
         return mask  # True means blocked
 
     def forward(
-        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, attn_mask: torch.Tensor | None = None, key_padding_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Computes sliding-window multi-head attention.
@@ -328,8 +329,8 @@ class SlidingWindowCrossAttention(nn.Module):
         query: torch.Tensor,  # codes_lo
         key: torch.Tensor,  # codes_hi
         value: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S_q, D = query.shape
         if D != self.embed_dim or key.size(2) != self.embed_dim or value.size(2) != self.embed_dim:
@@ -663,7 +664,7 @@ class SegmentCausalCrossAttention(nn.Module):
         q: torch.Tensor,  # (B, Lq,  q_dim)
         kv: torch.Tensor,  # (B, Lkv, kv_dim)
         seg_id: torch.Tensor,  # (B, Lq)
-        kv_mask: Optional[torch.Tensor] = None,
+        kv_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, Lq, _ = q.shape
         _, Lkv, _ = kv.shape

@@ -1,6 +1,7 @@
+from __future__ import annotations
 import importlib.util
 from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +15,7 @@ from components.tokenizer import ByteLevelTokenizer
 from configs.base_config import ExpConfig
 
 
-def _load_config(config: Union[str, Dict, ExpConfig]):
+def _load_config(config: str | dict[str, Any] | ExpConfig):
     """Return (exp_config, device) from a config path, dict or ExpConfig."""
     if isinstance(config, ExpConfig):
         exp_config = config
@@ -39,7 +40,7 @@ def _load_config(config: Union[str, Dict, ExpConfig]):
 class HierarchicalAELM(LM):
     """LM-Eval adapter for HierarchicalAutoencoder checkpoints."""
 
-    def __init__(self, checkpoint: str, config: Union[str, Dict], device: Optional[str] = None) -> None:
+    def __init__(self, checkpoint: str, config: str | dict[str, Any], device: str | None = None) -> None:
         super().__init__()
         exp_config, cfg_device = _load_config(config)
         self.exp_config = exp_config
@@ -98,7 +99,7 @@ class HierarchicalAELM(LM):
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs
 
-    def loglikelihood(self, requests, disable_tqdm: bool = False) -> List[Tuple[float, bool]]:
+    def loglikelihood(self, requests, disable_tqdm: bool = False) -> list[tuple[float, bool]]:
         results = []
         for context, continuation in tqdm(requests, disable=disable_tqdm):
             full_text = context + continuation
@@ -111,7 +112,7 @@ class HierarchicalAELM(LM):
             results.append((cont_ll, True))
         return results
 
-    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> List[float]:
+    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> list[float]:
         results = []
         for (string,) in tqdm(requests, disable=disable_tqdm):
             tokens = torch.tensor(self.tok_encode(string)).unsqueeze(0).to(self.device)

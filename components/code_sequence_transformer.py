@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -18,11 +18,11 @@ class CodeSequenceTransformer(nn.Module):
         num_layers: int,
         num_heads: int,
         ffn_dim_multiplier: int = 4,
-        head_dim: Optional[int] = 32,  # K
-        kv_comp_dim: Optional[int] = 64,  # d_c
-        q_comp_dim: Optional[int] = 96,  # d_c`
-        retr_dim: Optional[int] = 32,  # r
-        vq: Optional[VectorQuantizer] = None,
+        head_dim: int | None = 32,  # K
+        kv_comp_dim: int | None = 64,  # d_c
+        q_comp_dim: int | None = 96,  # d_c`
+        retr_dim: int | None = 32,  # r
+        vq: VectorQuantizer | None = None,
         use_flex_attention: bool = True,
     ) -> None:
         super().__init__()
@@ -53,8 +53,8 @@ class CodeSequenceTransformer(nn.Module):
     def forward(
         self,
         input_embeddings: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Process a sequence of embeddings.
 
         Args:
@@ -92,8 +92,8 @@ class CodeSequenceTransformer(nn.Module):
     def generate_embeddings(
         self,
         prefix: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        max_len: Optional[int] = None,
+        key_padding_mask: torch.Tensor | None = None,
+        max_len: int | None = None,
     ) -> torch.Tensor:
         """Autoregressively generate embeddings until EOS is produced."""
         assert self.vq is not None, "generate_embeddings requires a VectorQuantizer"

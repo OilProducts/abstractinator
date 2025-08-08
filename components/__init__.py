@@ -46,5 +46,7 @@ try:
         "SwiGLU",
         "ByteLevelTokenizer",
     ]
-except Exception:  # pragma: no cover - optional components may fail to import
+except ImportError:  # pragma: no cover - optional components may fail to import
+    # Optional heavy deps (FlexAttention/CUDA) may be unavailable at import time.
+    # Import of core symbols above remains usable.
     pass
