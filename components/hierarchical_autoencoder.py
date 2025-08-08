@@ -258,8 +258,10 @@ class HierarchicalAutoencoder(nn.Module):
         if e_idx == self.num_levels - 1:
             _, eop = self._bottom_ids()
             return eop
-        # intermediate: child space is compressor[e_idx-1]
-        return int(self.compressors[e_idx - 1].vq.eop_token_id)
+        # intermediate: child space corresponds to compressor index (num_levels - 2 - e_idx)
+        # expanders are ordered top→bottom (0..L-1); compressors are bottom→top (0..L-1)
+        comp_idx = self.num_levels - 2 - e_idx
+        return int(self.compressors[comp_idx].vq.eop_token_id)
 
     def _all_false_kpm_like(self, x: torch.Tensor) -> torch.Tensor:
         """Return a KPM (True=pad) of zeros matching x's sequence length."""
@@ -525,9 +527,23 @@ class HierarchicalAutoencoder(nn.Module):
                     if current_input_codes_hi.is_floating_point()
                     else F.embedding(current_input_codes_hi, self.expanders[i].emb_hi.weight)
                 )
-                if kv_mask is not None and kv_mask.size(1) != mem.size(1):
-                    # clip/pad the *mask* to Lkv (mem.size(1))
-                    kv_mask, _ = _fix_len(kv_mask, None, mem.size(1), True)
+                if kv_mask is not None:
+                    # We assume L = 1 (one query per segment) for teacher-forcing.
+                    # That means memory length (Lkv) should equal the number of segments (valid_mask length).
+                    # If they differ, it indicates num_queries_per_segment > 1 (L > 1),
+                    # which would require either:
+                    #   • building a query-level kv_mask via repeat_interleave of the segment mask, or
+                    #   • reducing memory to segment-level (one row per segment) before cross-attention.
+                    # Since this project prioritizes compression (L=1) and we do not support L>1 in TF yet,
+                    # assert to catch accidental mismatches early.
+                    assert (
+                        kv_mask.size(1) == mem.size(1)
+                    ), (
+                        "Teacher-forcing kv_mask length mismatch with memory. "
+                        "This likely indicates num_queries_per_segment > 1. "
+                        "For L>1 you must either expand kv_mask to query length or "
+                        "reduce memory to one row per segment."
+                    )
 
                 # 3) Call the expander with the segment-level KV mask
                 exp_out_dict = expander(
@@ -548,16 +564,23 @@ class HierarchicalAutoencoder(nn.Module):
                     # The KPM for the next expander's input is the KPM of the current target
                     current_src_kpm = tgt_kpm_for_this_level
             else:  # Autoregressive generation
-                # comp_results_reversed = compression_results["steps"][self.num_levels - 1 - i]
-                generated_tokens = expander.generate(
-                    codes_hi=current_input_codes_hi,
-                    # codes_lo=compression_results["final_reconstructed_tokens"],
-                    codes_lo=compression_results["steps"][self.num_levels - 1 - i].input_sequence,
-                    src_key_padding_mask=current_src_kpm,  # KPM for codes_hi
-                    tgt_key_padding_mask=compression_results["steps"][self.num_levels - 1 - i].input_padding_mask,
-                    max_len=max_len_override,
-                    seg_ids=compression_results["all_seg_ids"][self.num_levels - 1 - i],
-                )
+                comp_step = compression_results["steps"][self.num_levels - 1 - i]
+                if isinstance(expander, DecoderOnlyExpander):
+                    generated_tokens = expander.generate(
+                        codes_hi=current_input_codes_hi,
+                        codes_lo=comp_step.input_sequence,
+                        src_key_padding_mask=current_src_kpm,  # KPM for codes_hi
+                        tgt_key_padding_mask=comp_step.input_padding_mask,
+                        max_new_tokens=max_len_override,
+                        seg_ids=compression_results["all_seg_ids"][self.num_levels - 1 - i],
+                    )
+                else:
+                    # Fallback for encoder-decoder expanders
+                    generated_tokens = expander.generate(
+                        codes_hi=current_input_codes_hi,
+                        src_key_padding_mask=current_src_kpm,
+                        max_len=max_len_override,
+                    )
                 all_generated_tokens_list.append(generated_tokens)
                 current_input_codes_hi = generated_tokens
                 current_src_kpm = None  # KPM for purely generated sequences is typically None for next stage
@@ -944,7 +967,7 @@ class HierarchicalAutoencoder(nn.Module):
             src_key_padding_mask=src_kpm,
             tgt_key_padding_mask=tgt_kpm,  # will be mutated in-place
             seg_ids=seg_ids,
-            max_len=max_new,
+            max_new_tokens=max_new,
         )
 
         # how many actually got written this call?
@@ -953,7 +976,7 @@ class HierarchicalAutoencoder(nn.Module):
 
         # consume exactly `steps_taken`, not `max_new`
         bottom_bytes = lo.new_zeros(1, 0)
-        stop_set = {*self._bottom_ids()} if is_bottom else {int(self.compressors[e_idx - 1].vq.eop_token_id)}
+        stop_set = {*self._bottom_ids()} if is_bottom else {self._eop_id_for_expander(e_idx)}
 
         for pos in range(1, 1 + steps_taken):
             tok = int(out[0, pos].item())
