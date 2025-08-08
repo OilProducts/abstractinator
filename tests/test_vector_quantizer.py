@@ -2,6 +2,7 @@ import torch
 
 from components.vector_quantizer import VectorQuantizer
 
+
 def test_vector_quantizer_forward_no_ema():
     torch.manual_seed(0)
     vq = VectorQuantizer(K=8, D=4, ema=False, eop_token_id=0)

@@ -1,10 +1,11 @@
 from copy import deepcopy
+
 from configs.base_config import (
-    DEVICE,
-    N_CPU,
-    exp_config as _base_exp_config,
-    ExpConfig,
     CompressorLevelConfig,
+    ExpConfig,
+)
+from configs.base_config import (
+    exp_config as _base_exp_config,
 )
 
 exp_config: ExpConfig = deepcopy(_base_exp_config)
@@ -38,6 +39,4 @@ exp_config.batch_size = 64
 exp_config.gradient_accumulation_steps = 1
 exp_config.dataset_name = "roneneldan/TinyStories"
 exp_config.dataset_config = None
-exp_config.sample_prompt_for_generation = (
-    "Once upon a time, in a land far, far away,"
-)
+exp_config.sample_prompt_for_generation = "Once upon a time, in a land far, far away,"

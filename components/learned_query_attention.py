@@ -1,9 +1,11 @@
+import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
-import math
 
 from .utils import safe_softmax
+
 
 # @torch.compile
 class LearnedQueryAttention(nn.Module):
@@ -36,11 +38,13 @@ class LearnedQueryAttention(nn.Module):
         v_proj (nn.Linear): Linear projection for values.
         out_proj (nn.Linear): Final linear projection for the output.
     """
-    def __init__(self,
-                 embed_dim: int,
-                 num_queries_per_segment: int, # Defines the size L of query_template
-                 num_heads: int,
-                 ):
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_queries_per_segment: int,  # Defines the size L of query_template
+        num_heads: int,
+    ):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads for multi-head attention.")
@@ -83,10 +87,10 @@ class LearnedQueryAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                            # Input context: (B, S, D) for keys & values
-        queries: torch.Tensor,                      # Pre-built queries: (B, Q_tot, D)
-        attn_mask: torch.Tensor,                    # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
-        key_padding_mask: Optional[torch.Tensor] = None # Key padding mask: (B, S), boolean (True where padded)
+        x: torch.Tensor,  # Input context: (B, S, D) for keys & values
+        queries: torch.Tensor,  # Pre-built queries: (B, Q_tot, D)
+        attn_mask: torch.Tensor,  # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
+        key_padding_mask: Optional[torch.Tensor] = None,  # Key padding mask: (B, S), boolean (True where padded)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs the forward pass of the Learned Query Attention.
@@ -124,15 +128,17 @@ class LearnedQueryAttention(nn.Module):
         if D_x != self.d_model:
             raise ValueError(f"Input feature dimension {D_x} does not match model dimension {self.d_model}")
         if queries.size(2) != self.d_model:
-            raise ValueError(f"Queries feature dimension {queries.size(2)} does not match model dimension {self.d_model}")
+            raise ValueError(
+                f"Queries feature dimension {queries.size(2)} does not match model dimension {self.d_model}"
+            )
 
         # Normalize the input context (keys and values) - Pre-LN style for K/V
         x_norm = self.in_norm(x)
 
         # Project queries, keys, and values
-        q_proj = self.q_proj(queries)    # (B, Q_tot, D)
-        k_proj = self.k_proj(x_norm)     # (B, S, D)
-        v_proj = self.v_proj(x_norm)     # (B, S, D)
+        q_proj = self.q_proj(queries)  # (B, Q_tot, D)
+        k_proj = self.k_proj(x_norm)  # (B, S, D)
+        v_proj = self.v_proj(x_norm)  # (B, S, D)
 
         # Reshape and permute for multi-head attention
         # q: (B, Q_tot, D) -> (B, Q_tot, H, d_h) -> (B, H, Q_tot, d_h)
@@ -153,7 +159,7 @@ class LearnedQueryAttention(nn.Module):
 
         # Apply softmax with the combined mask
         # `safe_softmax` is assumed to handle masking by setting masked scores to -inf before softmax
-        attn_weights = safe_softmax(scores, combined_mask, dim=-1) # (B, H, Q_tot, S)
+        attn_weights = safe_softmax(scores, combined_mask, dim=-1)  # (B, H, Q_tot, S)
 
         # Compute weighted sum of values (applying attention)
         # (B, H, Q_tot, S) @ (B, H, S, d_h) -> (B, H, Q_tot, d_h)
@@ -169,4 +175,3 @@ class LearnedQueryAttention(nn.Module):
         # Return final output and mean attention weights for logging/inspection
         # Mean over heads: (B, H, Q_tot, S) -> (B, Q_tot, S)
         return attn_output, attn_weights.mean(dim=1)
-

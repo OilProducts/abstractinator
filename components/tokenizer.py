@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-import torch
+
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,7 @@ class ByteLevelTokenizer:
                 expected_vocab_size,
             )
 
-    def encode(
-        self, text: str, add_bos: bool | None = None, add_eos: bool | None = None
-    ) -> torch.Tensor:
+    def encode(self, text: str, add_bos: bool | None = None, add_eos: bool | None = None) -> torch.Tensor:
         if add_bos is None:
             add_bos = self.add_bos
         if add_eos is None:
@@ -81,13 +80,12 @@ class ByteLevelTokenizer:
         byte_list = [t for t in tokens if 0 <= t < 256]
         return bytes(byte_list).decode("utf-8", errors="ignore")
 
-
     def encode_batch_fixed_length(
-            texts: list[str],
-            *,
-            tokenizer,
-            seq_len: int,
-            dtype: torch.dtype = torch.int16,  # match your model
+        texts: list[str],
+        *,
+        tokenizer,
+        seq_len: int,
+        dtype: torch.dtype = torch.int16,  # match your model
     ):
         """
         Vectorised byte-level encoding whose behaviour matches the original
@@ -124,7 +122,7 @@ class ByteLevelTokenizer:
             reserve = 1 if tokenizer.add_eos else 0
             take = min(len(b), seq_len - pos - reserve)
             if take:
-                ids[i, pos: pos + take] = np.frombuffer(b[:take], dtype=np.uint8)
+                ids[i, pos : pos + take] = np.frombuffer(b[:take], dtype=np.uint8)
                 pos += take
 
             # EOS handling (identical to the original loop)

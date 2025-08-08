@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+
 import torch
 
 logger = logging.getLogger(__name__)
@@ -64,16 +65,8 @@ def load_base_components(
         compressors_sd = state["compressors"]
         expanders_sd = state["expanders"]
     else:
-        compressors_sd = {
-            k[len("compressors.") :]: v
-            for k, v in state.items()
-            if k.startswith("compressors.")
-        }
-        expanders_sd = {
-            k[len("expanders.") :]: v
-            for k, v in state.items()
-            if k.startswith("expanders.")
-        }
+        compressors_sd = {k[len("compressors.") :]: v for k, v in state.items() if k.startswith("compressors.")}
+        expanders_sd = {k[len("expanders.") :]: v for k, v in state.items() if k.startswith("expanders.")}
 
     # Load compressors starting from the bottom level.  The saved checkpoint may
     # contain fewer levels than ``model`` when fine‑tuning a larger hierarchy.

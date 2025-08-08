@@ -1,15 +1,12 @@
-import torch
 import pytest
+import torch
 
-
-from components.utils import safe_softmax, token_entropy, entropy_segments
+from components.utils import entropy_segments, safe_softmax, token_entropy
 
 
 def test_safe_softmax_partial_and_all_masked():
-    scores = torch.tensor([[1.0, 2.0, 3.0],
-                           [0.5, -1.0, 0.0]])
-    mask = torch.tensor([[False, True, False],
-                        [True, True, True]])
+    scores = torch.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 0.0]])
+    mask = torch.tensor([[False, True, False], [True, True, True]])
     out = safe_softmax(scores, mask, dim=1)
 
     expected_row0 = torch.softmax(scores[0].masked_fill(mask[0], float('-inf')), dim=0)

@@ -16,3 +16,14 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+# Project artifacts
+checkpoints/
+mlruns/
+models/
+
+# IDE and tooling
+.idea/
+.aim/
+package-lock.json
+uv.lock

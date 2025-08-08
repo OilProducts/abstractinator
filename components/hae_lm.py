@@ -1,18 +1,16 @@
-from typing import List, Tuple, Optional, Union, Dict
-
 import importlib.util
+from dataclasses import asdict
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-
-from dataclasses import asdict
+from lm_eval import utils
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval import utils
+from tqdm import tqdm
 
-from components.tokenizer import ByteLevelTokenizer
 from components import HierarchicalAutoencoder
+from components.tokenizer import ByteLevelTokenizer
 from configs.base_config import ExpConfig
 
 
@@ -62,9 +60,7 @@ class HierarchicalAELM(LM):
             propagate_key_padding_mask=exp_config.expander.propagate_key_padding_mask,
             aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
             top_transformer_config=(
-                asdict(exp_config.top_transformer_config)
-                if exp_config.top_transformer_config
-                else None
+                asdict(exp_config.top_transformer_config) if exp_config.top_transformer_config else None
             ),
             top_lm_loss_weight=exp_config.top_lm_loss_weight,
             use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,

@@ -1,31 +1,34 @@
 import torch
 
-
 from components.hierarchical_autoencoder import HierarchicalAutoencoder
 
 
 def build_model(target):
-    comp_cfg = [{
-        "dim": 4,
-        "heads": 1,
-        "window": 2,
-        "num_encoder_layers": 1,
-        "encoder_ffn_dim_multiplier": 2,
-        "num_queries": 1,
-        "codebook_size": 4,
-        "beta": 0.25,
-        "target_compression_ratio": target,
-        "compression_loss_weight": 1.0,
-    }]
-    exp_cfg = [{
-        "dim_scale": 1.0,
-        "num_enc_layers": 1,
-        "num_dec_layers": 1,
-        "heads_scale": 1.0,
-        "eos_id": 1,
-        "max_len": 8,
-        "use_decoder_only": True,
-    }]
+    comp_cfg = [
+        {
+            "dim": 4,
+            "heads": 1,
+            "window": 2,
+            "num_encoder_layers": 1,
+            "encoder_ffn_dim_multiplier": 2,
+            "num_queries": 1,
+            "codebook_size": 4,
+            "beta": 0.25,
+            "target_compression_ratio": target,
+            "compression_loss_weight": 1.0,
+        }
+    ]
+    exp_cfg = [
+        {
+            "dim_scale": 1.0,
+            "num_enc_layers": 1,
+            "num_dec_layers": 1,
+            "heads_scale": 1.0,
+            "eos_id": 1,
+            "max_len": 8,
+            "use_decoder_only": True,
+        }
+    ]
     return HierarchicalAutoencoder(
         num_levels=1,
         compressor_level_configs=comp_cfg,

@@ -1,4 +1,5 @@
 import os
+
 import torch
 
 # Determine CPU count for data loading and processing
@@ -16,15 +17,19 @@ exp_config = {
     "num_levels": 1,
     "initial_vocab_size": 259,
     "compressor_level_configs": [
-        {"dim": 128, "heads": 8, "window": 64,
-         "num_encoder_layers": 1,
-         'encoder_ffn_dim_multiplier': 4,
-         'max_seq_len_encoder': 4096,
-         "num_queries": 1,
-         "codebook_size": 2048,
-         "beta": 1.0,
-         "entropy_delta": 0.2,
-         "entropy_abs_threshold": None},
+        {
+            "dim": 128,
+            "heads": 8,
+            "window": 64,
+            "num_encoder_layers": 1,
+            'encoder_ffn_dim_multiplier': 4,
+            'max_seq_len_encoder': 4096,
+            "num_queries": 1,
+            "codebook_size": 2048,
+            "beta": 1.0,
+            "entropy_delta": 0.2,
+            "entropy_abs_threshold": None,
+        },
     ],
     "expander_dim_scale": 1.0,
     "expander_num_enc_layers": 1,

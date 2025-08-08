@@ -1,9 +1,6 @@
 """Utility functions for dataset tokenization and processing."""
 
-from typing import Dict, List, Any
 import torch
-import numpy as np
-
 
 # def tokenize_and_process_examples(
 #     examples: Dict[str, List[str]],
@@ -90,7 +87,7 @@ import numpy as np
 #         "key_padding_mask": kpm_list,
 #     }
 
-from functools import partial
+
 
 def tokenize_and_process_examples(
     examples,
@@ -111,8 +108,6 @@ def tokenize_and_process_examples(
 
     return {
         "input_ids": ids_list,
-        "labels":    ids_list,          # identical
+        "labels": ids_list,  # identical
         "key_padding_mask": kpm_list,
     }
-
-

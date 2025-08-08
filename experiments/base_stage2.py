@@ -1,6 +1,13 @@
 from copy import deepcopy
-from configs.base_config import DEVICE, N_CPU, exp_config as _base_exp_config, ExpConfig, CompressorLevelConfig, \
-    ExpanderConfig
+
+from configs.base_config import (
+    CompressorLevelConfig,
+    ExpanderConfig,
+    ExpConfig,
+)
+from configs.base_config import (
+    exp_config as _base_exp_config,
+)
 
 # Use defaults from base_config without modification
 exp_config: ExpConfig = deepcopy(_base_exp_config)
@@ -36,7 +43,8 @@ exp_config.compressor_level_configs.append(
         entropy_abs_threshold=None,
         target_compression_ratio=None,
         compression_loss_weight=1.0,
-    ))
+    )
+)
 
 exp_config.expander_level_configs.append(
     ExpanderConfig(
@@ -48,4 +56,5 @@ exp_config.expander_level_configs.append(
         max_len=8192,
         use_decoder_only=True,
         use_continuous_inputs=False,
-    ))
+    )
+)

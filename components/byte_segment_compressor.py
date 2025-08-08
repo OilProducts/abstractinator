@@ -1,14 +1,13 @@
-from typing import Dict, Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
 from .learned_query_attention import LearnedQueryAttention
-from .vector_quantizer import VectorQuantizer
-from .sliding_window_attention import SlidingWindowTransformerBlock
 from .mla import SlidingWindowMLATransformerBlock
-from .utils import token_entropy, entropy_segments, build_segment_queries_mask, _compiled
+from .utils import _compiled, build_segment_queries_mask, entropy_segments, token_entropy
+from .vector_quantizer import VectorQuantizer
 
 
 @dataclass
@@ -54,6 +53,7 @@ class ByteSegmentCompressor(nn.Module):
       }
     where Q_total = S_hat * num_queries_per_segment.
     """
+
     def __init__(
         self,
         vocab_size: int = 259,
@@ -109,7 +109,7 @@ class ByteSegmentCompressor(nn.Module):
                         dim=dim,
                         num_heads=heads,
                         window_size=window,
-                        head_dim = head_dim,
+                        head_dim=head_dim,
                         kv_comp_dim=kv_comp_dim,
                         q_comp_dim=q_comp_dim,
                         retr_dim=retr_dim,
@@ -175,9 +175,7 @@ class ByteSegmentCompressor(nn.Module):
             reset_interval=vq_reset_interval,
         )
 
-    def forward(self, token_ids: torch.Tensor,
-                key_padding_mask: Optional[torch.Tensor] = None
-               ) -> CompressorOutput:
+    def forward(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> CompressorOutput:
         """
         Processes input token IDs to produce compressed segment representations.
 
@@ -244,8 +242,6 @@ class ByteSegmentCompressor(nn.Module):
             # propagate the latest non-zero value to the right
             first_byte_idx = torch.cummax(first_pos, dim=1).values  # (B,S)
 
-
-
         # seg_id now maps each token position to a segment index.
         # patch_end_mask = torch.zeros_like(seg_id, dtype=torch.bool)
         # if seg_id.size(1) > 0:
@@ -270,11 +266,11 @@ class ByteSegmentCompressor(nn.Module):
         # Pool features from `hidden` states using the constructed `queries`.
         # Attention is restricted by `seg_attn_mask` and `key_padding_mask`.
         pooled_embeddings, _ = self.pooler(
-            x=hidden,                         # Keys and Values from encoder output (B,S,D)
-            queries=queries,                  # Segment-specific queries (B, S_hat*L, D)
-            attn_mask=seg_attn_mask,         # Restricts attention within segments
-            key_padding_mask=key_padding_mask # Masks padded tokens in `hidden`
-        ) # pooled_embeddings: (B, S_hat*L, D)
+            x=hidden,  # Keys and Values from encoder output (B,S,D)
+            queries=queries,  # Segment-specific queries (B, S_hat*L, D)
+            attn_mask=seg_attn_mask,  # Restricts attention within segments
+            key_padding_mask=key_padding_mask,  # Masks padded tokens in `hidden`
+        )  # pooled_embeddings: (B, S_hat*L, D)
 
         # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
         # Apply vector quantization to the pooled segment embeddings.
@@ -288,29 +284,37 @@ class ByteSegmentCompressor(nn.Module):
                 (quantised_embeddings.size(0), pad_size, quantised_embeddings.size(2)),
                 pad_id,
                 device=quantised_embeddings.device,
-                dtype=quantised_embeddings.dtype
+                dtype=quantised_embeddings.dtype,
             )
             quantised_embeddings = torch.cat((quantised_embeddings, padding), dim=1)
             codebook_indices = torch.cat(
-                (codebook_indices, torch.full((codebook_indices.size(0), pad_size), pad_id, device=codebook_indices.device)),
-                dim=1
+                (
+                    codebook_indices,
+                    torch.full((codebook_indices.size(0), pad_size), pad_id, device=codebook_indices.device),
+                ),
+                dim=1,
             )
             valid_segments_mask = torch.cat(
-                (valid_segments_mask, torch.zeros((valid_segments_mask.size(0), pad_size), dtype=torch.bool, device=valid_segments_mask.device)),
-                dim=1
+                (
+                    valid_segments_mask,
+                    torch.zeros(
+                        (valid_segments_mask.size(0), pad_size), dtype=torch.bool, device=valid_segments_mask.device
+                    ),
+                ),
+                dim=1,
             )
 
         return CompressorOutput(
             vq_embeddings=quantised_embeddings,  # (B, S_hat*L, D)
-            vq_indices=codebook_indices,          # (B, S_hat*L)
-            vq_loss=vq_loss,                      # Scalar tensor
-            vq_perplexity=perplexity,             # Scalar tensor
-            valid_mask=valid_segments_mask,       # (B, S)
-            patch_end_mask=patch_end_mask,        # (B, S)  # True if this is the last token of a segment
-            entropy_model_logits=logits,          # (B, S, vocab_size)
+            vq_indices=codebook_indices,  # (B, S_hat*L)
+            vq_loss=vq_loss,  # Scalar tensor
+            vq_perplexity=perplexity,  # Scalar tensor
+            valid_mask=valid_segments_mask,  # (B, S)
+            patch_end_mask=patch_end_mask,  # (B, S)  # True if this is the last token of a segment
+            entropy_model_logits=logits,  # (B, S, vocab_size)
             pre_vq_embeddings=pooled_embeddings,  # (B, S_hat*L, D)
-            seg_id=seg_id,                        # (B, S)  integers 0…
-            first_byte_idx=first_byte_idx,        # (B, S)
+            seg_id=seg_id,  # (B, S)  integers 0…
+            first_byte_idx=first_byte_idx,  # (B, S)
             input_sequence=token_ids,
             input_padding_mask=key_padding_mask,
         )

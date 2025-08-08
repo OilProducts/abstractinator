@@ -1,9 +1,9 @@
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
-from torch.nn.attention.flex_attention import flex_attention
 
 import torch
+from torch.nn.attention.flex_attention import flex_attention
 
 # Determine CPU count for data loading and processing
 N_CPU = int(os.cpu_count()) if os.cpu_count() else 1  # Ensure at least one worker
@@ -119,7 +119,7 @@ class TopTransformerConfig:
     q_comp_dim: Optional[int] = 96  # d_c`
     retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 128
-    lm_fixed_length: Optional[int] = 512 # Fixed length for the top LM input, will be padded if necessary
+    lm_fixed_length: Optional[int] = 512  # Fixed length for the top LM input, will be padded if necessary
     lm_pad_id: int = 258
 
 
@@ -134,9 +134,8 @@ class ExpanderConfig:
     use_decoder_only: bool = True
     use_continuous_inputs: bool = True
     cross_window: Optional[int] = 128  # If None, use the same window as the compressor level
-    hi_dim: int = 128 # Dimension of the high-level representation
-    lo_dim: int = 128 # Dimension of the low-level representation
-
+    hi_dim: int = 128  # Dimension of the high-level representation
+    lo_dim: int = 128  # Dimension of the low-level representation
 
 
 @dataclass
@@ -147,17 +146,13 @@ class ExpConfig:
     flex_attention: bool = FLEX_ATTENTION
     num_levels: int = 1
     initial_vocab_size: int = 260
-    compressor_level_configs: List[CompressorLevelConfig] = field(
-        default_factory=lambda: [CompressorLevelConfig()]
-    )
+    compressor_level_configs: List[CompressorLevelConfig] = field(default_factory=lambda: [CompressorLevelConfig()])
     expander_level_configs: List[ExpanderConfig] = field(default_factory=lambda: [ExpanderConfig()])
     aux_lm_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
     top_lm_mse_weight: float = 1.0
     top_lm_ce_weight: float = 1.0
-    top_transformer_config: Optional[TopTransformerConfig] = field(
-        default_factory=TopTransformerConfig
-    )
+    top_transformer_config: Optional[TopTransformerConfig] = field(default_factory=TopTransformerConfig)
     propagate_key_padding_mask: bool = True
     learning_rate: float = 5e-4
     batch_size: int = 16
@@ -166,12 +161,10 @@ class ExpConfig:
     max_steps: Optional[int] = None
     log_interval: int = 1
     gradient_clip_norm: float = 1.0
-    gradient_accumulation_steps: int = 1 # 8
+    gradient_accumulation_steps: int = 1  # 8
     scheduler_type: str = "cosine_with_min_lr"
     warmup_steps: int = 1000
-    scheduler_specific_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {"min_lr": 1e-6}
-    )
+    scheduler_specific_kwargs: Dict[str, Any] = field(default_factory=lambda: {"min_lr": 1e-6})
     dataset_name: str = "roneneldan/TinyStories"
     dataset_config: Optional[str] = None
     dataset_train_split: str = "train"

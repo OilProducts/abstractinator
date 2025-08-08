@@ -1,11 +1,10 @@
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional, Dict
 
-from .expander import EncoderBlock
-from .vector_quantizer import VectorQuantizer
 from .mla import CausalMLATransformerBlock
-from .utils import _compiled
+from .vector_quantizer import VectorQuantizer
 
 
 @torch.compile(dynamic=True)
@@ -13,18 +12,18 @@ class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 
     def __init__(
-            self,
-            embed_dim: int,
-            dim: int,
-            num_layers: int,
-            num_heads: int,
-            ffn_dim_multiplier: int = 4,
-            head_dim: Optional[int] = 32,  # K
-            kv_comp_dim: Optional[int] = 64,  # d_c
-            q_comp_dim: Optional[int] = 96,  # d_c`
-            retr_dim: Optional[int] = 32,  # r
-            vq: Optional[VectorQuantizer] = None,
-            use_flex_attention: bool = True,
+        self,
+        embed_dim: int,
+        dim: int,
+        num_layers: int,
+        num_heads: int,
+        ffn_dim_multiplier: int = 4,
+        head_dim: Optional[int] = 32,  # K
+        kv_comp_dim: Optional[int] = 64,  # d_c
+        q_comp_dim: Optional[int] = 96,  # d_c`
+        retr_dim: Optional[int] = 32,  # r
+        vq: Optional[VectorQuantizer] = None,
+        use_flex_attention: bool = True,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -35,26 +34,26 @@ class CodeSequenceTransformer(nn.Module):
         self.in_proj = nn.Linear(embed_dim, dim)
         self.encoder = nn.ModuleList(
             [
-                    CausalMLATransformerBlock(dim=dim,
-                                              num_heads=num_heads,
-                                              ffn_dim_multiplier=ffn_dim_multiplier,
-                                              head_dim=head_dim,
-                                              kv_comp_dim=kv_comp_dim,
-                                              q_comp_dim=q_comp_dim,
-                                              retr_dim=retr_dim,
-                                              use_flex_attention=self.use_flex_attention
-                                              )
-                 for _ in range(num_layers)
-
+                CausalMLATransformerBlock(
+                    dim=dim,
+                    num_heads=num_heads,
+                    ffn_dim_multiplier=ffn_dim_multiplier,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
+                    use_flex_attention=self.use_flex_attention,
+                )
+                for _ in range(num_layers)
             ]
         )
         self.final_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, embed_dim)
 
     def forward(
-            self,
-            input_embeddings: torch.Tensor,
-            key_padding_mask: Optional[torch.Tensor] = None,
+        self,
+        input_embeddings: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Process a sequence of embeddings.
 
@@ -91,10 +90,10 @@ class CodeSequenceTransformer(nn.Module):
 
     @torch.no_grad()
     def generate_embeddings(
-            self,
-            prefix: torch.Tensor,
-            key_padding_mask: Optional[torch.Tensor] = None,
-            max_len: Optional[int] = None,
+        self,
+        prefix: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        max_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Autoregressively generate embeddings until EOS is produced."""
         assert self.vq is not None, "generate_embeddings requires a VectorQuantizer"

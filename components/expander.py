@@ -1,23 +1,23 @@
 import math
+from functools import lru_cache
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import lru_cache
-from .rope import RotaryCache, apply_rope
+
+from .rope import apply_rope
+from .sliding_window_attention import AttnCache, SegmentCausalCrossAttention
 from .swiglu import SwiGLU
-from .sliding_window_attention import SlidingWindowCrossAttention, SegmentCausalCrossAttention, AttnCache
 
 
 @lru_cache(maxsize=64)
 def _cached_causal_mask(length: int) -> torch.Tensor:
     """Return a causal mask computed on CPU."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mask = torch.triu(
-        torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1
-    )
+    mask = torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
     return mask
+
 
 def get_causal_mask(length: int, device: torch.device) -> torch.Tensor:
     """Return the cached causal mask on ``device``."""
@@ -123,7 +123,9 @@ class DecoderBlock(nn.Module):
         cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), key=memory, value=memory, attn_mask=cross_attn_mask, key_padding_mask=memory_key_padding_mask)
+        x = x + self.cross_attn(
+            self.norm2(x), key=memory, value=memory, attn_mask=cross_attn_mask, key_padding_mask=memory_key_padding_mask
+        )
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -131,9 +133,7 @@ class DecoderBlock(nn.Module):
 class SimpleEncoder(nn.Module):
     def __init__(self, num_layers: int, d_model: int, num_heads: int):
         super().__init__()
-        self.layers = nn.ModuleList([
-            EncoderBlock(d_model, num_heads, 4 * d_model) for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList([EncoderBlock(d_model, num_heads, 4 * d_model) for _ in range(num_layers)])
         self.final_norm = nn.RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -145,9 +145,7 @@ class SimpleEncoder(nn.Module):
 class SimpleDecoder(nn.Module):
     def __init__(self, num_layers: int, d_model: int, num_heads: int):
         super().__init__()
-        self.layers = nn.ModuleList([
-            DecoderBlock(d_model, num_heads, 4 * d_model) for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList([DecoderBlock(d_model, num_heads, 4 * d_model) for _ in range(num_layers)])
         self.final_norm = nn.RMSNorm(d_model)
 
     def forward(
@@ -174,19 +172,15 @@ class SimpleDecoder(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self,
-                 idx: int,
-                 d_model: int,
-                 num_heads: int,
-                 cross_window: int,
-                 q_dim, kv_dim):
+    def __init__(self, idx: int, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim):
         super().__init__()
         self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
         self.self_attn = MultiHeadAttentionRoPE(d_model, num_heads, causal=True)
         self.norm2 = nn.RMSNorm(d_model)
         self.cross_attn = SegmentCausalCrossAttention(
-            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False)
+            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False
+        )
         # self.cross_attn = SlidingWindowCrossAttention(d_model, num_heads, window_size=cross_window)
         self.norm3 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, 4 * d_model)
@@ -205,12 +199,14 @@ class SlidingDecoderBlock(nn.Module):
         x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
 
         cross_cache = None if cache is None else cache.cross.setdefault(self.layer_id, {})
-        x = x + self.cross_attn(self.norm2(x),
-                                kv_src=memory,
-                                seg_id=seg_ids,
-                                kv_mask=memory_key_padding_mask,
-                                q_pad_mask=tgt_key_padding_mask,
-                                cache=cross_cache)
+        x = x + self.cross_attn(
+            self.norm2(x),
+            kv_src=memory,
+            seg_id=seg_ids,
+            kv_mask=memory_key_padding_mask,
+            q_pad_mask=tgt_key_padding_mask,
+            cache=cross_cache,
+        )
         x = x + self.ffn(self.norm3(x))
         return x
 
@@ -221,15 +217,9 @@ class SlidingDecoder(nn.Module):
         self.layers = nn.ModuleList()
         for l_idx in range(num_layers):
             layer = SlidingDecoderBlock(
-                idx=l_idx,
-                d_model=d_model,
-                num_heads=num_heads,
-                cross_window=cross_window,
-                q_dim=q_dim,
-                kv_dim=kv_dim
+                idx=l_idx, d_model=d_model, num_heads=num_heads, cross_window=cross_window, q_dim=q_dim, kv_dim=kv_dim
             )
             self.layers.append(layer)
-
 
         # self.layers = nn.ModuleList([
         #     SlidingDecoderBlock(d_model, num_heads, cross_window, q_dim, kv_dim) for _ in range(num_layers)
@@ -264,6 +254,7 @@ class SlidingDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 # CodeExpander: Sequence-to-Sequence model using the custom Transformer blocks
 # ---------------------------------------------------------------------------
+
 
 # @torch.compile
 class CodeExpander(nn.Module):
@@ -365,6 +356,7 @@ class CodeExpander(nn.Module):
                 break
         return generated_ids[:, 1:]
 
+
 # @torch.compile
 class DecoderOnlyExpander(nn.Module):
     """Decoder-only variant using sliding-window cross attention for memory access."""
@@ -373,8 +365,8 @@ class DecoderOnlyExpander(nn.Module):
         self,
         K_hi: int,
         K_lo: int,
-        hi_dim: int = 256, # kv_dim
-        lo_dim: int = 256, # q_dim
+        hi_dim: int = 256,  # kv_dim
+        lo_dim: int = 256,  # q_dim
         D: int = 256,
         N_dec: int = 4,
         H: int = 8,
@@ -383,7 +375,6 @@ class DecoderOnlyExpander(nn.Module):
         eop_id: int = 259,
         max_len: int = 2048,
         cross_lookback_bytes: int = 128,
-
     ) -> None:
         super().__init__()
         self.K_hi, self.K_lo = K_hi, K_lo
@@ -439,15 +430,14 @@ class DecoderOnlyExpander(nn.Module):
 
     @torch.no_grad()
     def generate(
-            self,
-            codes_hi: torch.Tensor,
-            codes_lo: torch.Tensor,  # (B, L)  – already padded to L
-            src_key_padding_mask: Optional[torch.Tensor] = None,
-            tgt_key_padding_mask: Optional[torch.Tensor] = None,
-            seg_ids: Optional[torch.Tensor] = None,
-            max_len: Optional[int] = None,
-            max_new_tokens: Optional[int] = None,
-
+        self,
+        codes_hi: torch.Tensor,
+        codes_lo: torch.Tensor,  # (B, L)  – already padded to L
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+        max_len: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Autoregressively fills the PAD slots of `codes_lo` while keeping its length
@@ -473,7 +463,6 @@ class DecoderOnlyExpander(nn.Module):
         if max_new_tokens is not None:
             steps_budget = min(steps_budget, int(max_new_tokens))
 
-
         for _ in range(steps_budget):
             # how many non-PAD tokens are present in each sample
             len_valid = (~tgt_key_padding_mask).sum(dim=1)  # (B,)
@@ -498,8 +487,7 @@ class DecoderOnlyExpander(nn.Module):
 
             # ── logits for the last valid token in each batch ─────
             gather_idx = (len_valid - 1).unsqueeze(1).unsqueeze(2)  # (B,1,1)
-            last_hid = dec_out.gather(1, gather_idx.expand(-1, 1, dec_out.size(-1))) \
-                .squeeze(1)  # (B, D)
+            last_hid = dec_out.gather(1, gather_idx.expand(-1, 1, dec_out.size(-1))).squeeze(1)  # (B, D)
 
             next_logits = self.out_proj(last_hid)  # (B, K_lo)
             next_id = next_logits.argmax(dim=-1)  # (B,)
@@ -514,4 +502,3 @@ class DecoderOnlyExpander(nn.Module):
                 break
 
         return generated
-

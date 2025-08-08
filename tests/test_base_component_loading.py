@@ -1,30 +1,33 @@
 import torch
 
-
+from components.checkpoint_utils import load_base_components, save_base_components
 from components.hierarchical_autoencoder import HierarchicalAutoencoder
-from components.checkpoint_utils import save_base_components, load_base_components
 
 
 def build_base_model():
-    comp_cfg = [{
-        "dim": 4,
-        "heads": 1,
-        "window": 2,
-        "num_encoder_layers": 1,
-        "encoder_ffn_dim_multiplier": 2,
-        "num_queries": 1,
-        "codebook_size": 4,
-        "beta": 0.25,
-    }]
-    exp_cfg = [{
-        "dim_scale": 1.0,
-        "num_enc_layers": 1,
-        "num_dec_layers": 1,
-        "heads_scale": 1.0,
-        "eos_id": 1,
-        "max_len": 8,
-        "use_decoder_only": True,
-    }]
+    comp_cfg = [
+        {
+            "dim": 4,
+            "heads": 1,
+            "window": 2,
+            "num_encoder_layers": 1,
+            "encoder_ffn_dim_multiplier": 2,
+            "num_queries": 1,
+            "codebook_size": 4,
+            "beta": 0.25,
+        }
+    ]
+    exp_cfg = [
+        {
+            "dim_scale": 1.0,
+            "num_enc_layers": 1,
+            "num_dec_layers": 1,
+            "heads_scale": 1.0,
+            "eos_id": 1,
+            "max_len": 8,
+            "use_decoder_only": True,
+        }
+    ]
     model = HierarchicalAutoencoder(
         num_levels=1,
         compressor_level_configs=comp_cfg,
@@ -39,25 +42,29 @@ def build_base_model():
 
 
 def build_top_model():
-    comp_cfg = [{
-        "dim": 4,
-        "heads": 1,
-        "window": 2,
-        "num_encoder_layers": 1,
-        "encoder_ffn_dim_multiplier": 2,
-        "num_queries": 1,
-        "codebook_size": 4,
-        "beta": 0.25,
-    }]
-    exp_cfg = [{
-        "dim_scale": 1.0,
-        "num_enc_layers": 1,
-        "num_dec_layers": 1,
-        "heads_scale": 1.0,
-        "eos_id": 1,
-        "max_len": 8,
-        "use_decoder_only": True,
-    }]
+    comp_cfg = [
+        {
+            "dim": 4,
+            "heads": 1,
+            "window": 2,
+            "num_encoder_layers": 1,
+            "encoder_ffn_dim_multiplier": 2,
+            "num_queries": 1,
+            "codebook_size": 4,
+            "beta": 0.25,
+        }
+    ]
+    exp_cfg = [
+        {
+            "dim_scale": 1.0,
+            "num_enc_layers": 1,
+            "num_dec_layers": 1,
+            "heads_scale": 1.0,
+            "eos_id": 1,
+            "max_len": 8,
+            "use_decoder_only": True,
+        }
+    ]
     model = HierarchicalAutoencoder(
         num_levels=1,
         compressor_level_configs=comp_cfg,
@@ -189,4 +196,3 @@ def test_load_base_components_into_larger_model(tmp_path):
         assert not p.requires_grad
     for p in model.expanders[1].parameters():
         assert not p.requires_grad
-
