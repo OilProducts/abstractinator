@@ -87,9 +87,11 @@ def load_experiment_config(args: argparse.Namespace) -> tuple[str, int, ExpConfi
 
     if args.config:
         config = _load_config(args.config)
-        device = config.DEVICE
-        n_cpu = config.N_CPU
         exp_cfg: ExpConfig = config.exp_config
+        # Prefer explicit attributes on the config module, else fall back to
+        # values inside exp_config, else use library defaults.
+        device = getattr(config, "DEVICE", None) or getattr(exp_cfg, "device", None) or DEFAULT_DEVICE
+        n_cpu = getattr(config, "N_CPU", None) or DEFAULT_N_CPU
     else:
         if not args.resume_from_checkpoint:
             raise ValueError("--config or --resume_from_checkpoint must be provided")
