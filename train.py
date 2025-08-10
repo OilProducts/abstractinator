@@ -41,6 +41,7 @@ torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 torch._dynamo.config.recompile_limit = 512
+torch._dynamo.config.capture_scalar_outputs = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -324,8 +325,10 @@ def train_loop(
     train_dataloader = DataLoader(
         tokenized_dataset,
         batch_size=exp_config.batch_size,
-        num_workers=n_cpu,
+        num_workers=8,
         pin_memory=True if device == "cuda" else False,
+        persistent_workers=True,
+        prefetch_factor=2
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config.gradient_accumulation_steps)
@@ -352,8 +355,8 @@ def train_loop(
         model.expanders.eval()
     optimizer.zero_grad()
 
-    if device == "cuda":
-        torch.cuda.synchronize()
+    # if device == "cuda":
+    #     torch.cuda.synchronize()
     training_start_time = time.time()
     metrics = TrainingMetrics(
         num_levels=exp_config.num_levels,
@@ -374,8 +377,9 @@ def train_loop(
             model.expanders.eval()
 
         for i, batch in enumerate(train_dataloader):
-            tokens = batch["input_ids"].to(device)
-            key_padding_mask = batch["key_padding_mask"].to(device)
+            # Make H2D transfers asynchronous to overlap with compute
+            tokens = batch["input_ids"].to(device, non_blocking=True)
+            key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
             model_kpm = key_padding_mask if exp_config.propagate_key_padding_mask else None
 
             output_dict = model(tokens, key_padding_mask=model_kpm)
@@ -393,8 +397,8 @@ def train_loop(
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-                if device == "cuda":
-                    torch.cuda.synchronize()
+                # if device == "cuda":
+                #     torch.cuda.synchronize()
                 current_time = time.time()
                 duration_accumulation_window = current_time - time_of_last_optimizer_step_event
 
@@ -408,7 +412,8 @@ def train_loop(
 
                 steps_accumulated = metrics.count
 
-                if steps_accumulated > 0:
+                # Only do console + MLflow logging on the chosen interval to reduce CPU
+                if steps_accumulated > 0 and (global_step % exp_config.log_interval == 0):
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                     console_log_parts = metrics.console_parts(
                         timestamp=timestamp,
@@ -424,7 +429,7 @@ def train_loop(
                     if console_log_parts:
                         logger.info(" | ".join(console_log_parts))
 
-                    if global_step % exp_config.log_interval == 0 and metrics.count > 0:
+                    if metrics.count > 0:
                         codebook_sizes = [c.codebook_size for c in exp_config.compressor_level_configs]
                         metrics_dict = metrics.metrics_dict(
                             learning_rate=optimizer.param_groups[0]["lr"],

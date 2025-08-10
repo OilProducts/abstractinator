@@ -45,98 +45,130 @@ class TrainingMetrics:
         self.top_lm_enabled = top_lm_enabled
         self._tok_s_deque = deque(maxlen=tok_s_window)
         self._ppl_ema = SmoothEMA(num_levels, alpha=0.9)
+        # Long-running totals (CPU)
         self.total_patches_processed_per_level = [0.0] * num_levels
         self.total_bytes_processed = 0
+        # Device for GPU accumulators will be set on first update
+        self._device: torch.device | None = None
         self.reset_window()
 
     # -------- Window accumulation --------
     def reset_window(self) -> None:
-        self.total_loss = 0.0
-        self.vq_loss = 0.0
-        self.avg_reconstruction_loss = 0.0
-        self.reconstruction_loss_details: Dict[str, float] = defaultdict(float)
+        # GPU accumulators (created lazily on first batch to match device)
+        self.total_loss_t = None
+        self.vq_loss_t = None
+        self.avg_reconstruction_loss_t = None
+        self.reconstruction_loss_details: Dict[str, torch.Tensor] = defaultdict(torch.Tensor)
 
-        self.avg_aux_lm_loss = 0.0
-        self.aux_lm_loss_details: Dict[str, float] = defaultdict(float)
+        self.avg_aux_lm_loss_t = None
+        self.aux_lm_loss_details: Dict[str, torch.Tensor] = defaultdict(torch.Tensor)
 
-        self.avg_top_code_lm_loss = 0.0
-        self.top_code_lm_loss_details: Dict[str, float] = defaultdict(float)
-        self.top_code_mse = 0.0
-        self.top_code_vq_loss = 0.0
+        self.avg_top_code_lm_loss_t = None
+        self.top_code_lm_loss_details: Dict[str, torch.Tensor] = defaultdict(torch.Tensor)
+        self.top_code_mse_t = None
+        self.top_code_vq_loss_t = None
 
-        self.compression_ratios = [0.0] * self.num_levels
-        self.input_seq_lengths = [0.0] * self.num_levels
-        self.output_seq_lengths = [0.0] * self.num_levels
+        self.compression_ratios_t: list[torch.Tensor | None] = [None] * self.num_levels
+        self.input_seq_lengths_t: list[torch.Tensor | None] = [None] * self.num_levels
+        self.output_seq_lengths_t: list[torch.Tensor | None] = [None] * self.num_levels
 
-        self.all_codebook_perplexities = [0.0] * self.num_levels
-        self.non_padded_tokens = 0
+        self.all_codebook_perplexities_t: list[torch.Tensor | None] = [None] * self.num_levels
+        self._ppl_sum_t: list[torch.Tensor | None] = [None] * self.num_levels
+        self.non_padded_tokens_t = None
         self.count = 0
 
         self._saw_compression = False
         self._saw_perplexities = False
 
     def update_from_batch(self, output: Dict, key_padding_mask: torch.Tensor) -> None:
-        self.total_loss += float(output["total_loss"])  # tensor -> python float
-        self.vq_loss += float(output["vq_loss"])
-        self.avg_reconstruction_loss += float(output["avg_reconstruction_loss"])
+        # Lazily capture device and create zero scalars
+        dev = output["total_loss"].device
+        if self._device is None:
+            self._device = dev
+        if self.total_loss_t is None:
+            zero = torch.zeros((), device=dev, dtype=torch.float32)
+            self.total_loss_t = zero.clone()
+            self.vq_loss_t = zero.clone()
+            self.avg_reconstruction_loss_t = zero.clone()
+            self.avg_aux_lm_loss_t = zero.clone()
+            self.avg_top_code_lm_loss_t = zero.clone()
+            self.top_code_mse_t = zero.clone()
+            self.top_code_vq_loss_t = zero.clone()
+            self.non_padded_tokens_t = zero.clone()
+            # initialise per-level lists
+            self.input_seq_lengths_t = [zero.clone() for _ in range(self.num_levels)]
+            self.output_seq_lengths_t = [zero.clone() for _ in range(self.num_levels)]
+            self.all_codebook_perplexities_t = [zero.clone() for _ in range(self.num_levels)]
+            self._ppl_sum_t = [zero.clone() for _ in range(self.num_levels)]
+
+        # Window counters on device; no host syncs here
+        self.total_loss_t = self.total_loss_t + output["total_loss"].detach()
+        self.vq_loss_t = self.vq_loss_t + output["vq_loss"].detach()
+        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + output["avg_reconstruction_loss"].detach()
         self.count += 1
-        self.non_padded_tokens += int((~key_padding_mask).sum().item())
+        self.non_padded_tokens_t = self.non_padded_tokens_t + (~key_padding_mask).sum()
 
         for k, v in output.get("reconstruction_loss_details", {}).items():
-            self.reconstruction_loss_details[k] += float(v)
+            prev = self.reconstruction_loss_details.get(k)
+            self.reconstruction_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
 
         if self.aux_lm_enabled and "avg_aux_lm_loss" in output:
-            self.avg_aux_lm_loss += float(output["avg_aux_lm_loss"])
+            self.avg_aux_lm_loss_t = self.avg_aux_lm_loss_t + output["avg_aux_lm_loss"].detach()
             for k, v in output.get("aux_lm_loss_details", {}).items():
-                self.aux_lm_loss_details[k] += float(v)
+                prev = self.aux_lm_loss_details.get(k)
+                self.aux_lm_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
 
         if self.top_lm_enabled and "avg_top_code_lm_loss" in output:
-            self.avg_top_code_lm_loss += float(output["avg_top_code_lm_loss"])
+            self.avg_top_code_lm_loss_t = self.avg_top_code_lm_loss_t + output["avg_top_code_lm_loss"].detach()
             for k, v in output.get("top_code_lm_loss_details", {}).items():
-                self.top_code_lm_loss_details[k] += float(v)
+                prev = self.top_code_lm_loss_details.get(k)
+                self.top_code_lm_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
                 if k == "top_code_mse":
-                    self.top_code_mse += float(v)
+                    self.top_code_mse_t = self.top_code_mse_t + v.detach()
                 elif k == "top_code_vq_loss":
-                    self.top_code_vq_loss += float(v)
+                    self.top_code_vq_loss_t = self.top_code_vq_loss_t + v.detach()
 
         if "compression_ratios" in output:
             self._saw_compression = True
-            for lvl, ratio in enumerate(output["compression_ratios"]):
-                self.compression_ratios[lvl] += float(ratio)
-
             # Per-level input/output lengths from compression results
             comp_steps = output.get("compression_results", {}).get("steps", [])
             for lvl, step in enumerate(comp_steps):
-                # (~padding).sum() counts non-padded tokens at compressor input
-                self.input_seq_lengths[lvl] += float((~step.input_padding_mask).sum().item())
-                self.output_seq_lengths[lvl] += float(step.patch_end_mask.sum().item())
+                self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + (~step.input_padding_mask).sum()
+                self.output_seq_lengths_t[lvl] = self.output_seq_lengths_t[lvl] + step.patch_end_mask.sum()
 
         if "all_codebook_perplexities" in output:
             self._saw_perplexities = True
             for lvl, ppl in enumerate(output["all_codebook_perplexities"]):
-                val = float(ppl) if isinstance(ppl, (float, int)) else float(ppl.item())
-                self.all_codebook_perplexities[lvl] += val
-                self._ppl_ema.update(lvl, val)
+                val = ppl if isinstance(ppl, torch.Tensor) else torch.tensor(float(ppl), device=dev)
+                self.all_codebook_perplexities_t[lvl] = self.all_codebook_perplexities_t[lvl] + val.detach()
+                # Accumulate raw sum; apply EMA only at log time to avoid per‑batch syncs
+                self._ppl_sum_t[lvl] = self._ppl_sum_t[lvl] + val.detach()
 
     # -------- Window summarization --------
     def throughput(self, duration_sec: float) -> WindowThroughput:
-        tokens_per_second = self.non_padded_tokens / duration_sec if duration_sec > 0 else 0.0
+        # Convert GPU scalars to CPU exactly once per window
+        tokens_processed = int(self.non_padded_tokens_t.item()) if self.non_padded_tokens_t is not None else 0
+        tokens_per_second = (tokens_processed / duration_sec) if duration_sec > 0 else 0.0
         self._tok_s_deque.append(tokens_per_second)
         avg_tok_s = sum(self._tok_s_deque) / len(self._tok_s_deque) if self._tok_s_deque else 0.0
 
-        patches_per_sec = [
-            (self.output_seq_lengths[lvl] / duration_sec) if duration_sec > 0 else 0.0 for lvl in range(self.num_levels)
-        ]
+        patches_processed_per_level: list[float] = []
+        patches_per_sec: list[float] = []
         for lvl in range(self.num_levels):
-            self.total_patches_processed_per_level[lvl] += self.output_seq_lengths[lvl]
+            lvl_count = (
+                float(self.output_seq_lengths_t[lvl].item()) if self.output_seq_lengths_t[lvl] is not None else 0.0
+            )
+            patches_processed_per_level.append(lvl_count)
+            patches_per_sec.append((lvl_count / duration_sec) if duration_sec > 0 else 0.0)
+            self.total_patches_processed_per_level[lvl] += lvl_count
 
-        self.total_bytes_processed += self.non_padded_tokens
+        self.total_bytes_processed += tokens_processed
 
         return WindowThroughput(
-            tokens_processed=self.non_padded_tokens,
+            tokens_processed=tokens_processed,
             tokens_per_second=tokens_per_second,
             avg_tokens_per_second=avg_tok_s,
-            patches_processed_per_level=self.output_seq_lengths[:],
+            patches_processed_per_level=patches_processed_per_level,
             patches_per_second_per_level=patches_per_sec,
         )
 
@@ -159,24 +191,24 @@ class TrainingMetrics:
             f"Epoch {epoch}/{num_epochs}",
             f"OptStep {global_step}",
             f"MB {minibatch_index}/{total_minibatches}",
-            f"Loss {self.total_loss / self.count:.4f}",
-            f"Reco {self.avg_reconstruction_loss / self.count:.4f}",
-            f"VQ {self.vq_loss / self.count:.4f}",
+            f"Loss {(self.total_loss_t / self.count).item():.4f}",
+            f"Reco {(self.avg_reconstruction_loss_t / self.count).item():.4f}",
+            f"VQ {(self.vq_loss_t / self.count).item():.4f}",
             f"Tok/s {short_num(avg_tok_s)}",
             f"Bytes {short_num(self.total_bytes_processed)}",
             f"ETA {format_duration(total_eta_sec)}",
         ]
 
         if self.aux_lm_enabled:
-            parts.append(f"AuxLM {self.avg_aux_lm_loss / self.count:.4f}")
+            parts.append(f"AuxLM {(self.avg_aux_lm_loss_t / self.count).item():.4f}")
 
         if self.top_lm_enabled:
             if self.count > 0:
-                parts.append(f"TopLM {self.avg_top_code_lm_loss / self.count:.4f}")
-            if self.top_code_mse:
-                parts.append(f"TopMSE {self.top_code_mse / self.count:.4f}")
-            if self.top_code_vq_loss:
-                parts.append(f"TopVQ {self.top_code_vq_loss / self.count:.4f}")
+                parts.append(f"TopLM {(self.avg_top_code_lm_loss_t / self.count).item():.4f}")
+            if self.top_code_mse_t is not None and float(self.top_code_mse_t.item()) != 0.0:
+                parts.append(f"TopMSE {(self.top_code_mse_t / self.count).item():.4f}")
+            if self.top_code_vq_loss_t is not None and float(self.top_code_vq_loss_t.item()) != 0.0:
+                parts.append(f"TopVQ {(self.top_code_vq_loss_t / self.count).item():.4f}")
 
         # Patches summary (skip level 0 in console as before)
         patch_log_parts = []
@@ -188,20 +220,39 @@ class TrainingMetrics:
         if patch_log_parts:
             parts.append("Patches " + ", ".join(patch_log_parts))
 
-        if self._saw_compression and len(self.compression_ratios) == self.num_levels:
-            ratios_str = ", ".join([f"{r / self.count:.2f}" for r in self.compression_ratios])
+        if self._saw_compression and len(self.output_seq_lengths_t) == self.num_levels and self.count > 0:
+            ratios = []
+            for lvl in range(self.num_levels):
+                in_len = self.input_seq_lengths_t[lvl] if self.input_seq_lengths_t[lvl] is not None else None
+                out_len = self.output_seq_lengths_t[lvl] if self.output_seq_lengths_t[lvl] is not None else None
+                if in_len is None or out_len is None:
+                    ratios.append("0.00")
+                else:
+                    ratios.append(f"{(out_len / (in_len + 1e-9)).item():.2f}")
+            ratios_str = ", ".join(ratios)
             parts.append(f"Ratios [{ratios_str}]")
 
+        # Update smoothed PPL from window averages (one sync per level per log event)
+        for lvl in range(self.num_levels):
+            if self._ppl_sum_t and self._ppl_sum_t[lvl] is not None and self.count > 0:
+                avg_val = (self._ppl_sum_t[lvl] / self.count).item()
+                self._ppl_ema.update(lvl, avg_val)
         ppl_str = ", ".join(
             f"{self._ppl_ema.values[lvl]:.4f}" if self._ppl_ema.ready[lvl] else "n/a" for lvl in range(self.num_levels)
         )
         parts.append(f"SmoothPPL [{ppl_str}]")
 
         for k, v in self.reconstruction_loss_details.items():
-            parts.append(f"{k}:{v / self.count:.4f}")
+            if isinstance(v, torch.Tensor):
+                parts.append(f"{k}:{(v / self.count).item():.4f}")
+            else:
+                parts.append(f"{k}:{float(v) / self.count:.4f}")
         if self.aux_lm_enabled:
             for k, v in self.aux_lm_loss_details.items():
-                parts.append(f"{k}:{v / self.count:.4f}")
+                if isinstance(v, torch.Tensor):
+                    parts.append(f"{k}:{(v / self.count).item():.4f}")
+                else:
+                    parts.append(f"{k}:{float(v) / self.count:.4f}")
 
         return parts
 
@@ -216,13 +267,13 @@ class TrainingMetrics:
             return {}
 
         md: Dict[str, float] = {
-            "loss/total_avg_accum": self.total_loss / self.count,
-            "loss/vq_avg_accum": self.vq_loss / self.count,
-            "loss/reconstruction_avg_accum": self.avg_reconstruction_loss / self.count,
+            "loss/total_avg_accum": float((self.total_loss_t / self.count).item()),
+            "loss/vq_avg_accum": float((self.vq_loss_t / self.count).item()),
+            "loss/reconstruction_avg_accum": float((self.avg_reconstruction_loss_t / self.count).item()),
             "performance/tokens_per_sec": tokens_per_second,
-            "loss/top_code_lm_avg_accum": self.avg_top_code_lm_loss / self.count if self.top_lm_enabled else 0.0,
-            "loss/top_code_mse_avg_accum": self.top_code_mse / self.count if self.top_lm_enabled else 0.0,
-            "loss/top_code_vq_avg_accum": self.top_code_vq_loss / self.count if self.top_lm_enabled else 0.0,
+            "loss/top_code_lm_avg_accum": float((self.avg_top_code_lm_loss_t / self.count).item()) if self.top_lm_enabled else 0.0,
+            "loss/top_code_mse_avg_accum": float((self.top_code_mse_t / self.count).item()) if self.top_lm_enabled else 0.0,
+            "loss/top_code_vq_avg_accum": float((self.top_code_vq_loss_t / self.count).item()) if self.top_lm_enabled else 0.0,
             "learning_rate": learning_rate,
         }
 
@@ -232,23 +283,32 @@ class TrainingMetrics:
             md[f"performance/patches_total_L{lvl}"] = self.total_patches_processed_per_level[lvl]
 
         for k, v in self.top_code_lm_loss_details.items():
-            md[f"loss_detail_avg_accum/{k}"] = v / self.count
+            md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
         for k, v in self.reconstruction_loss_details.items():
-            md[f"loss_detail_avg_accum/{k}"] = v / self.count
+            md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
         if self.aux_lm_enabled:
-            md["loss/aux_lm_avg_accum"] = self.avg_aux_lm_loss / self.count
+            md["loss/aux_lm_avg_accum"] = float((self.avg_aux_lm_loss_t / self.count).item())
             for k, v in self.aux_lm_loss_details.items():
-                md[f"loss_detail_avg_accum/{k}"] = v / self.count
+                md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
 
         if self._saw_compression:
             for lvl in range(self.num_levels):
-                md[f"compression_avg/ratio_L{lvl}"] = self.compression_ratios[lvl] / self.count
-                md[f"compression_avg/input_len_L{lvl}"] = self.input_seq_lengths[lvl] / self.count
-                md[f"compression_avg/output_len_L{lvl}"] = self.output_seq_lengths[lvl] / self.count
+                in_len_t = self.input_seq_lengths_t[lvl]
+                out_len_t = self.output_seq_lengths_t[lvl]
+                in_avg = float(((in_len_t / self.count) if in_len_t is not None else torch.tensor(0.0)).item())
+                out_avg = float(((out_len_t / self.count) if out_len_t is not None else torch.tensor(0.0)).item())
+                ratio_avg = float((
+                    (out_len_t / (in_len_t + 1e-9)) if (in_len_t is not None and out_len_t is not None) else torch.tensor(0.0)
+                ).item())
+                md[f"compression_avg/ratio_L{lvl}"] = ratio_avg
+                md[f"compression_avg/input_len_L{lvl}"] = in_avg
+                md[f"compression_avg/output_len_L{lvl}"] = out_avg
 
         if self._saw_perplexities:
             for lvl in range(self.num_levels):
-                md[f"vq_metrics_avg/perplexity_L{lvl}"] = self.all_codebook_perplexities[lvl] / self.count
+                ppl_t = self.all_codebook_perplexities_t[lvl]
+                ppl_avg = float(((ppl_t / self.count) if ppl_t is not None else torch.tensor(0.0)).item())
+                md[f"vq_metrics_avg/perplexity_L{lvl}"] = ppl_avg
                 if codebook_sizes is not None:
                     md[f"vq_metrics/codebook_size_L{lvl}"] = int(codebook_sizes[lvl])
         for lvl in range(self.num_levels):
