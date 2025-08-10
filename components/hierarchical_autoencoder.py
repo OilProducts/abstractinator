@@ -375,9 +375,10 @@ class HierarchicalAutoencoder(nn.Module):
             all_compressor_input_tokens_list.append(current_input_tokens)  # Store input for aux LM loss
             all_compressor_input_kpms_list.append(current_kpm)  # Store KPM for aux LM loss
             if current_kpm is not None:
-                input_seq_len = (~current_kpm).sum(dim=1).float().mean().item()
+                # Keep as device scalar to avoid host syncs
+                input_seq_len = (~current_kpm).sum(dim=1).float().mean()
             else:
-                input_seq_len = float(current_input_tokens.size(1))
+                input_seq_len = tokens.new_tensor(float(current_input_tokens.size(1)), dtype=torch.float32)
             all_input_seq_lengths.append(input_seq_len)
 
             comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
@@ -401,9 +402,9 @@ class HierarchicalAutoencoder(nn.Module):
 
             if comp_out.valid_mask is not None:
                 # Effective output length based on valid segments * num_queries
-                output_seq_len = (comp_out.valid_mask.sum(dim=1) * num_q_this_level).float().mean().item()
+                output_seq_len = (comp_out.valid_mask.sum(dim=1) * num_q_this_level).float().mean()
             else:
-                output_seq_len = float(comp_out.vq_indices.size(1))
+                output_seq_len = tokens.new_tensor(float(comp_out.vq_indices.size(1)), dtype=torch.float32)
             all_output_seq_lengths.append(output_seq_len)
 
             current_input_tokens = comp_out.vq_indices
@@ -424,11 +425,15 @@ class HierarchicalAutoencoder(nn.Module):
             else:
                 current_kpm = None
 
-        compression_ratios = [
-            out_len / in_len if in_len > 0 else 0.0
-            for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths)
-        ]
-        compression_ratios = [tokens.new_tensor(r, dtype=torch.float32) for r in compression_ratios]
+        # Compute ratios on-device to prevent CPU-GPU synchronization
+        compression_ratios = []
+        for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths):
+            # in_len/out_len may be tensors or Python floats wrapped above; coerce to device tensors
+            in_t = in_len if isinstance(in_len, torch.Tensor) else tokens.new_tensor(float(in_len), dtype=torch.float32)
+            out_t = out_len if isinstance(out_len, torch.Tensor) else tokens.new_tensor(float(out_len), dtype=torch.float32)
+            # Guard against division by zero
+            ratio = out_t / (in_t + 1e-9)
+            compression_ratios.append(ratio)
 
         return {
             'all_vq_indices': all_vq_indices_list,

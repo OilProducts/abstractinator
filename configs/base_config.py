@@ -159,7 +159,7 @@ class ExpConfig:
     sequence_length: int = 1024
     num_epochs: int = 1
     max_steps: Optional[int] = None
-    log_interval: int = 1
+    log_interval: int = 10
     gradient_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 1  # 8
     scheduler_type: str = "cosine_with_min_lr"

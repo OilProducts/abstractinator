@@ -56,6 +56,8 @@ class VectorQuantizer(nn.Module):
             self.max_codes_to_reset_pct = max_codes_to_reset_pct
             self.min_usage_threshold = 1.0
             self.register_buffer("steps_since_last_reset", torch.tensor(0, dtype=torch.int64))
+            # Python mirror to avoid CUDA scalar sync on condition checks
+            self._steps_since_last_reset_py: int = 0
 
             # Buffer settings
             self.replacement_buffer_size = replacement_buffer_size
@@ -66,6 +68,9 @@ class VectorQuantizer(nn.Module):
             )
             self.register_buffer("buffer_idx", torch.tensor(0, dtype=torch.long))
             self.register_buffer("buffer_is_full", torch.tensor(False, dtype=torch.bool))
+            # Python mirrors to avoid reading CUDA scalars on the host
+            self._buffer_idx_py: int = 0
+            self._buffer_full_py: bool = False
 
         self.codebook = nn.Parameter(torch.randn(K, D))
         if ema:
@@ -82,29 +87,42 @@ class VectorQuantizer(nn.Module):
 
         n_new = new_vectors.size(0)
         buff_size = self.replacement_buffer_size
-        current_idx = self.buffer_idx.item()
+        # Avoid reading CUDA scalar with .item(); use Python mirror
+        current_idx = int(self._buffer_idx_py)
+
+        # Ensure device match for the copy to avoid implicit sync paths
+        dest_dev = self.replacement_buffer.device
+        src = new_vectors.to(dest_dev, non_blocking=True)
 
         if n_new >= buff_size:
-            self.replacement_buffer.copy_(new_vectors)
+            self.replacement_buffer.copy_(src)
             self.buffer_is_full.fill_(True)
+            self._buffer_full_py = True
+            self._buffer_idx_py = 0
+            self.buffer_idx.zero_()
         else:
             space_left = buff_size - current_idx
             if n_new < space_left:
-                self.replacement_buffer[current_idx : current_idx + n_new] = new_vectors
-                self.buffer_idx.add_(n_new)
+                self.replacement_buffer[current_idx : current_idx + n_new] = src
+                self._buffer_idx_py += n_new
+                self.buffer_idx.fill_(self._buffer_idx_py)
             else:
-                self.replacement_buffer[current_idx:] = new_vectors[:space_left]
-                self.replacement_buffer[: n_new - space_left] = new_vectors[space_left:]
-                self.buffer_idx.fill_(n_new - space_left)
+                self.replacement_buffer[current_idx:] = src[:space_left]
+                self.replacement_buffer[: n_new - space_left] = src[space_left:]
+                self._buffer_idx_py = n_new - space_left
+                self.buffer_idx.fill_(self._buffer_idx_py)
                 self.buffer_is_full.fill_(True)
+                self._buffer_full_py = True
 
     @torch.no_grad()
     def _reset_dead_codes(self):
         """Resets dead codes using fast random sampling from the buffer."""
-        if not self.buffer_is_full and self.buffer_idx == 0:
+        if not self._buffer_full_py and self._buffer_idx_py == 0:
             return
 
-        source_vectors = self.replacement_buffer if self.buffer_is_full else self.replacement_buffer[: self.buffer_idx]
+        source_vectors = (
+            self.replacement_buffer if self._buffer_full_py else self.replacement_buffer[: self._buffer_idx_py]
+        )
         num_available_replacements = source_vectors.size(0)
 
         dead_code_candidates_indices = (self.ema_cluster_size < self.min_usage_threshold).nonzero(as_tuple=True)[0]
@@ -179,9 +197,12 @@ class VectorQuantizer(nn.Module):
                 self._ema_update(encodings, flat_input)
 
             if self.reset_codes:
-                self.steps_since_last_reset.add_(1)
-                if self.steps_since_last_reset >= self.reset_interval:
+                # Maintain Python counter to avoid CUDA scalar sync in condition
+                self._steps_since_last_reset_py += 1
+                self.steps_since_last_reset.fill_(self._steps_since_last_reset_py)
+                if self._steps_since_last_reset_py >= self.reset_interval:
                     self._reset_dead_codes()
+                    self._steps_since_last_reset_py = 0
                     self.steps_since_last_reset.zero_()
 
         if self.ema:
