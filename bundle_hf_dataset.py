@@ -49,18 +49,6 @@ Dataset: {dataset}
 Config:  {config or "<none>"}
 Splits:  {", ".join(splits)}
 
-Two ways to use this bundle on an air-gapped machine:
-
-A) No code changes (recommended)
-   1) Set env vars before running your training script:
-        export HF_DATASETS_CACHE="{(out_dir/'cache').resolve()}"
-        export HF_DATASETS_OFFLINE=1
-   2) Keep your existing `load_dataset("{dataset}", name={json.dumps(config)}, split=...)`.
-
-B) Explicit load-from-disk (one-line change)
-   from datasets import load_from_disk
-   raw_dataset = load_from_disk("{(out_dir/'exports'/'<split>').resolve()}")
-
 Notes:
 - The exports/ are saved with `save_to_disk` per split.
 - The cache/ contains the processed Arrow shards so `load_dataset` works offline.
