@@ -91,6 +91,7 @@ class CompressorLevelConfig:
     codebook_size: int = 8192
     beta: float = 1.0
     vq_reset_interval: int = 250
+    vq_depth: int = 1
     entropy_delta: float = 0.2
     entropy_abs_threshold: Optional[float] = None
     target_compression_ratio: Optional[List[float]] = None

@@ -8,10 +8,49 @@ from torch import Tensor
 
 from .byte_segment_compressor import ByteSegmentCompressor, CompressorOutput
 from .code_sequence_transformer import CodeSequenceTransformer
-from .expander import CodeExpander, DecoderOnlyExpander
+from .expander import CodeExpander, DecoderOnlyExpanderRVQ
+from .vector_quantizer import ComposedIndexCodec
 
 logger = logging.getLogger(__name__)
 
+
+def _rvq_factored_ce(
+        stage_logits: List[torch.Tensor],  # length=depth, each (B,L,K)
+        special_logits: Optional[torch.Tensor],  # (B,L,S) or None
+        targets: torch.Tensor,  # (B,L) composed ids
+        codec: ComposedIndexCodec,
+        kpm: Optional[torch.Tensor],  # (B,L) True==PAD
+) -> torch.Tensor:
+    device = targets.device
+    B, L = targets.shape
+    digits, is_special = codec.decompose(targets)  # digits: list of (B,L)
+    loss = torch.zeros((), device=device)
+
+    # specials
+    if is_special.any():
+        assert special_logits is not None, "Model must provide 'special_logits' if specials exist in targets."
+        logp_sp = F.log_softmax(special_logits, dim=-1)  # (B,L,S)
+        sp_local = codec.special_local_index(targets)  # (B,L)
+        nll_sp = -logp_sp.gather(-1, sp_local.unsqueeze(-1)).squeeze(-1)  # (B,L)
+        loss += (nll_sp[is_special]).mean() if (~is_special).any() else nll_sp.mean()
+
+    # non-specials: sum CE across stages
+    if (~is_special).any():
+        mask_ns = ~is_special
+        tot = torch.zeros_like(targets, dtype=stage_logits[0].dtype)
+        for s, logits_s in enumerate(stage_logits):
+            logp = F.log_softmax(logits_s, dim=-1)  # (B,L,K)
+            nll_s = -logp.gather(-1, digits[s].unsqueeze(-1)).squeeze(-1)  # (B,L)
+            tot = tot + nll_s
+        # apply KPM if provided
+        if kpm is not None:
+            eff_mask = mask_ns & (~kpm)
+            denom = eff_mask.sum().clamp(min=1)
+            loss += (tot[eff_mask]).sum() / denom
+        else:
+            loss += tot[mask_ns].mean()
+
+    return loss
 
 def _fix_len(
     seq: torch.Tensor,  # (B, S, D) *or* (B, S)
@@ -44,13 +83,13 @@ def _fix_len(
     return seq, kpm
 
 
-def _trim_trailing_pad(seq, kpm):
-    """Remove all-pad suffix so we append inside the fixed window."""
-    if kpm is None:
-        return seq, kpm
-    # every batch item has identical length because we pad uniformly
-    eff_len = int((~kpm).sum(dim=1).max().item())
-    return seq[:, :eff_len, ...], kpm[:, :eff_len]
+# def _trim_trailing_pad(seq, kpm):
+#     """Remove all-pad suffix so we append inside the fixed window."""
+#     if kpm is None:
+#         return seq, kpm
+#     # every batch item has identical length because we pad uniformly
+#     eff_len = int((~kpm).sum(dim=1).max().item())
+#     return seq[:, :eff_len, ...], kpm[:, :eff_len]
 
 
 class HierarchicalAutoencoder(nn.Module):
@@ -124,6 +163,11 @@ class HierarchicalAutoencoder(nn.Module):
 
         for i in range(num_levels):
             config = compressor_level_configs[i]
+            # Compute effective codebook size (per-stage K raised to depth)
+            vq_depth = int(config.get('vq_depth', 1))
+            per_stage_k = int(config['codebook_size'])
+            effective_k = per_stage_k ** vq_depth if vq_depth >= 2 else per_stage_k
+
             compressor = ByteSegmentCompressor(
                 vocab_size=current_input_vocab_size,
                 dim=config['dim'],
@@ -137,7 +181,8 @@ class HierarchicalAutoencoder(nn.Module):
                 num_lm_encoder_layers=config.get('num_lm_encoder_layers'),
                 num_compression_encoder_layers=config.get('num_compression_encoder_layers'),
                 num_queries=config['num_queries'],
-                codebook_size=config['codebook_size'],
+                codebook_size=per_stage_k,
+                vq_depth=vq_depth,
                 beta=config['beta'],
                 vq_reset_interval=config.get('vq_reset_interval', 250),
                 entropy_delta=config.get('entropy_delta', 0.2),
@@ -146,8 +191,8 @@ class HierarchicalAutoencoder(nn.Module):
                 output_length=config.get('output_length'),
             )
             self.compressors.append(compressor)
-            self.actual_codebook_sizes.append(config['codebook_size'])
-            current_input_vocab_size = config['codebook_size']
+            self.actual_codebook_sizes.append(effective_k)
+            current_input_vocab_size = effective_k
 
             target_ratio = config.get('target_compression_ratio')
             if isinstance(target_ratio, list):
@@ -212,18 +257,22 @@ class HierarchicalAutoencoder(nn.Module):
             max_len = exp_cfg.get("max_len", 2048)
 
             if exp_cfg.get("use_decoder_only", True):
-                expander = DecoderOnlyExpander(
-                    K_hi=k_hi,
-                    K_lo=k_lo,
-                    D=exp_dim,
+                expander = DecoderOnlyExpanderRVQ(
+                    lo_vq=self.compressors[i-1].vq if i > 0 else None,
+                    hi_vq=self.compressors[i].vq,
+                    K_lo=k_lo if i==0 else None,
+                    D=comp_cfg["dim"],
                     N_dec=n_dec,
                     H=exp_heads,
                     # cross_window=comp_cfg.get("compression_window", comp_cfg.get("window", 128)),
                     cross_window=1,
+                    residual_conditioning=True,
+                    use_sqdist_logits=True,
+                    predict_specials=True,
                     eos_id=eos_id,
                     max_len=max_len,
-                    hi_dim=exp_cfg.get("hi_dim", 256),
-                    lo_dim=exp_cfg.get("lo_dim", 128),
+                    # hi_dim=exp_cfg.get("hi_dim", 256),
+                    # lo_dim=exp_cfg.get("lo_dim", 128),
                 )
             else:
                 expander = CodeExpander(
@@ -439,6 +488,8 @@ class HierarchicalAutoencoder(nn.Module):
             'all_vq_indices': all_vq_indices_list,
             'all_vq_embeddings': all_vq_embeddings,
             'all_pre_vq_embeddings': all_pre_vq_embeddings_list,
+            # Backward-compat alias expected by some tests
+            'all_pre_vq': all_pre_vq_embeddings_list,
             'all_vq_loss': all_vq_loss_list,
             'vq_loss': total_vq_loss,
             'final_key_padding_mask': current_kpm,  # KPM for top_codes
@@ -455,6 +506,30 @@ class HierarchicalAutoencoder(nn.Module):
             'all_first_byte_idx': all_first_byte_idx,
             'steps': steps,
         }
+
+    # Utility for tests: pad top-LM inputs to a target length if requested in
+    # the top transformer config.
+    def _prepare_top_lm_inputs(
+        self, embeddings: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Pad or clip embeddings/key mask to the ``pad_to_length`` if provided.
+
+        Args:
+            embeddings: (B, S, D) pre‑VQ embeddings from the top compressor.
+            key_padding_mask: Optional (B, S) mask; True marks padding.
+
+        Returns:
+            Tuple of possibly padded/clipped ``(embeddings, key_padding_mask)``.
+        """
+        if not self.top_transformer_config:
+            return embeddings, key_padding_mask
+
+        tgt_len = self.top_transformer_config.get("pad_to_length")
+        if tgt_len is None:
+            return embeddings, key_padding_mask
+
+        emb_fixed, kpm_fixed = _fix_len(embeddings, key_padding_mask, int(tgt_len), pad_val=0.0)
+        return emb_fixed, kpm_fixed
 
     def decompress(
         self,
@@ -556,7 +631,8 @@ class HierarchicalAutoencoder(nn.Module):
                     seg_ids=compression_results["all_seg_ids"][self.num_levels - 1 - i],
                 )
 
-                all_output_logits_list.append(exp_out_dict['logits'])
+                all_output_logits_list.append(exp_out_dict['stage_logits'])
+                # TODO: What do with special logits?
 
                 if i < self.num_levels - 1:
                     if teacher_forcing_embeddings is not None:
@@ -567,7 +643,7 @@ class HierarchicalAutoencoder(nn.Module):
                     current_src_kpm = tgt_kpm_for_this_level
             else:  # Autoregressive generation
                 comp_step = compression_results["steps"][self.num_levels - 1 - i]
-                if isinstance(expander, DecoderOnlyExpander):
+                if isinstance(expander, DecoderOnlyExpanderRVQ):
                     generated_tokens = expander.generate(
                         codes_hi=current_input_codes_hi,
                         codes_lo=comp_step.input_sequence,
@@ -694,12 +770,20 @@ class HierarchicalAutoencoder(nn.Module):
         )
         return avg, total_weighted, details
 
+
+
     def _compute_top_code_lm_loss(
         self, compression_results: Dict[str, Any], kpm_for_top_codes: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         device = compression_results['all_pre_vq_embeddings'][-1].device
         avg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
+
+        if (self.code_sequence_transformer is None or
+                self.top_lm_loss_weight <= 0 or
+                compression_results['all_pre_vq'][-1].numel() == 0):
+            return avg_loss, details
+
 
         if (
             self.code_sequence_transformer is not None
@@ -709,14 +793,14 @@ class HierarchicalAutoencoder(nn.Module):
             # cont = compression_results['all_pre_vq'][-1]
             cont = compression_results['all_vq_embeddings'][-1]
             codes = compression_results['all_vq_indices'][-1]
-            kpm = kpm_for_top_codes  # (B, S?) or None
+            vq = self.compressors[-1].vq  # could be single-stage or MS-RVQ
 
             transformer_input = (
                 cont if self.top_transformer_continuous else F.embedding(codes, self.compressors[-1].vq.codebook)
             )
             cst_out = self.code_sequence_transformer(
                 input_embeddings=transformer_input,
-                key_padding_mask=kpm,
+                key_padding_mask=kpm_for_top_codes,
             )
             preds_pre_vq = cst_out['predictions_pre_vq']
             vq_loss_top = cst_out['vq_loss']
@@ -726,30 +810,91 @@ class HierarchicalAutoencoder(nn.Module):
                 ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
             else:
                 pred = preds_pre_vq[:, :-1, :]
-                mask = kpm[:, 1:] if kpm is not None else None
+                mask = kpm_for_top_codes[:, 1:] if kpm_for_top_codes is not None else None
 
+                target_codes = codes[:, 1:]
                 target_cont = cont[:, 1:, :]
                 mse_per_tok = F.mse_loss(pred, target_cont, reduction='none').mean(dim=-1)
 
-                target_codes = codes[:, 1:]
-                codebook = self.compressors[-1].vq.codebook
-                logits = -torch.cdist(pred, codebook)
-                ce_per_tok = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), target_codes.reshape(-1), reduction='none'
-                ).view_as(target_codes)
+                # --- CE on discrete codes ---
+                if hasattr(vq, 'depth') and vq.depth > 1:
+                    # Factorized CE over stages with residual conditioning in d_c
+                    digits, special_mask = vq.codec.decompose(target_codes)  # list[(B,S-1)], (B,S-1)
+                    valid = ~special_mask
+                    if mask is not None:
+                        valid = valid & (~mask)
+                    if valid.any():
+                        y0 = vq.down(pred)  # (B,S-1,d_c)
+                        r = y0
+                        total_nll = torch.zeros_like(mse_per_tok)  # (B,S-1)
+                        for s in range(vq.depth):
+                            W = vq.stage_codebook(s)  # (K, d_c)
+                            # -||r-e||^2 logits (faithful to VQ assignment)
+                            r2 = (r * r).sum(-1, keepdim=True)  # (B,S-1,1)
+                            e2 = (W * W).sum(-1).view(1, 1, -1)  # (1,1,K)
+                            dot = F.linear(r, W)  # (B,S-1,K)
+                            logits_s = -(r2 - 2 * dot + e2)  # (B,S-1,K)
 
-                if mask is not None:
-                    loss_mask = ~mask
-                    valid_targets = loss_mask.sum()
-                    if valid_targets > 0:
-                        mse_loss = (mse_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
-                        ce_loss = (ce_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
+                            nll_s = F.cross_entropy(
+                                logits_s.reshape(-1, logits_s.size(-1)),
+                                digits[s].reshape(-1),
+                                reduction='none'
+                            ).view_as(mse_per_tok)  # (B,S-1)
+                            total_nll = total_nll + nll_s
+
+                            # teacher residual update (only matters on valid positions)
+                            e_s = F.embedding(digits[s], W)  # (B,S-1,d_c)
+                            r = r - e_s.detach()
+
+                        ce_per_tok = total_nll
+                        # mask invalids
+                        denom = valid.sum().clamp(min=1)
+                        ce_loss = (ce_per_tok[valid]).sum() / denom
+                        mse_loss = (mse_per_tok[valid]).sum() / denom
                     else:
-                        mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-                        ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                        ce_loss = torch.tensor(0., device=device)
+                        mse_loss = torch.tensor(0., device=device)
                 else:
-                    mse_loss = mse_per_tok.mean()
-                    ce_loss = ce_per_tok.mean()
+                    # Legacy single-stage VQ: flat logits vs one codebook
+                    codebook = vq.codebook  # (K,D)
+                    # Use -||pred - e||^2 (works even if D differs)
+                    r2 = (pred * pred).sum(-1, keepdim=True)
+                    e2 = (codebook * codebook).sum(-1).view(1, 1, -1)
+                    dot = pred @ codebook.t()
+                    logits = -(r2 - 2 * dot + e2)  # (B,S-1,K)
+                    ce_per_tok = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        target_codes.reshape(-1),
+                        reduction='none'
+                    ).view_as(mse_per_tok)
+
+                    if mask is not None:
+                        valid = ~mask
+                        denom = valid.sum().clamp(min=1)
+                        mse_loss = (mse_per_tok[valid]).sum() / denom
+                        ce_loss = (ce_per_tok[valid]).sum() / denom
+                    else:
+                        mse_loss = mse_per_tok.mean()
+                        ce_loss = ce_per_tok.mean()
+
+                # codebook = self.compressors[-1].vq.stage_codebook(0)
+                # logits = -torch.cdist(pred, codebook)
+                # ce_per_tok = F.cross_entropy(
+                #     logits.view(-1, logits.size(-1)), target_codes.reshape(-1), reduction='none'
+                # ).view_as(target_codes)
+
+                # if mask is not None:
+                #     loss_mask = ~mask
+                #     valid_targets = loss_mask.sum()
+                #     if valid_targets > 0:
+                #         mse_loss = (mse_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
+                #         ce_loss = (ce_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
+                #     else:
+                #         mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                #         ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                # else:
+                #     mse_loss = mse_per_tok.mean()
+                #     ce_loss = ce_per_tok.mean()
 
             avg_loss = self.top_lm_mse_weight * mse_loss + self.top_lm_ce_weight * ce_loss + vq_loss_top
             details['top_code_mse'] = mse_loss
@@ -815,12 +960,12 @@ class HierarchicalAutoencoder(nn.Module):
         targets: List[torch.Tensor],
         target_kpms: List[Optional[torch.Tensor]],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        device = all_logits[0].device if all_logits else torch.device('cpu')
+        device = all_logits[0][0].device if all_logits else torch.device('cpu')
         total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         details: Dict[str, torch.Tensor] = {}
 
         for i in range(self.num_levels):
-            logits_i = all_logits[i]
+            logits_i = all_logits[i][0]
             target_i = targets[i]
             target_kpm_i = target_kpms[i]
 
