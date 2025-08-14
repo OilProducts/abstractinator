@@ -40,7 +40,7 @@ LOGGER_NAME = "abstractinator.train"
 torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
-torch._dynamo.config.recompile_limit = 512
+# torch._dynamo.config.recompile_limit = 512
 torch._dynamo.config.capture_scalar_outputs = True
 
 
@@ -266,11 +266,11 @@ def train_loop(
 
     logger = logging.getLogger(LOGGER_NAME)
 
-    mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
-    mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
-    mlflow_client = MlflowClient()
-    mlflow_run_id = mlflow_run.info.run_id
-    mlflow_logger = MlflowBatchLogger(mlflow_client, mlflow_run_id, exp_config.mlflow_batch_interval)
+    # mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
+    # mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
+    # mlflow_client = MlflowClient()
+    # mlflow_run_id = mlflow_run.info.run_id
+    # mlflow_logger = MlflowBatchLogger(mlflow_client, mlflow_run_id, exp_config.mlflow_batch_interval)
 
     tokenizer = ByteLevelTokenizer(
         add_bos=True,
@@ -347,7 +347,7 @@ def train_loop(
         else {},
     )
 
-    mlflow.log_params(exp_config.as_dict())
+    # mlflow.log_params(exp_config.as_dict())
 
     model.train()
     if args.load_base_from:
@@ -365,6 +365,29 @@ def train_loop(
     )
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
+    model = torch.compile(model)
+
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            # record_shapes=True,
+            # with_stack=True,
+            profile_memory=True,
+            # with_modules=True,
+    ) as prof:
+        for _ in range(50):  # run ~50 optimizer steps
+            batch = next(iter(train_dataloader))
+            tokens = batch["input_ids"].to(device, non_blocking=True)
+            key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
+            out = model(tokens, key_padding_mask=key_padding_mask)
+            loss = out["total_loss"] / exp_config.gradient_accumulation_steps
+            loss.backward()
+            optimizer.step();
+            optimizer.zero_grad()
+
+    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
+    prof.export_chrome_trace("trace.json")
 
     for epoch in range(start_epoch, exp_config.num_epochs):
         logger.info("\n--- Epoch %s/%s ---", epoch + 1, exp_config.num_epochs)
@@ -437,7 +460,7 @@ def train_loop(
                             patches_per_second=patches_per_second,
                             codebook_sizes=codebook_sizes,
                         )
-                        mlflow_logger.log(global_step, metrics_dict)
+                        # mlflow_logger.log(global_step, metrics_dict)
 
                 metrics.reset_window()
                 time_of_last_optimizer_step_event = current_time
@@ -466,8 +489,8 @@ def train_loop(
                         logger.info("Reconstructed Text:\n%s", reconstructed_text)
                         logger.info("------------------------------------------")
 
-                        mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
-                        mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
+                        # mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
+                        # mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
 
                     model.train()
                     if args.load_base_from:
@@ -506,8 +529,8 @@ def train_loop(
     logger.info("Training finished.")
     if exp_config.save_base_components_path:
         save_base_components(model, exp_config.save_base_components_path)
-    mlflow_logger.flush()
-    mlflow.end_run()
+    # mlflow_logger.flush()
+    # mlflow.end_run()
 
 
 def main() -> None:

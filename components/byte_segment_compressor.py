@@ -8,7 +8,7 @@ import torch.nn as nn
 from .learned_query_attention import LearnedQueryAttention
 from .mla import SlidingWindowMLATransformerBlock
 from .utils import _compiled, build_segment_queries_mask, entropy_segments, token_entropy
-from .vector_quantizer import VectorQuantizer
+from .vector_quantizer import VectorQuantizer, MultiStageResidualVQ
 
 
 @dataclass
@@ -28,7 +28,7 @@ class CompressorOutput:
 
 
 # If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
-@torch.compile(dynamic=True)
+# @torch.compile
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
@@ -73,7 +73,9 @@ class ByteSegmentCompressor(nn.Module):
         num_lm_encoder_layers: int | None = None,
         num_compression_encoder_layers: int | None = None,
         num_queries: int = 1,  # L: Number of queries per segment for the pooler
-        codebook_size: int = 512,  # K: Number of codes in VQ codebook
+        codebook_size: int = 512,  # K: Number of codes in VQ codebook (per stage if vq_depth>1)
+        vq_depth: int = 1,  # Number of residual VQ stages; 1 means single-stage VQ
+        vq_d_c: int | None = None,  # Compressed dim used inside residual VQ
         beta: float = 0.25,  # Beta for VQ commitment loss
         vq_reset_interval: int = 250,
         entropy_delta: float = 0.2,
@@ -86,7 +88,7 @@ class ByteSegmentCompressor(nn.Module):
         self.entropy_delta = entropy_delta
         self.entropy_abs_threshold = entropy_abs_threshold
         self.use_flex_attention = use_flex_attention
-        self.output_length = output_length
+        self.output_length = output_length if output_length is not None else 512
 
         if lm_window is None:
             lm_window = window
@@ -169,12 +171,24 @@ class ByteSegmentCompressor(nn.Module):
             num_heads=heads,
         )
 
-        self.vq = VectorQuantizer(
-            K=codebook_size,
-            D=dim,
-            beta=beta,
-            reset_interval=vq_reset_interval,
-        )
+        if vq_depth is not None: # and vq_depth >= 2:
+            # Use residual multi-stage VQ with a shared compressed space
+            d_c = vq_d_c if vq_d_c is not None else (kv_comp_dim if kv_comp_dim is not None else 64)
+            self.vq = MultiStageResidualVQ(
+                K=codebook_size,
+                D=dim,
+                depth=int(vq_depth),
+                d_c=int(d_c),
+                beta=beta,
+                reset_interval=vq_reset_interval,
+            )
+        else:
+            self.vq = VectorQuantizer(
+                K=codebook_size,
+                D=dim,
+                beta=beta,
+                reset_interval=vq_reset_interval,
+            )
 
     def forward(self, token_ids: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> CompressorOutput:
         """
@@ -246,14 +260,50 @@ class ByteSegmentCompressor(nn.Module):
         # seg_id now maps each token position to a segment index.
 
         # ── 2b. Build queries & tensor mask ─────────────
+        L = self.num_queries_per_segment
+        Q_max = (int(self.output_length) // max(1, L)) * max(1, L)  # Ensure output length multiple of L
         queries, seg_attn_mask, valid_segments_mask = build_segment_queries_mask(
             seg_id,
             self.pooler.query_template,
             self.pooler.num_heads,
+            Q_max=Q_max,
         )
         # queries: (B, S_hat*L, D) - Tiled learned queries for each potential segment.
         # seg_attn_mask: (B*H, S_hat*L, S_original) - Masks attention outside segments.
         # valid_segments_mask: (B, S_hat) - Indicates which of S_hat segments are real.
+
+        B, Q_cur, D = queries.shape
+        S = token_ids.size(1)
+        H = self.pooler.num_heads
+        Q_max = int(self.output_length)  # already a config value
+
+        # Make seg_attn_mask & queries fixed-size on-GPU
+        dev = hidden.device
+        if queries.device != dev:
+            queries = queries.to(dev, non_blocking=True)
+        if seg_attn_mask.device != dev:
+            seg_attn_mask = seg_attn_mask.to(dev, non_blocking=True)
+        if valid_segments_mask.device != dev:
+            valid_segments_mask = valid_segments_mask.to(dev, non_blocking=True)
+
+        if Q_cur < Q_max:
+            # pad queries with zeros
+            pad_q = torch.zeros(B, Q_max - Q_cur, D, device=dev, dtype=queries.dtype)
+            queries = torch.cat([queries, pad_q], dim=1)
+
+            # pad attn mask with True (disallow attention for padded queries)
+            pad_m = torch.ones(B * H, Q_max - Q_cur, S, device=dev, dtype=seg_attn_mask.dtype)
+            seg_attn_mask = torch.cat([seg_attn_mask, pad_m], dim=1)
+
+            # pad valid_segments_mask with False (no real segments)
+            pad_vs = torch.zeros(B, Q_max - Q_cur, device=dev, dtype=valid_segments_mask.dtype)
+            valid_segments_mask = torch.cat([valid_segments_mask, pad_vs], dim=1)
+        elif Q_cur > Q_max:
+            queries = queries[:, :Q_max, :]
+            seg_attn_mask = seg_attn_mask[:, :Q_max, :]
+            valid_segments_mask = valid_segments_mask[:, :Q_max]
+
+
 
         # ── 3. Learned-Query Pooling (Segment-Restricted) ───────────────────
         # Pool features from `hidden` states using the constructed `queries`.
@@ -265,6 +315,17 @@ class ByteSegmentCompressor(nn.Module):
             key_padding_mask=key_padding_mask,  # Masks padded tokens in `hidden`
         )  # pooled_embeddings: (B, S_hat*L, D)
 
+        # Zero-out invalid queries by snapping them to the padding code vector.
+        B = seg_id.size(0)
+        q_valid = valid_segments_mask.unsqueeze(-1).expand(-1, -1, L).reshape(B, Q_max)  # (B, Q_max)
+        # Choose a pad vector: prefer quantizer-provided sentinel, fallback to codebook entry
+        vq_pad_vec = getattr(self.vq, "pad_vector", None)
+        if vq_pad_vec is not None:
+            pad_vec = vq_pad_vec.view(1, 1, -1).detach()
+        else:
+            pad_vec = self.vq.codebook[self.vq.padding_token_id].detach().view(1, 1, -1)
+        pooled_embeddings = torch.where(q_valid.unsqueeze(-1), pooled_embeddings, pad_vec.expand_as(pooled_embeddings))
+
         # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
         # Apply vector quantization to the pooled segment embeddings.
         quantised_embeddings, vq_loss, codebook_indices, perplexity = self.vq(pooled_embeddings)
@@ -273,13 +334,21 @@ class ByteSegmentCompressor(nn.Module):
         pad_id = self.vq.padding_token_id
         if quantised_embeddings.size(1) < self.output_length:
             pad_size = self.output_length - quantised_embeddings.size(1)
-            padding = torch.full(
-                (quantised_embeddings.size(0), pad_size, quantised_embeddings.size(2)),
-                pad_id,
-                device=quantised_embeddings.device,
-                dtype=quantised_embeddings.dtype,
-            )
-            quantised_embeddings = torch.cat((quantised_embeddings, padding), dim=1)
+            pad_vec = getattr(self.vq, "pad_vector", None)
+            if pad_vec is None:
+                pad_emb = torch.zeros(B, pad_size, D, device=quantised_embeddings.device,
+                                      dtype=quantised_embeddings.dtype)
+            else:
+                pad_emb = pad_vec.view(1, 1, -1).expand(B, pad_size, -1).to(quantised_embeddings.dtype)
+            quantised_embeddings = torch.cat([quantised_embeddings, pad_emb], dim=1)
+
+            # padding = torch.full(
+            #     (quantised_embeddings.size(0), pad_size, quantised_embeddings.size(2)),
+            #     pad_id,
+            #     device=quantised_embeddings.device,
+            #     dtype=quantised_embeddings.dtype,
+            # )
+            # quantised_embeddings = torch.cat((quantised_embeddings, padding), dim=1)
             codebook_indices = torch.cat(
                 (
                     codebook_indices,

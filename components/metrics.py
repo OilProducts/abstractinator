@@ -184,23 +184,50 @@ class TrainingMetrics:
         total_eta_sec: float,
         patches_per_second: List[float],
     ) -> List[str]:
+        # if self.count == 0:
+        #     return []
+        # parts = [
+        #     f"{timestamp}",
+        #     f"Epoch {epoch}/{num_epochs}",
+        #     f"OptStep {global_step}",
+        #     f"MB {minibatch_index}/{total_minibatches}",
+        #     f"Loss {(self.total_loss_t / self.count).item():.4f}",
+        #     f"Reco {(self.avg_reconstruction_loss_t / self.count).item():.4f}",
+        #     f"VQ {(self.vq_loss_t / self.count).item():.4f}",
+        #     f"Tok/s {short_num(avg_tok_s)}",
+        #     f"Bytes {short_num(self.total_bytes_processed)}",
+        #     f"ETA {format_duration(total_eta_sec)}",
+        # ]
+
         if self.count == 0:
             return []
+
+        # gather the scalar tensors once
+        scalars = [
+            self.total_loss_t, self.avg_reconstruction_loss_t, self.vq_loss_t,
+            (self.avg_aux_lm_loss_t if self.aux_lm_enabled else torch.zeros((), device=self.total_loss_t.device)),
+            (self.avg_top_code_lm_loss_t if self.top_lm_enabled else torch.zeros((), device=self.total_loss_t.device)),
+        ]
+        vals = torch.stack(scalars).to(torch.float32) / max(1, self.count)
+        loss_total, reco, vq, aux, top = vals.detach().cpu().tolist()
+
         parts = [
             f"{timestamp}",
             f"Epoch {epoch}/{num_epochs}",
             f"OptStep {global_step}",
             f"MB {minibatch_index}/{total_minibatches}",
-            f"Loss {(self.total_loss_t / self.count).item():.4f}",
-            f"Reco {(self.avg_reconstruction_loss_t / self.count).item():.4f}",
-            f"VQ {(self.vq_loss_t / self.count).item():.4f}",
+            f"Loss {loss_total:.4f}",
+            f"Reco {reco:.4f}",
+            f"VQ {vq:.4f}",
             f"Tok/s {short_num(avg_tok_s)}",
             f"Bytes {short_num(self.total_bytes_processed)}",
             f"ETA {format_duration(total_eta_sec)}",
         ]
+        if self.aux_lm_enabled: parts.append(f"AuxLM {aux:.4f}")
+        if self.top_lm_enabled and self.count > 0: parts.append(f"TopLM {top:.4f}")
 
-        if self.aux_lm_enabled:
-            parts.append(f"AuxLM {(self.avg_aux_lm_loss_t / self.count).item():.4f}")
+        # if self.aux_lm_enabled:
+        #     parts.append(f"AuxLM {(self.avg_aux_lm_loss_t / self.count).item():.4f}")
 
         if self.top_lm_enabled:
             if self.count > 0:

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
+from typing import List, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .rope import apply_rope
+from .rope import RoPECache, apply_rope
 from .sliding_window_attention import AttnCache, SegmentCausalCrossAttention
 from .swiglu import SwiGLU
+from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, LearnedCodebookAdapter
 
 
 @lru_cache(maxsize=64)
@@ -38,6 +40,8 @@ class MultiHeadAttentionRoPE(nn.Module):
         self.head_dim = d_model // num_heads
         self.causal = causal
 
+        self.rope = RoPECache(max_seqlen=2048, head_dim=self.head_dim, dtype=torch.bfloat16, device="cuda")
+
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -64,8 +68,13 @@ class MultiHeadAttentionRoPE(nn.Module):
         k = self.k_proj(key).view(B, L_k, H, d).transpose(1, 2)
         v = self.v_proj(value).view(B, L_k, H, d).transpose(1, 2)
 
-        q = apply_rope(q)
-        k = apply_rope(k)
+        # q = apply_rope(q)
+        # k = apply_rope(k)
+
+        L = q.size(-2)
+        cos, sin = self.rope.slice(L)  # views only, no kernels
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
 
@@ -276,6 +285,8 @@ class CodeExpander(nn.Module):
 
         self.emb_hi = nn.Embedding(K_hi, D)
         self.emb_lo = nn.Embedding(K_lo, D)
+        # self.out_proj = nn.Linear(D, K_lo, bias=False)
+        # self.out_proj.weight = self.emb_lo.weight  # share the same Parameter
 
         self.encoder = SimpleEncoder(N_enc, D, H)
         self.decoder = SimpleDecoder(N_dec, D, H)
@@ -393,6 +404,9 @@ class DecoderOnlyExpander(nn.Module):
         self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=lo_dim, kv_dim=hi_dim)
         self.out_proj = nn.Linear(D, K_lo)
 
+        self.rope = RoPECache(max_seqlen=self.max_len, head_dim=kv_dim_or_q_dim,  # match your use
+                              dtype=model_dtype, device=next(self.parameters()).device)
+
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
         return get_causal_mask(length, device)
 
@@ -498,5 +512,180 @@ class DecoderOnlyExpander(nn.Module):
             # optional early-stop on EOS/EOP
             if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
                 break
+
+        return generated
+
+
+class DecoderOnlyExpanderRVQ(nn.Module):
+    """
+    Decoder-only expander that:
+      - embeds high codes by reusing the *high-level* MS-RVQ codebooks (no emb_hi),
+      - embeds low codes likewise (no emb_lo),
+      - outputs factorized stage-wise logits (no D×K_eff softmax).
+    """
+    def __init__(self,
+                 lo_vq: "MultiStageResidualVQ",       # MS-RVQ for the *target* code space
+                 hi_vq: Optional["MultiStageResidualVQ"],  # MS-RVQ for the *memory* code space
+                 K_lo: Optional[int] = None,          # if lo_vq is None
+                 D: int = 256,
+                 N_dec: int = 4,
+                 H: int = 8,
+                 cross_window: int = 128,
+                 eos_id: int = 257,
+                 eop_id: int = 259,
+                 max_len: int = 2048,
+                 lo_d_c: int = 64,                    # Factorized rank for bytes
+                 residual_conditioning: bool = True,
+                 use_sqdist_logits: bool = False,
+                 predict_specials: bool = True):
+        super().__init__()
+        self.lo_vq = lo_vq
+        self.hi_vq = hi_vq
+        self.D = D
+        self.eos_id = eos_id
+        self.eop_id = eop_id
+        self.max_len = max_len
+        self.K_lo = K_lo
+
+        # Reuse VQ projections and codebooks
+        # ---- low side (what we predict) ----
+        if lo_vq is not None:
+            self.lo_adapt = RVQEmbeddingAdapter(lo_vq, target_D=D,
+                                                use_shared_proj=True,
+                                                tie_up_down=True,
+                                                specials_in_D=True)
+            self.lo_codec = ComposedIndexCodec(K=lo_vq.K, depth=lo_vq.depth,
+                                               bos=lo_vq.bos_token_id, eos=lo_vq.eos_token_id,
+                                               pad=lo_vq.padding_token_id, eop=lo_vq.eop_token_id)
+            # self.head = RVQFactorizedHead(self.lo_adapt,
+            #                               residual_conditioning=residual_conditioning,
+            #                               use_sqdist_logits=use_sqdist_logits,
+            #                               predict_specials=predict_specials)
+        else:
+            assert K_lo is not None, "Need K_lo for bottom level when lo_vq is None."
+            self.lo_adapt = LearnedCodebookAdapter(K=K_lo, D=D, d_c=lo_d_c, )
+            self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1, eop=-1)
+            # self.head = RVQFactorizedHead(self.lo_adapt,
+            #                               residual_conditioning=False,
+            #                               use_sqdist_logits=False,
+            #                               predict_specials=False)
+
+        # ---- high side (memory) ----
+        self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True, specials_in_D=True) if hi_vq is not None else None
+
+        # Your existing decoder block
+        self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=D, kv_dim=D)
+
+        # Factorized head
+        self.head = RVQFactorizedHead(self.lo_adapt,
+                                      residual_conditioning=residual_conditioning,
+                                      use_sqdist_logits=use_sqdist_logits,
+                                      predict_specials=predict_specials)
+
+        # Codec for (de)composition
+        # self.codec = ComposedIndexCodec(K=lo_vq.K, depth=lo_vq.depth,
+        #                                 bos=lo_vq.bos_token_id, eos=lo_vq.eos_token_id,
+        #                                 pad=lo_vq.padding_token_id, eop=lo_vq.eop_token_id)
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        return get_causal_mask(length, device)
+
+    def _embed_memory(self, codes_hi: torch.Tensor) -> torch.Tensor:
+        # Either high side is already continuous (D), or embed via hi_vq
+        if codes_hi.is_floating_point():
+            return codes_hi
+        if self.hi_adapt is None:
+            raise ValueError("codes_hi is discrete but hi_vq/hi_adapt not provided")
+        return self.hi_adapt.embed_composed(codes_hi)
+
+    def _embed_decoder_inputs(self, codes_lo: torch.Tensor) -> torch.Tensor:
+        # Shift-right with EOS
+        decoder_input_ids = F.pad(codes_lo[:, :-1], (1, 0), value=self.eos_id)
+        return self.lo_adapt.embed_composed(decoder_input_ids)
+
+    def forward(self,
+                codes_hi: torch.Tensor,                # (B, S_hi) or (B, S_hi, D)
+                codes_lo: torch.Tensor,                # (B, L)
+                src_key_padding_mask: Optional[torch.Tensor] = None,
+                tgt_key_padding_mask: Optional[torch.Tensor] = None,
+                seg_ids: Optional[torch.Tensor] = None
+                ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
+        device = codes_hi.device
+        memory = self._embed_memory(codes_hi)          # (B, S_hi, D)
+        dec_inp = self._embed_decoder_inputs(codes_lo) # (B, L, D)
+
+        tgt_mask = self._causal_mask(codes_lo.size(1), device)
+        adjusted_tgt_kpm = None
+        if tgt_key_padding_mask is not None:
+            adjusted_tgt_kpm = F.pad(tgt_key_padding_mask[:, :-1], (1, 0), value=False)
+
+        h = self.decoder(dec_inp, memory,
+                         tgt_mask=tgt_mask,
+                         tgt_key_padding_mask=adjusted_tgt_kpm,
+                         memory_key_padding_mask=src_key_padding_mask,
+                         seg_ids=seg_ids)              # (B, L, D)
+
+        # Teacher-forced residual conditioning uses *true* digits at (B,L)
+        teacher_digits, _ = self.lo_codec.decompose(codes_lo)
+        logits = self.head(h, teacher_digits=teacher_digits)  # dict
+
+        return logits  # {"stage_logits": [B,L,K]*depth, "special_logits": (B,L,S) or None}
+
+    @torch.no_grad()
+    def generate(self,
+                 codes_hi: torch.Tensor,               # (B, S_hi) or (B, S_hi, D)
+                 src_key_padding_mask: Optional[torch.Tensor] = None,
+                 max_len: Optional[int] = None,
+                 seg_ids: Optional[torch.Tensor] = None
+                 ) -> torch.Tensor:
+        """
+        Autoregressively generates low-level composed codes (B, L).
+        Within each time step, it selects stage indices sequentially (residual RVQ style).
+        """
+        device = codes_hi.device
+        B = codes_hi.size(0)
+        Lmax = max_len or self.max_len
+
+        memory = self._embed_memory(codes_hi)     # (B, S_hi, D)
+        generated = torch.full((B, 1), self.eos_id, device=device, dtype=torch.long)
+        kpm = torch.zeros_like(generated, dtype=torch.bool)
+
+        cache = AttnCache()
+
+        for _ in range(Lmax - 1):
+            dec_inp = self.lo_adapt.embed_composed(generated)    # (B, T, D)
+            tgt_mask = self._causal_mask(dec_inp.size(1), device)
+
+            h = self.decoder(dec_inp, memory,
+                             cache=cache,
+                             tgt_mask=tgt_mask,
+                             tgt_key_padding_mask=kpm,
+                             memory_key_padding_mask=src_key_padding_mask,
+                             seg_ids=seg_ids)                    # (B, T, D)
+
+            last_h = h[:, -1:, :]                                # (B,1,D)
+            # No teacher digits in inference; the head will greedy-condition residuals
+            logits = self.head(last_h, teacher_digits=None)
+            stage_logits: List[torch.Tensor] = logits["stage_logits"]  # each (B,1,K)
+
+            # pick stage digits sequentially and compose
+            digits = []
+            r_dc = self.lo_adapt.down(last_h)                     # (B,1,d_c)
+            for s in range(self.lo_vq.depth):
+                W = self.lo_adapt.stage_codebook(s)
+                logit_s = self.head._stage_logits(r_dc, W)        # (B,1,K)
+                idx_s = logit_s.argmax(dim=-1)                    # (B,1)
+                digits.append(idx_s.squeeze(1))
+                # residual update
+                r_dc = r_dc - F.embedding(idx_s, W)
+            next_id = self.codec.compose([d for d in digits])     # (B,1)
+
+            generated = torch.cat([generated, next_id], dim=1)
+            # stop early if all EOS/EOP (optional)
+            if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
+                break
+
+            # keep mask all non-pad
+            kpm = torch.zeros_like(generated, dtype=torch.bool)
 
         return generated

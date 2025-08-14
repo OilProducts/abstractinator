@@ -267,6 +267,8 @@ def build_segment_queries_mask(
     seg_id: torch.Tensor,  # [B, S_original]   – integer segment ids
     query_embed: torch.Tensor,  # [L, D]            – learned query template
     num_heads: int,  # number of attention heads
+    *,
+    Q_max: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct segment-aware queries and attention masks.
 
@@ -291,47 +293,96 @@ def build_segment_queries_mask(
             - ``valid_segments``: Boolean tensor of shape ``(B, S_hat)`` marking
               which segment slots are real for each item in the batch.
     """
-    B, S_original = seg_id.shape  # SymInts
+    B, S_original = seg_id.shape
     L, D = query_embed.shape
     device = seg_id.device
 
     # ----------------------------------------------------------------------
     # 1.  Maximum #segments in the batch (scalar SymInt, NOT Python int)
     # ----------------------------------------------------------------------
-    seg_count = seg_id.amax(dim=1) + 1  # (B,)  actual segments per item
-    S_hat = seg_count.amax()  # 0‑D tensor / SymInt ✔️
+    # seg_count = seg_id.amax(dim=1) + 1  # (B,)  actual segments per item
+    # S_hat = seg_count.amax()  # 0‑D tensor / SymInt ✔️
+    #
+    # # ----------------------------------------------------------------------
+    # # 2.  Build queries   [B, S_hat * L, D]
+    # # ----------------------------------------------------------------------
+    # #   Expand with SymInt S_hat – no Python conversion.
+    # queries = (
+    #     query_embed.unsqueeze(0)  # [L, D]  # [1, L, D]
+    #     .unsqueeze(0)  # [1, 1, L, D]
+    #     .expand(B, S_hat, L, D)  # [B, S_hat, L, D]
+    #     .reshape(B, -1, D)  # [B, S_hat*L, D]
+    # )
+    #
+    # # ----------------------------------------------------------------------
+    # # 3.  Segment‑id for every query   [B, S_hat*L]
+    # # ----------------------------------------------------------------------
+    # # Build with arithmetic on SymInts – still no .item().
+    # q_positions = torch.arange(queries.shape[1], device=device)  # 0 … S_hat*L‑1
+    # seg_for_q = (q_positions // L).expand(B, -1)  # repeat for batch
+    #
+    # # ----------------------------------------------------------------------
+    # # 4.  Attention mask   [B*num_heads, S_hat*L, S_original]   (True ⇒ BLOCK)
+    # # ----------------------------------------------------------------------
+    # same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])  # broadcast compare
+    # att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
+    #
+    # # ----------------------------------------------------------------------
+    # # 5.  Valid segment slots   [B, S_hat]
+    # # ----------------------------------------------------------------------
+    # valid_segments = (
+    #     torch.arange(S_hat, device=device)  # 0 … S_hat‑1   (SymInt end)
+    #     .unsqueeze(0)
+    #     .lt(seg_count.unsqueeze(1))  # i < seg_count[b]
+    # )
+    #
+    # return queries, att_mask, valid_segments
 
-    # ----------------------------------------------------------------------
-    # 2.  Build queries   [B, S_hat * L, D]
-    # ----------------------------------------------------------------------
-    #   Expand with SymInt S_hat – no Python conversion.
+
+    seg_count = seg_id.amax(dim=1) + 1  # (B,)
+    if Q_max is None:
+        # --- dynamic (old) path ---
+        S_hat = seg_count.amax()
+        queries = (
+            query_embed.unsqueeze(0).unsqueeze(0)    # [1,1,L,D]
+            .expand(B, S_hat, L, D)                  # [B,Ŝ,L,D]
+            .reshape(B, -1, D)                       # [B,Ŝ·L,D]
+        )
+        q_positions = torch.arange(queries.shape[1], device=device)
+        seg_for_q = (q_positions // L).expand(B, -1)           # [B, Ŝ·L]
+        same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])
+        att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
+        valid_segments = (
+            torch.arange(S_hat, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
+        )
+        return queries, att_mask, valid_segments
+
+    # --- fixed-shape path ---
+    S_hat_cap = max(1, int(Q_max // L))
+    Q_max = int(S_hat_cap * L)  # enforce multiple of L
+
+    # Queries: [B, S_hat_cap*L, D] with constant shape
     queries = (
-        query_embed.unsqueeze(0)  # [L, D]  # [1, L, D]
-        .unsqueeze(0)  # [1, 1, L, D]
-        .expand(B, S_hat, L, D)  # [B, S_hat, L, D]
-        .reshape(B, -1, D)  # [B, S_hat*L, D]
+        query_embed.unsqueeze(0).unsqueeze(0)     # [1,1,L,D]
+        .expand(B, S_hat_cap, L, D)               # [B,Ŝ_cap,L,D]
+        .reshape(B, Q_max, D)                     # [B,Q_max,D]
+        .contiguous()
     )
 
-    # ----------------------------------------------------------------------
-    # 3.  Segment‑id for every query   [B, S_hat*L]
-    # ----------------------------------------------------------------------
-    # Build with arithmetic on SymInts – still no .item().
-    q_positions = torch.arange(queries.shape[1], device=device)  # 0 … S_hat*L‑1
-    seg_for_q = (q_positions // L).expand(B, -1)  # repeat for batch
-
-    # ----------------------------------------------------------------------
-    # 4.  Attention mask   [B*num_heads, S_hat*L, S_original]   (True ⇒ BLOCK)
-    # ----------------------------------------------------------------------
-    same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])  # broadcast compare
-    att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
-
-    # ----------------------------------------------------------------------
-    # 5.  Valid segment slots   [B, S_hat]
-    # ----------------------------------------------------------------------
+    # Valid segments per item: [B, S_hat_cap]
     valid_segments = (
-        torch.arange(S_hat, device=device)  # 0 … S_hat‑1   (SymInt end)
-        .unsqueeze(0)
-        .lt(seg_count.unsqueeze(1))  # i < seg_count[b]
+        torch.arange(S_hat_cap, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
     )
+    # Valid queries per item: [B, Q_max]
+    q_valid = valid_segments.unsqueeze(-1).expand(-1, -1, L).reshape(B, Q_max)
+
+    # Attention mask (True = block), constant shape [B*H, Q_max, S]
+    seg_for_q = (torch.arange(Q_max, device=device) // L).view(1, -1, 1)  # [1,Q_max,1]
+    same_segment = seg_for_q.eq(seg_id[:, None, :])                       # [B,Q_max,S]
+    att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)        # [B*H,Q_max,S]
+    # Also block *all* keys for padded queries so they become no-ops
+    # att_mask |= (~q_valid)[:, :, None]
+    att_mask |= (~q_valid).repeat_interleave(num_heads, dim=0)[:, :, None]
 
     return queries, att_mask, valid_segments
+
