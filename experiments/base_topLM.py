@@ -41,7 +41,7 @@ exp_config.compressor_level_configs.append(
         beta=1.0,
         vq_reset_interval=250,
         vq_depth=2,
-        entropy_delta=0.2,
+        entropy_delta=0.0,
         entropy_abs_threshold=None,
         target_compression_ratio=None,
         compression_loss_weight=1.0,

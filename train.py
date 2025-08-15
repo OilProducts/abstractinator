@@ -41,7 +41,7 @@ torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
 # torch._dynamo.config.recompile_limit = 512
-torch._dynamo.config.capture_scalar_outputs = True
+# torch._dynamo.config.capture_scalar_outputs = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +129,7 @@ def initialize_model(
         top_lm_mse_weight=exp_config.top_lm_mse_weight,
         top_lm_ce_weight=exp_config.top_lm_ce_weight,
         use_flex_attention=exp_config.flex_attention,
+        device=ExpConfig.device,
     ).to(device)
 
     if args.load_base_from:
@@ -366,28 +367,50 @@ def train_loop(
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
     model = torch.compile(model)
+    #
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    #
+    # with profile(
+    #         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #         # record_shapes=True,
+    #         # with_stack=True,
+    #         profile_memory=True,
+    #         # with_modules=True,
+    # ) as prof:
+    #     for _ in range(50):  # run ~50 optimizer steps
+    #         batch = next(iter(train_dataloader))
+    #         tokens = batch["input_ids"].to(device, non_blocking=True)
+    #         key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
+    #         out = model(tokens, key_padding_mask=key_padding_mask)
+    #         loss = out["total_loss"] / exp_config.gradient_accumulation_steps
+    #         loss.backward()
+    #         optimizer.step();
+    #         optimizer.zero_grad()
+    #
+    # print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
+    # prof.export_chrome_trace("trace.json")
 
-    from torch.profiler import profile, record_function, ProfilerActivity
+    # def nan_hook(name):
+    #     def _hook(module, inputs, output):
+    #         def has_bad(x):
+    #             return torch.is_tensor(x) and (~torch.isfinite(x)).any().item()
+    #
+    #         bad_in = any(has_bad(x) for x in (inputs if isinstance(inputs, tuple) else (inputs,)))
+    #         bad_out = has_bad(output)
+    #         if bad_in or bad_out:
+    #             print(f"[NaN/Inf] in {name}: bad_in={bad_in}, bad_out={bad_out}")
+    #             if bad_out and torch.is_tensor(output):
+    #                 with torch.no_grad():
+    #                     print("  output stats:", output.float().min().item(), output.float().max().item())
+    #             raise RuntimeError(f"NaN/Inf encountered in {name}")
+    #
+    #     return _hook
+    #
+    # # Register on sensitive blocks
+    # for n, m in model.named_modules():
+    #     if any(k in n.lower() for k in ["attention", "attn", "softmax", "layernorm", "vq", "loss"]):
+    #         m.register_forward_hook(nan_hook(n))
 
-    with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            # record_shapes=True,
-            # with_stack=True,
-            profile_memory=True,
-            # with_modules=True,
-    ) as prof:
-        for _ in range(50):  # run ~50 optimizer steps
-            batch = next(iter(train_dataloader))
-            tokens = batch["input_ids"].to(device, non_blocking=True)
-            key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
-            out = model(tokens, key_padding_mask=key_padding_mask)
-            loss = out["total_loss"] / exp_config.gradient_accumulation_steps
-            loss.backward()
-            optimizer.step();
-            optimizer.zero_grad()
-
-    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
-    prof.export_chrome_trace("trace.json")
 
     for epoch in range(start_epoch, exp_config.num_epochs):
         logger.info("\n--- Epoch %s/%s ---", epoch + 1, exp_config.num_epochs)

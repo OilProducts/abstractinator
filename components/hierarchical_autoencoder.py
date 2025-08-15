@@ -134,6 +134,7 @@ class HierarchicalAutoencoder(nn.Module):
         top_lm_mse_weight: float = 1.0,
         top_lm_ce_weight: float = 1.0,
         use_flex_attention: bool = True,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
 
@@ -190,6 +191,7 @@ class HierarchicalAutoencoder(nn.Module):
                 use_flex_attention=use_flex_attention,
                 output_length=config.get('output_length'),
             )
+            compressor = torch.compile(compressor)
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(effective_k)
             current_input_vocab_size = effective_k
@@ -220,6 +222,9 @@ class HierarchicalAutoencoder(nn.Module):
                 retr_dim=cfg.get("retr_dim", 32),  # r
                 vq=self.compressors[-1].vq,
             )
+
+            self.code_sequence_transformer = torch.compile(self.code_sequence_transformer)
+
             mode = "continuous" if self.top_transformer_continuous else "discrete"
             logger.info(
                 "Initialized CodeSequenceTransformer for %s codes (embed_dim: %s, dim: %s)",
@@ -271,6 +276,7 @@ class HierarchicalAutoencoder(nn.Module):
                     predict_specials=True,
                     eos_id=eos_id,
                     max_len=max_len,
+                    device=device,
                     # hi_dim=exp_cfg.get("hi_dim", 256),
                     # lo_dim=exp_cfg.get("lo_dim", 128),
                 )
@@ -403,7 +409,7 @@ class HierarchicalAutoencoder(nn.Module):
         all_seg_ids: List[torch.Tensor] = []
         all_vq_loss_list: List[torch.Tensor] = []
         # Stores valid_masks (per segment) from each compressor to reconstruct KPMs later.
-        # all_compressor_level_valid_masks: List[Optional[torch.Tensor]] = []
+        all_compressor_level_valid_masks: List[Optional[torch.Tensor]] = []
         total_vq_loss = torch.tensor(0.0, device=tokens.device, dtype=torch.float32)
 
         # For auxiliary LM loss
@@ -445,7 +451,7 @@ class HierarchicalAutoencoder(nn.Module):
             all_entropy_model_logits_list.append(comp_out.entropy_model_logits)
             total_vq_loss += comp_out.vq_loss
 
-            # all_compressor_level_valid_masks.append(comp_out.valid_mask)
+            all_compressor_level_valid_masks.append(comp_out.valid_mask)
 
             num_q_this_level = compressor.num_queries_per_segment  # L value
 
@@ -877,24 +883,7 @@ class HierarchicalAutoencoder(nn.Module):
                         mse_loss = mse_per_tok.mean()
                         ce_loss = ce_per_tok.mean()
 
-                # codebook = self.compressors[-1].vq.stage_codebook(0)
-                # logits = -torch.cdist(pred, codebook)
-                # ce_per_tok = F.cross_entropy(
-                #     logits.view(-1, logits.size(-1)), target_codes.reshape(-1), reduction='none'
-                # ).view_as(target_codes)
 
-                # if mask is not None:
-                #     loss_mask = ~mask
-                #     valid_targets = loss_mask.sum()
-                #     if valid_targets > 0:
-                #         mse_loss = (mse_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
-                #         ce_loss = (ce_per_tok * loss_mask).sum() / valid_targets.clamp(min=1e-9)
-                #     else:
-                #         mse_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-                #         ce_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-                # else:
-                #     mse_loss = mse_per_tok.mean()
-                #     ce_loss = ce_per_tok.mean()
 
             avg_loss = self.top_lm_mse_weight * mse_loss + self.top_lm_ce_weight * ce_loss + vq_loss_top
             details['top_code_mse'] = mse_loss
@@ -1065,77 +1054,57 @@ class HierarchicalAutoencoder(nn.Module):
 
     @torch.no_grad()
     def _gen_segment_at_level(
-        self,
-        e_idx: int,  # 0 = top expander, L-1 = bottom (bytes)
-        hi_seq: torch.Tensor,  # (1, S_hi) or (1, S_hi, D)
-        *,
-        comp_for_masks: Optional[Dict[str, Any]],  # fresh compress(...) for top, else None
-        decode_max_len: Optional[int],
+            self,
+            e_idx: int,  # 0 = top expander
+            hi_seq: torch.Tensor,  # (1, S_hi) or (1, S_hi, D)
+            *,
+            comp_for_masks: Optional[Dict[str, Any]],
+            decode_max_len: Optional[int],
     ) -> torch.Tensor:
-        """
-        Returns: bottom bytes (1, B_new) generated for this parent segment.
-        Uses DecoderOnlyExpander.generate which fills PADs up to EOP/EOS or budget.
-        """
-        assert hi_seq.size(0) == 1, "Gen supports B=1 for now."
+        assert hi_seq.size(0) == 1
         exp = self.expanders[e_idx]
         is_bottom = e_idx == self.num_levels - 1
         device = hi_seq.device
 
-        # per-segment cap we actually want to allow this call to emit
         max_new = int(decode_max_len) if decode_max_len is not None else int(exp.max_len)
-        max_new = max(1, min(max_new, exp.max_len))  # safety
+        max_new = max(1, min(max_new, exp.max_len))
 
-        # capacity = seed(1) + max_new tokens at most
-        L = 1 + max_new
-        lo = torch.full((1, L), exp.eos_id, dtype=torch.long, device=device)
-        tgt_kpm = torch.ones(1, L, dtype=torch.bool, device=device)
-        tgt_kpm[:, 0] = False  # first token is real
+        # ---- seed with a single token ----
+        lo = torch.full((1, 1), exp.eos_id, dtype=torch.long, device=device)  # (1,1)
+        # KV mask for memory (all real)
+        S_hi = hi_seq.size(1) if hi_seq.dim() == 2 else hi_seq.size(1)
+        src_kpm = torch.zeros(1, S_hi, dtype=torch.bool, device=device)
 
-        # masks
-        # --- correct KPM to match the KV length ---
-        if hi_seq.dim() == 3:  # (B, S_hi, D)
-            B, S_hi = hi_seq.size(0), hi_seq.size(1)
-        else:  # (B, S_hi)
-            B, S_hi = hi_seq.size(0), hi_seq.size(1)
-
-        src_kpm = torch.zeros(B, S_hi, dtype=torch.bool, device=hi_seq.device)  # (B, S_hi)
-
-        # --- better seg_id during gen ---
-        # All queries in this segment should map to the *last* (newest) segment,
-        # and lookback handles previous ones.
-        Lq = lo.size(1)
+        # queries belong to the newest segment
         last_seg = S_hi - 1
-        seg_ids = torch.full((B, Lq), last_seg, dtype=torch.long, device=hi_seq.device)
+        seg_ids = torch.full((1, 1), last_seg, dtype=torch.long, device=device)
 
-        # ---- let the expander fill until EOP/EOS/budget/full ----
         out = exp.generate(
             codes_hi=hi_seq,
-            codes_lo=lo,
+            codes_lo=lo,  # just the seed
             src_key_padding_mask=src_kpm,
-            tgt_key_padding_mask=tgt_kpm,  # will be mutated in-place
             seg_ids=seg_ids,
-            max_new_tokens=max_new,
-        )
+            max_new_tokens=max_new,  # steps budget
+        )  # (1, T)
 
-        # how many actually got written this call?
-        new_valid = int((~tgt_kpm).sum().item())  # includes the seed at pos 0
-        steps_taken = max(0, new_valid - 1)  # exclude the seed
+        # how many were actually generated (excluding the seed)
+        steps_taken = max(0, out.size(1) - 1)
 
-        # consume exactly `steps_taken`, not `max_new`
         bottom_bytes = lo.new_zeros(1, 0)
         stop_set = {*self._bottom_ids()} if is_bottom else {self._eop_id_for_expander(e_idx)}
 
+        # Consume positions 1..T-1 in order
         for pos in range(1, 1 + steps_taken):
             tok = int(out[0, pos].item())
-            if tok in stop_set:  # terminal landed exactly at this position
-                if is_bottom:  # include it at bottom so caller can stop on it
-                    bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
+            if tok in stop_set:
+                if is_bottom:
+                    bottom_bytes = torch.cat([bottom_bytes, out[:, pos:pos + 1]], dim=1)
                 break
 
             if is_bottom:
-                bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
+                bottom_bytes = torch.cat([bottom_bytes, out[:, pos:pos + 1]], dim=1)
             else:
-                child_hi = out[:, pos : pos + 1]  # (1,1)
+                child_hi = out[:, pos:pos + 1]  # (1,1)
                 child_bytes = self._gen_segment_at_level(
                     e_idx=e_idx + 1,
                     hi_seq=child_hi,
@@ -1143,8 +1112,92 @@ class HierarchicalAutoencoder(nn.Module):
                     decode_max_len=decode_max_len,
                 )
                 bottom_bytes = torch.cat([bottom_bytes, child_bytes], dim=1)
-        return bottom_bytes
 
+        return bottom_bytes
+    #
+    # @torch.no_grad()
+    # def _gen_segment_at_level(
+    #     self,
+    #     e_idx: int,  # 0 = top expander, L-1 = bottom (bytes)
+    #     hi_seq: torch.Tensor,  # (1, S_hi) or (1, S_hi, D)
+    #     *,
+    #     comp_for_masks: Optional[Dict[str, Any]],  # fresh compress(...) for top, else None
+    #     decode_max_len: Optional[int],
+    # ) -> torch.Tensor:
+    #     """
+    #     Returns: bottom bytes (1, B_new) generated for this parent segment.
+    #     Uses DecoderOnlyExpander.generate which fills PADs up to EOP/EOS or budget.
+    #     """
+    #     assert hi_seq.size(0) == 1, "Gen supports B=1 for now."
+    #     exp = self.expanders[e_idx]
+    #     is_bottom = e_idx == self.num_levels - 1
+    #     device = hi_seq.device
+    #
+    #     # per-segment cap we actually want to allow this call to emit
+    #     max_new = int(decode_max_len) if decode_max_len is not None else int(exp.max_len)
+    #     max_new = max(1, min(max_new, exp.max_len))  # safety
+    #
+    #     # capacity = seed(1) + max_new tokens at most
+    #     L = 1 + max_new
+    #     lo = torch.full((1, L), exp.eos_id, dtype=torch.long, device=device)
+    #     tgt_kpm = torch.ones(1, L, dtype=torch.bool, device=device)
+    #     tgt_kpm[:, 0] = False  # first token is real
+    #
+    #     # masks
+    #     # --- correct KPM to match the KV length ---
+    #     if hi_seq.dim() == 3:  # (B, S_hi, D)
+    #         B, S_hi = hi_seq.size(0), hi_seq.size(1)
+    #     else:  # (B, S_hi)
+    #         B, S_hi = hi_seq.size(0), hi_seq.size(1)
+    #
+    #     src_kpm = torch.zeros(B, S_hi, dtype=torch.bool, device=hi_seq.device)  # (B, S_hi)
+    #
+    #     # --- better seg_id during gen ---
+    #     # All queries in this segment should map to the *last* (newest) segment,
+    #     # and lookback handles previous ones.
+    #     Lq = lo.size(1)
+    #     last_seg = S_hi - 1
+    #     seg_ids = torch.full((B, Lq), last_seg, dtype=torch.long, device=hi_seq.device)
+    #
+    #     # ---- let the expander fill until EOP/EOS/budget/full ----
+    #     out = exp.generate(
+    #         codes_hi=hi_seq,
+    #         codes_lo=lo,
+    #         src_key_padding_mask=src_kpm,
+    #         # tgt_key_padding_mask=tgt_kpm,  # will be mutated in-place
+    #         seg_ids=seg_ids,
+    #         max_new_tokens=max_new,
+    #     )
+    #
+    #     # how many actually got written this call?
+    #     new_valid = int((~tgt_kpm).sum().item())  # includes the seed at pos 0
+    #     steps_taken = max(0, new_valid - 1)  # exclude the seed
+    #
+    #     # consume exactly `steps_taken`, not `max_new`
+    #     bottom_bytes = lo.new_zeros(1, 0)
+    #     stop_set = {*self._bottom_ids()} if is_bottom else {self._eop_id_for_expander(e_idx)}
+    #
+    #     for pos in range(1, 1 + steps_taken):
+    #         tok = int(out[0, pos].item())
+    #         if tok in stop_set:  # terminal landed exactly at this position
+    #             if is_bottom:  # include it at bottom so caller can stop on it
+    #                 bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
+    #             break
+    #
+    #         if is_bottom:
+    #             bottom_bytes = torch.cat([bottom_bytes, out[:, pos : pos + 1]], dim=1)
+    #         else:
+    #             child_hi = out[:, pos : pos + 1]  # (1,1)
+    #             child_bytes = self._gen_segment_at_level(
+    #                 e_idx=e_idx + 1,
+    #                 hi_seq=child_hi,
+    #                 comp_for_masks=None,
+    #                 decode_max_len=decode_max_len,
+    #             )
+    #             bottom_bytes = torch.cat([bottom_bytes, child_bytes], dim=1)
+    #     return bottom_bytes
+
+    # @torch.compile
     def forward(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """Training forward pass combining compression and reconstruction.
 
@@ -1302,9 +1355,26 @@ class HierarchicalAutoencoder(nn.Module):
             # compress current bytes to get masks/seg_ids for top expander
             comp = self.compress(byte_buf, key_padding_mask=byte_kpm)
 
-            # one more top symbol (continuous)
+            # # one more top symbol (continuous)
+            # next_top_vec = _predict_one_top_symbol(comp)  # (1, D)
+            # top_hi = torch.cat([comp["all_pre_vq_embeddings"][-1], next_top_vec.unsqueeze(1)], dim=1)  # (1, L+1, D)
+
             next_top_vec = _predict_one_top_symbol(comp)  # (1, D)
-            top_hi = torch.cat([comp["all_pre_vq_embeddings"][-1], next_top_vec.unsqueeze(1)], dim=1)  # (1, L+1, D)
+            top_mem = comp["all_pre_vq_embeddings"][-1]  # (1, S, D)
+            top_kpm = comp.get("final_key_padding_mask", None)  # (1, S) or None
+
+            # --- keep only non-pad positions from the current top memory ---
+            if top_kpm is not None:
+                # works even if non-pad are not strictly a prefix
+                keep_idx = (~top_kpm[0]).nonzero(as_tuple=False).squeeze(1)  # (S_valid,)
+                if keep_idx.numel() > 0:
+                    top_mem = top_mem.index_select(1, keep_idx)  # (1, S_valid, D)
+                else:
+                    # no valid context (extreme corner case) -> drop to empty prefix
+                    top_mem = top_mem[:, :0, :]
+
+            # append the new top symbol
+            top_hi = torch.cat([top_mem, next_top_vec.unsqueeze(1)], dim=1)  # (1, S_valid+1, D)
 
             # generate the entire descendant bottom bytes for this top symbol
             new_bytes = self._gen_segment_at_level(
@@ -1325,5 +1395,10 @@ class HierarchicalAutoencoder(nn.Module):
                 break
 
             byte_kpm = self._all_false_kpm_like(byte_buf)
+
+            # if byte_buf is longer than 512, bail
+            if byte_buf.size(1) > 512:
+                print("Generated byte buffer exceeded 512 tokens, stopping generation.")
+                break
 
         return byte_buf

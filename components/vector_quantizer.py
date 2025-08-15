@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 # import torch._dynamo as dynamo
 
-@torch.compile
+# @torch.compile
 class VectorQuantizer(nn.Module):
     """
     An efficient Vector Quantizer (VQ) layer with EMA updates and robust,
@@ -109,26 +109,6 @@ class VectorQuantizer(nn.Module):
             # safe to use Python here; this function is compile-disabled
             if int(idx0) + int(n_new) >= int(B):
                 self.buffer_is_full.fill_(True)
-
-        # if n_new >= buff_size:
-        #     self.replacement_buffer.copy_(src)
-        #     self.buffer_is_full.fill_(True)
-        #     self._buffer_full_py = True
-        #     self._buffer_idx_py = 0
-        #     self.buffer_idx.zero_()
-        # else:
-        #     space_left = buff_size - current_idx
-        #     if n_new < space_left:
-        #         self.replacement_buffer[current_idx : current_idx + n_new] = src
-        #         self._buffer_idx_py += n_new
-        #         self.buffer_idx.fill_(self._buffer_idx_py)
-        #     else:
-        #         self.replacement_buffer[current_idx:] = src[:space_left]
-        #         self.replacement_buffer[: n_new - space_left] = src[space_left:]
-        #         self._buffer_idx_py = n_new - space_left
-        #         self.buffer_idx.fill_(self._buffer_idx_py)
-        #         self.buffer_is_full.fill_(True)
-        #         self._buffer_full_py = True
 
     @torch.no_grad()
     @torch._dynamo.disable()
@@ -518,9 +498,9 @@ class RVQEmbeddingAdapter(nn.Module):
         self.D = int(target_D)
 
         # projections
-        share_ok = use_shared_proj and (self.D == self.D_vq)
+        share_ok = False #use_shared_proj and (self.D == self.D_vq)
         if share_ok:
-            self.up = vq.up                       # d_c -> D
+            self.up = vq.up                       # d_c -> Das
             self.down = vq.down                   # D -> d_c
         else:
             # One shared parameter for both directions
@@ -530,15 +510,6 @@ class RVQEmbeddingAdapter(nn.Module):
             nn.init.xavier_uniform_(Wdc)
             self.down = DownProj(Wdc)  # D -> d_c
             self.up = UpProj(Wdc)  # d_c -> D
-
-            # self.up = nn.Linear(self.d_c, self.D, bias=False)
-            # self.down = nn.Linear(self.D, self.d_c, bias=False)
-            # # nice init
-            # nn.init.xavier_uniform_(self.up.weight)
-            # if tie_up_down:
-            #     self.down.weight = self.up.weight.T  # tie (optional)
-            # else:
-            #     nn.init.xavier_uniform_(self.down.weight)
 
         # tiny special table in target D
         self.special_ids = sorted({int(vq.bos_token_id),
@@ -550,132 +521,12 @@ class RVQEmbeddingAdapter(nn.Module):
                             if specials_in_D else None)
 
 
-        # # Tie projections to MS‑RVQ by default (no extra params)
-        # self.down = vq.down if use_shared_proj else nn.Linear(self.D, self.d_c, bias=False)
-        # self.up   = vq.up   if use_shared_proj else nn.Linear(self.d_c, self.D, bias=False)
-        #
-        # # Tiny learned table for specials; you can also keep zero vectors if you prefer.
-        # self.special_ids = [vq.bos_token_id, vq.eos_token_id, vq.padding_token_id, vq.eop_token_id]
-        # self.special_ids = sorted(list(set(int(x) for x in self.special_ids)))
-        # self.special_to_local = {sid: i for i, sid in enumerate(self.special_ids)}
-        # self.special_emb = nn.Embedding(len(self.special_ids), self.D) if specials_in_D else None
-
     @torch.no_grad()
     def stage_codebook(self, s: int) -> torch.Tensor:
         # Return d_c codebook of stage s, detached so no grads leak into VQ from expander.
         return self.vq.stages[s].codebook.detach()
 
-    # def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
-    #     """
-    #     idx: (B, L) composed ids including specials.
-    #     returns: (B, L, D)
-    #     """
-    #     B, L = idx.shape
-    #     # specials
-    #     special_mask = torch.zeros_like(idx, dtype=torch.bool)
-    #     for sid in self.special_ids:
-    #         special_mask |= (idx == sid)
-    #
-    #     # non-special: sum stage vectors in d_c, then up to D
-    #     out = torch.zeros(B, L, self.D, device=idx.device, dtype=self.vq.up.weight.dtype)
-    #
-    #     if (~special_mask).any():
-    #         digits, _ = ComposedIndexCodec(self.K, self.depth,
-    #                                        self.vq.bos_token_id, self.vq.eos_token_id,
-    #                                        self.vq.padding_token_id, self.vq.eop_token_id).decompose(idx)
-    #         y_dc = torch.zeros(B, L, self.d_c, device=idx.device, dtype=self.vq.up.weight.dtype)
-    #         for s in range(self.depth):
-    #             W = self.stage_codebook(s)               # (K, d_c)
-    #             y_dc = y_dc + F.embedding(digits[s], W)  # (B, L, d_c)
-    #         out_ns = self.up(y_dc)                       # (B, L, D)
-    #         out = torch.where((~special_mask).unsqueeze(-1), out_ns, out)
-    #
-    #     if self.special_emb is not None and special_mask.any():
-    #         # map specials to [0..num_special-1]
-    #         local = idx.clone()
-    #         for sid, j in self.special_to_local.items():
-    #             local[idx == sid] = j
-    #         out_sp = self.special_emb(local.clamp_min(0))
-    #         out = torch.where(special_mask.unsqueeze(-1), out_sp, out)
-    #
-    #     return out
 
-    # def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
-    #     """
-    #     idx: (B, L) composed ids including specials.
-    #     returns: (B, L, D)
-    #     Safe under torch.compile: never passes OOB indices to Embedding.
-    #     """
-    #     B, L = idx.shape
-    #     device = idx.device
-    #     out = torch.zeros(B, L, self.D, device=device, dtype=self.vq.up.weight.dtype)
-    #
-    #     # ----- specials mask -----
-    #     special_mask = torch.zeros_like(idx, dtype=torch.bool)
-    #     for sid in self.special_ids:
-    #         special_mask |= (idx == sid)
-    #
-    #     # ----- non-special path (sum stage vectors in d_c -> up to D) -----
-    #     if (~special_mask).any():
-    #         # Decompose once
-    #         digits, _ = ComposedIndexCodec(self.K, self.depth,
-    #                                        self.vq.bos_token_id, self.vq.eos_token_id,
-    #                                        self.vq.padding_token_id, self.vq.eop_token_id).decompose(idx)
-    #         y_dc = torch.zeros(B, L, self.d_c, device=device, dtype=self.vq.up.weight.dtype)
-    #         for s in range(self.depth):
-    #             W = self.stage_codebook(s)  # (K, d_c)
-    #             # Ensure indices are valid at special positions too (map specials -> 0)
-    #             idx_s = digits[s]
-    #             if special_mask.any():
-    #                 idx_s = torch.where(special_mask, idx_s.new_zeros(()), idx_s)
-    #             y_dc = y_dc + F.embedding(idx_s, W)
-    #         out_ns = self.up(y_dc)
-    #         out = torch.where((~special_mask).unsqueeze(-1), out_ns, out)
-    #
-    #     # ----- specials path (tiny table) -----
-    #     if self.special_emb is not None and special_mask.any():
-    #         # Build a safe index tensor: 0 everywhere, mapped j at special positions
-    #         local = torch.zeros_like(idx, dtype=torch.long)
-    #         for sid, j in self.special_to_local.items():
-    #             local = torch.where(idx == sid, local.new_full((), j), local)
-    #         # This call is now in-range for *all* positions
-    #         out_sp = self.special_emb(local)
-    #         out = torch.where(special_mask.unsqueeze(-1), out_sp, out)
-    #
-    #     return out
-
-    #
-    # def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
-    #     idx = idx.long()
-    #     B, L = idx.shape
-    #     dev = idx.device
-    #     out = torch.zeros(B, L, self.D, device=dev, dtype=self.up.Wdc.dtype)
-    #
-    #     # specials mask
-    #     special_mask = torch.zeros_like(idx, dtype=torch.bool)
-    #     for sid in self.special_ids:
-    #         special_mask |= (idx == sid)
-    #
-    #     # non-special path: sum stage vectors in d_c -> up to D
-    #     if (~special_mask).any():
-    #         idx_ns = idx.masked_fill(special_mask, 0)      # sanitize
-    #         digits, _ = self.vq.codec.decompose(idx_ns)    # [ (B,L) ] len=depth
-    #         y_dc = torch.zeros(B, L, self.d_c, device=dev, dtype=self.up.Wdc.dtype)
-    #         for s in range(self.depth):
-    #             W = self.stage_codebook(s)                 # (K, d_c)
-    #             y_dc = y_dc + F.embedding(digits[s], W)
-    #         out_ns = self.up(y_dc)                         # (B,L,D_tgt)
-    #         out[~special_mask] = out_ns[~special_mask]
-    #
-    #     # specials path: small table, guaranteed in-range
-    #     if self.special_emb is not None and special_mask.any():
-    #         local = torch.zeros_like(idx)
-    #         for sid, j in self.special_to_local.items():
-    #             local[idx == sid] = j
-    #         out_sp = self.special_emb(local)
-    #         out[special_mask] = out_sp[special_mask]
-    #
-    #     return out
 
     def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
         """
@@ -787,43 +638,6 @@ class RVQFactorizedHead(nn.Module):
 
         special_logits = self.special_head(h) if self.has_specials else None
         return {"stage_logits": out, "special_logits": special_logits}
-
-
-# class LearnedCodebookAdapter(nn.Module):
-#     """
-#     Bottom-level adapter with a *single* stage (depth=1).
-#     - codebook: (K, d_c)  learned
-#     - up: d_c -> D  (and down: D -> d_c) so we can reuse the same head
-#     """
-#     def __init__(self, K: int, D: int, d_c: int = 64, tie_up_down: bool = True):
-#         super().__init__()
-#         self.K, self.D, self.d_c, self.depth = int(K), int(D), int(d_c), 1
-#
-#         self.special_emb = None  # no special handling here
-#
-#         # Factorized byte embedding
-#         self._codebook = nn.Embedding(self.K, self.d_c)     # stage 0
-#         self.down = nn.Linear(self.D, self.d_c, bias=False) # for the head
-#         self.up   = nn.Linear(self.d_c, self.D, bias=False) # for inputs
-#
-#         # Optional tying (like ALBERT)
-#         if tie_up_down:
-#             self.up.weight = self.down.weight.T  # weight sharing
-#
-#         nn.init.normal_(self._codebook.weight, std=0.02)
-#         nn.init.xavier_uniform_(self.down.weight)
-#
-#     def stage_codebook(self, s: int = 0) -> torch.Tensor:
-#         assert s == 0, "Depth=1 adapter: only stage 0 exists."
-#         return self._codebook.weight  # (K, d_c)
-#
-#     @torch.no_grad()
-#     def embed_ids_dc(self, ids: torch.Tensor) -> torch.Tensor:
-#         return self._codebook(ids)    # (B,L,d_c)
-#
-#     def embed_composed(self, ids: torch.Tensor) -> torch.Tensor:
-#         # bytes (and EOS/EOP) are predicted *in the same K*; no special head needed
-#         return self.up(self._codebook(ids))  # (B,L,D)
 
 class LearnedCodebookAdapter(nn.Module):
     """
