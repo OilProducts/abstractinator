@@ -7,7 +7,7 @@ from .mla import CausalMLATransformerBlock
 from .vector_quantizer import VectorQuantizer
 
 
-@torch.compile(dynamic=True)
+# @torch.compile(dynamic=True)
 class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 
@@ -50,6 +50,8 @@ class CodeSequenceTransformer(nn.Module):
         self.final_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, embed_dim)
 
+
+    @torch.compile
     def forward(
         self,
         input_embeddings: torch.Tensor,

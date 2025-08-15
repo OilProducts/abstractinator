@@ -9,24 +9,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def safe_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Identical to soft‑max on `scores.masked_fill(mask, -inf)` *except*
-    rows where everything is masked yield a zero vector (no NaNs).
-    """
-    scores = scores.masked_fill(mask, float("-inf"))
+def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None = None, dim: int = -1, eps: float = 1e-20) -> torch.Tensor:
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
 
-    # Identify rows that are completely −inf
-    all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
+    # Rowwise max; guard all -inf rows
+    row_max = scores.max(dim=dim, keepdim=True).values
+    row_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
+    scores = scores - row_max
 
-    # Replace −inf with 0 in such rows so exp() = 1 → softmax = 1/rowlen
-    safe_scores = scores.masked_fill(all_masked, 0.0)
+    exp = torch.exp(scores)
+    if mask is not None:
+        exp = exp.masked_fill(mask, 0.0)
 
-    attn = torch.softmax(safe_scores, dim=dim)
+    denom = exp.sum(dim=dim, keepdim=True)
+    return exp / torch.clamp_min(denom, eps)
 
-    # Bring the fully‑masked rows back to exact zeros
-    attn = attn.masked_fill(all_masked, 0.0)
-    return attn
+
+
+# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None, dim: int = -1) -> torch.Tensor:
+#     # Apply provided mask if present
+#     if mask is not None:
+#         scores = scores.masked_fill(mask, float("-inf"))
+#
+#     # Always guard against fully-masked rows (all -inf), even if mask is None.
+#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
+#
+#     # Replace -inf with 0 so softmax's internal max-subtraction doesn't generate NaNs.
+#     safe_scores = scores.masked_fill(all_masked, 0.0)
+#
+#     attn = torch.softmax(safe_scores, dim=dim)
+#     return attn.masked_fill(all_masked, 0.0)
+
+
+# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
+#     """
+#     Identical to soft‑max on `scores.masked_fill(mask, -inf)` *except*
+#     rows where everything is masked yield a zero vector (no NaNs).
+#     """
+#     scores = scores.masked_fill(mask, float("-inf"))
+#
+#     # Identify rows that are completely −inf
+#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
+#
+#     # Replace −inf with 0 in such rows so exp() = 1 → softmax = 1/rowlen
+#     safe_scores = scores.masked_fill(all_masked, 0.0)
+#
+#     attn = torch.softmax(safe_scores, dim=dim)
+#
+#     # Bring the fully‑masked rows back to exact zeros
+#     attn = attn.masked_fill(all_masked, 0.0)
+#     return attn
+
+# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None, dim: int = -1) -> torch.Tensor:
+#     if mask is not None:
+#         scores = scores.masked_fill(mask, float("-inf"))
+#     return torch.softmax(scores, dim=dim) if mask is None else _safe_softmax_with_mask(scores, mask, dim)
+#
+# def _safe_softmax_with_mask(scores, mask, dim):
+#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
+#     safe_scores = scores.masked_fill(all_masked, 0.0)
+#     attn = torch.softmax(safe_scores, dim=dim)
+#     return attn.masked_fill(all_masked, 0.0)
+
 
 
 def short_num(n):
@@ -262,6 +307,61 @@ def get_tiled_queries(base_queries: torch.Tensor, B: int, S_hat: int) -> torch.T
     # ---- 4. Add batch dim and broadcast -----------------------------------
     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
 
+# utils_segment_queries.py (or wherever you keep helpers)
+
+from typing import Tuple
+import torch
+
+@torch.no_grad()
+def build_segment_queries_qseg(
+    seg_id: torch.Tensor,        # [B, S] int; token -> segment id
+    query_embed: torch.Tensor,   # [L, D] learned template
+    *,
+    Q_max: int,                  # constant total #queries per item
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build segment-aware queries *without* a dense (B·H,Q,S) mask.
+
+    Returns
+    -------
+    queries : (B, Q_max, D)
+    q_seg   : (B, Q_max) int   (segment id for each query; -1 for padded queries)
+    valid_segments_mask : (B, S_hat_cap) bool where S_hat_cap = Q_max // L
+    """
+    B, S = seg_id.shape
+    L, D = query_embed.shape
+    device = seg_id.device
+
+    # Enforce Q_max multiple of L (compile-stable shapes)
+    S_hat_cap = max(1, int(Q_max // L))
+    Q_max = int(S_hat_cap * L)
+
+    # Per-sample #segments
+    seg_count = seg_id.amax(dim=1) + 1  # [B], >=1
+
+    # (1) Tile the L learned queries across S_hat_cap segment slots
+    #     Shape is constant: (B, S_hat_cap, L, D) -> (B, Q_max, D)
+    queries = (
+        query_embed.unsqueeze(0).unsqueeze(0)     # [1,1,L,D]
+        .expand(B, S_hat_cap, L, D)               # [B,S_hat_cap,L,D]
+        .reshape(B, Q_max, D)                     # [B,Q_max,D]
+        .contiguous()
+    )
+
+    # (2) q_seg: segment id per query (0..S_hat_cap-1 for real slots, -1 for invalid)
+    q_pos = torch.arange(Q_max, device=device)           # [Q_max]
+    seg_idx_per_q = (q_pos // L)                         # [Q_max] 0..S_hat_cap-1
+    q_seg = seg_idx_per_q.unsqueeze(0).expand(B, Q_max).clone()  # [B,Q_max]
+    # mark queries that belong to non-existent segments
+    invalid_q = seg_idx_per_q.unsqueeze(0) >= seg_count.unsqueeze(1)   # [B,Q_max]
+    q_seg[invalid_q] = -1
+
+    # (3) valid segments per item: [B, S_hat_cap]
+    valid_segments_mask = (
+        torch.arange(S_hat_cap, device=device).unsqueeze(0) < seg_count.unsqueeze(1)
+    )
+
+    return queries, q_seg, valid_segments_mask
 
 def build_segment_queries_mask(
     seg_id: torch.Tensor,  # [B, S_original]   – integer segment ids
@@ -296,48 +396,6 @@ def build_segment_queries_mask(
     B, S_original = seg_id.shape
     L, D = query_embed.shape
     device = seg_id.device
-
-    # ----------------------------------------------------------------------
-    # 1.  Maximum #segments in the batch (scalar SymInt, NOT Python int)
-    # ----------------------------------------------------------------------
-    # seg_count = seg_id.amax(dim=1) + 1  # (B,)  actual segments per item
-    # S_hat = seg_count.amax()  # 0‑D tensor / SymInt ✔️
-    #
-    # # ----------------------------------------------------------------------
-    # # 2.  Build queries   [B, S_hat * L, D]
-    # # ----------------------------------------------------------------------
-    # #   Expand with SymInt S_hat – no Python conversion.
-    # queries = (
-    #     query_embed.unsqueeze(0)  # [L, D]  # [1, L, D]
-    #     .unsqueeze(0)  # [1, 1, L, D]
-    #     .expand(B, S_hat, L, D)  # [B, S_hat, L, D]
-    #     .reshape(B, -1, D)  # [B, S_hat*L, D]
-    # )
-    #
-    # # ----------------------------------------------------------------------
-    # # 3.  Segment‑id for every query   [B, S_hat*L]
-    # # ----------------------------------------------------------------------
-    # # Build with arithmetic on SymInts – still no .item().
-    # q_positions = torch.arange(queries.shape[1], device=device)  # 0 … S_hat*L‑1
-    # seg_for_q = (q_positions // L).expand(B, -1)  # repeat for batch
-    #
-    # # ----------------------------------------------------------------------
-    # # 4.  Attention mask   [B*num_heads, S_hat*L, S_original]   (True ⇒ BLOCK)
-    # # ----------------------------------------------------------------------
-    # same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])  # broadcast compare
-    # att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
-    #
-    # # ----------------------------------------------------------------------
-    # # 5.  Valid segment slots   [B, S_hat]
-    # # ----------------------------------------------------------------------
-    # valid_segments = (
-    #     torch.arange(S_hat, device=device)  # 0 … S_hat‑1   (SymInt end)
-    #     .unsqueeze(0)
-    #     .lt(seg_count.unsqueeze(1))  # i < seg_count[b]
-    # )
-    #
-    # return queries, att_mask, valid_segments
-
 
     seg_count = seg_id.amax(dim=1) + 1  # (B,)
     if Q_max is None:

@@ -10,66 +10,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn.attention.flex_attention import and_masks, create_block_mask, flex_attention
 
+from .rope import RoPECache, apply_rope
 from .swiglu import SwiGLU
 from .utils import safe_softmax
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Swap and negate the last‑dimensional halves: (x1, x2) → (‑x2, x1)."""
-    x1, x2 = x[..., : x.size(-1) // 2], x[..., x.size(-1) // 2 :]
-    return torch.cat([-x2, x1], dim=-1)
-
-
-def _apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
-    """
-    Standard RoPE:  (x_even, x_odd) → (x_even·cos – x_odd·sin, x_even·sin + x_odd·cos)
-    `sin`/`cos` must be broadcast‑compatible with `x`.
-    """
-    return (x * cos) + (_rotate_half(x) * sin)
-
-
-class _RoPECache:
-    """
-    Cache (sin, cos) per (dim, device, dtype). Grow tables when needed and return slices.
-    Keeping dict size constant avoids Dynamo guards like len(_cache) == N.
-    """
-
-    _cache: dict[tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, int]] = {}
-
-    @staticmethod
-    def _build_tables(L: int, dim: int, device: torch.device, out_dtype: torch.dtype):
-        # build in fp32 for accurate sin/cos, then cast
-        inv = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
-        t = torch.arange(L, device=device, dtype=torch.float32)
-        f = torch.einsum('l,d->ld', t, inv)  # [L, dim/2] fp32
-        sin = f.sin().repeat_interleave(2, dim=-1).contiguous()
-        cos = f.cos().repeat_interleave(2, dim=-1).contiguous()
-        if out_dtype != torch.float32:
-            sin = sin.to(out_dtype)
-            cos = cos.to(out_dtype)
-        return sin, cos
-
-    @classmethod
-    @dynamo.disable  # keep Python dict ops & len(_cache) out of the compiled graph
-    def get(cls, need_len: int, dim: int, device: torch.device, dtype: torch.dtype):
-        key = (dim, device, dtype)
-        if key not in cls._cache:
-            init_len = max(need_len, 1024)  # start big enough to avoid frequent rebuilds
-            sin, cos = cls._build_tables(init_len, dim, device, dtype)
-            cls._cache[key] = (sin, cos, init_len)
-        else:
-            sin, cos, cur_len = cls._cache[key]
-            if need_len > cur_len:
-                new_len = max(cur_len * 2, need_len)
-                sin, cos = cls._build_tables(new_len, dim, device, dtype)
-                cls._cache[key] = (sin, cos, new_len)
-        sin, cos, _ = cls._cache[key]
-        return sin[:need_len], cos[:need_len]
-
-    @classmethod
-    def clear(cls) -> None:
-        cls._cache.clear()
-
 
 class MultiheadLatentAttention(nn.Module):
     """
@@ -118,12 +61,25 @@ class MultiheadLatentAttention(nn.Module):
 
         self._init_weights()
 
+        # pick dtype/device from a real param so it follows .to() and AMP
+        param = self.q_proj.weight
+        self.rope = RoPECache(
+            max_seqlen=2048,
+            head_dim=self.r,  # <-- rotate in retrieval space
+            device=param.device,
+            dtype=param.dtype,
+        )
+
         self.score_mod = score_mod or (lambda s, *_: s)  # identity if none
         self.use_flex_attention = use_flex_attention
         if self.use_flex_attention:
             self._attn = self._flex_attention
         else:
             self._attn = self._fallback_attention
+
+        self._pad_for_scores = None  # [B, S] bool or None
+        self._q_seg_for_scores = None  # [B, Q] int or None
+        self._seg_id_for_scores = None  # [B, S] int or None
 
     # ------------------------------------------------------------------ #
     def _init_weights(self):
@@ -136,18 +92,25 @@ class MultiheadLatentAttention(nn.Module):
     # clear RoPE tables when dtype/device flip
     def load_state_dict(self, *a, **kw):
         ret = super().load_state_dict(*a, **kw)
-        _RoPECache.clear()
+        # _RoPECache.clear()
         return ret
 
     def _score_mod_with_pad(self, scores, b, h, q, k):
-        # apply user-provided score_mod first (if any)
-        if self.score_mod is not None:
+
+        # user-provided score_mod first, if any
+        if self.score_mod is not None and self.score_mod is not self._score_mod_with_pad:
             scores = self.score_mod(scores, b, h, q, k)
 
-        pad = getattr(self, "_pad_for_scores", None)
-        if pad is not None:
-            # pad[b, k] shape-broadcasts over the block tile
-            scores = scores.masked_fill(pad[b, k], float("-inf"))
+        # 1) padding (what you already had)
+        if self._pad_for_scores is not None:
+            scores = scores.masked_fill(self._pad_for_scores[b, k], float("-inf"))
+
+        # 2) segment gating (new)
+        if self._q_seg_for_scores is not None and self._seg_id_for_scores is not None:
+            # bad if key's seg != query's seg
+            bad = self._seg_id_for_scores[b, k] != self._q_seg_for_scores[b, q]
+            scores = scores.masked_fill(bad, float("-inf"))
+
         return scores
 
     def _flex_attention(self, q_r, k_r, v_c, *, block_mask: torch.Tensor | None = None):
@@ -206,23 +169,22 @@ class MultiheadLatentAttention(nn.Module):
         _, L, _d = kv_c.shape
         dev, dt = kv_c.device, kv_c.dtype
 
-        # 1) latent → head space
         q_hk = self.q_proj(hidden_q).view(B, S, self.h, self.k)  # [B,S,H,K]
-
-        # 2) big compressed view (only one needed now)
         q_big = torch.einsum('bshk,hkq->bshq', q_hk, self.w_kc_q)  # [B,S,H,d_c′]
 
-        sin_q, cos_q = _RoPECache.get(S, self.d_cq, dev, dt)  # [S, d_c′]
-        q_big = _apply_rope(q_big, sin_q[None, :, None, :], cos_q[None, :, None, :])  # [1,S,1,d_c′]
-
-        sin_k, cos_k = _RoPECache.get(L, self.d_c, dev, dt)
-        kv_c = _apply_rope(kv_c, sin_k[None], cos_k[None])  # [B,L,d_c]
-
-        # 4) retrieval space
+        # Project into the actual scoring space r
         q_r = torch.einsum('bshq,hqr->bshr', q_big, self.W_qr)  # [B,S,H,r]
         q_r = q_r.permute(0, 2, 1, 3)  # [B,H,S,r]
 
         k_r = torch.einsum('bld,hdr->bhlr', kv_c, self.W_kr)  # [B,H,L,r]
+
+        # --- RoPE in retrieval space (the dot-product space) ---
+        cos_S, sin_S = self.rope.slice(S)  # (1,1,S,r/2)
+        q_r = apply_rope(q_r, cos_S, sin_S)  # [B,H,S,r]
+
+        cos_L, sin_L = self.rope.slice(L)  # (1,1,L,r/2)
+        k_r = apply_rope(k_r, cos_L, sin_L)  # [B,H,L,r]
+
         v_c = kv_c.unsqueeze(1).expand(-1, self.h, -1, -1)  # [B,H,L,d_c]
 
         # 5) attention
@@ -434,7 +396,14 @@ class SlidingWindowMLATransformerBlock(nn.Module):
             Output of the Transformer block.
         """
         # Attention (Pre‑LN)
-        x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
+        if torch.isnan(x).any():
+            print('nan')
+        x = self.norm1(x)  # [B, S, D]
+        if torch.isnan(x).any():
+            print('nan')
+        x = x + self.attn(x, key_padding_mask=key_padding_mask)  # [B, S, D]
+
+        # x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
 
         # Feed‑forward (Pre‑LN)
         x = x + self.ffn(self.norm2(x))

@@ -215,7 +215,7 @@ class SlidingDecoderBlock(nn.Module):
             seg_id=seg_ids,
             kv_mask=memory_key_padding_mask,
             q_pad_mask=tgt_key_padding_mask,
-            cache=cross_cache,
+            # cache=cross_cache,
         )
         x = x + self.ffn(self.norm3(x))
         return x
@@ -537,7 +537,8 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                  lo_d_c: int = 64,                    # Factorized rank for bytes
                  residual_conditioning: bool = True,
                  use_sqdist_logits: bool = False,
-                 predict_specials: bool = True):
+                 predict_specials: bool = True,
+                 device: Optional[torch.device] = None):
         super().__init__()
         self.lo_vq = lo_vq
         self.hi_vq = hi_vq
@@ -552,7 +553,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         if lo_vq is not None:
             self.lo_adapt = RVQEmbeddingAdapter(lo_vq, target_D=D,
                                                 use_shared_proj=True,
-                                                tie_up_down=True,
+                                                # tie_up_down=True,
                                                 specials_in_D=True)
             self.lo_codec = ComposedIndexCodec(K=lo_vq.K, depth=lo_vq.depth,
                                                bos=lo_vq.bos_token_id, eos=lo_vq.eos_token_id,
@@ -563,7 +564,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             #                               predict_specials=predict_specials)
         else:
             assert K_lo is not None, "Need K_lo for bottom level when lo_vq is None."
-            self.lo_adapt = LearnedCodebookAdapter(K=K_lo, D=D, d_c=lo_d_c, )
+            self.lo_adapt = LearnedCodebookAdapter(K=K_lo, D=D, d_c=lo_d_c, device=device,)
             self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1, eop=-1)
             # self.head = RVQFactorizedHead(self.lo_adapt,
             #                               residual_conditioning=False,
@@ -631,61 +632,207 @@ class DecoderOnlyExpanderRVQ(nn.Module):
 
         return logits  # {"stage_logits": [B,L,K]*depth, "special_logits": (B,L,S) or None}
 
+
     @torch.no_grad()
-    def generate(self,
-                 codes_hi: torch.Tensor,               # (B, S_hi) or (B, S_hi, D)
-                 src_key_padding_mask: Optional[torch.Tensor] = None,
-                 max_len: Optional[int] = None,
-                 seg_ids: Optional[torch.Tensor] = None
-                 ) -> torch.Tensor:
-        """
-        Autoregressively generates low-level composed codes (B, L).
-        Within each time step, it selects stage indices sequentially (residual RVQ style).
-        """
+    def generate(
+            self,
+            codes_hi: torch.Tensor,  # (B, S_hi) or (B, S_hi, D)
+            codes_lo: torch.Tensor,  # (B, T0)  seed(s)
+            src_key_padding_mask: Optional[torch.Tensor] = None,
+            tgt_key_padding_mask: Optional[torch.Tensor] = None,  # <- compat
+            max_len: Optional[int] = None,
+            max_new_tokens: Optional[int] = None,
+            seg_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         device = codes_hi.device
         B = codes_hi.size(0)
-        Lmax = max_len or self.max_len
-
-        memory = self._embed_memory(codes_hi)     # (B, S_hi, D)
-        generated = torch.full((B, 1), self.eos_id, device=device, dtype=torch.long)
-        kpm = torch.zeros_like(generated, dtype=torch.bool)
+        memory = self._embed_memory(codes_hi)  # (B, S_hi, D)
+        generated = codes_lo.clone()  # (B, T)
+        kpm = tgt_key_padding_mask.clone() if tgt_key_padding_mask is not None \
+            else torch.zeros_like(generated, dtype=torch.bool)
 
         cache = AttnCache()
 
-        for _ in range(Lmax - 1):
-            dec_inp = self.lo_adapt.embed_composed(generated)    # (B, T, D)
-            tgt_mask = self._causal_mask(dec_inp.size(1), device)
+        # steps budget: how many *new* tokens we’re allowed to produce
+        steps_budget = int(max_new_tokens) if max_new_tokens is not None else \
+            int((max_len or self.max_len) - 1)
+        steps_budget = max(0, steps_budget)
 
-            h = self.decoder(dec_inp, memory,
-                             cache=cache,
-                             tgt_mask=tgt_mask,
-                             tgt_key_padding_mask=kpm,
-                             memory_key_padding_mask=src_key_padding_mask,
-                             seg_ids=seg_ids)                    # (B, T, D)
+        # helper: align seg_ids length to current T
+        def _align_seg_ids(curr_T: int) -> torch.Tensor:
+            if seg_ids is None:
+                last_seg = memory.size(1) - 1
+                return torch.full((B, curr_T), last_seg, dtype=torch.long, device=device)
+            if seg_ids.size(1) < curr_T:
+                pad = seg_ids[:, -1:].expand(-1, curr_T - seg_ids.size(1))
+                return torch.cat([seg_ids, pad], dim=1)
+            if seg_ids.size(1) > curr_T:
+                return seg_ids[:, :curr_T]
+            return seg_ids
 
-            last_h = h[:, -1:, :]                                # (B,1,D)
-            # No teacher digits in inference; the head will greedy-condition residuals
-            logits = self.head(last_h, teacher_digits=None)
-            stage_logits: List[torch.Tensor] = logits["stage_logits"]  # each (B,1,K)
+        depth = self.lo_codec.depth  # works for both MS-RVQ and learned single-stage
 
-            # pick stage digits sequentially and compose
+        for _ in range(steps_budget):
+            T = generated.size(1)
+            dec_inp = self.lo_adapt.embed_composed(generated)  # (B, T, D)
+            tgt_mask = self._causal_mask(T, device)
+            seg_ids_cur = _align_seg_ids(T)  # (B, T)
+
+            h = self.decoder(
+                dec_inp, memory,
+                cache=cache,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=kpm,
+                memory_key_padding_mask=src_key_padding_mask,
+                seg_ids=seg_ids_cur,
+            )  # (B, T, D)
+
+            last_h = h[:, -1:, :]  # (B,1,D)
+            r_dc = self.lo_adapt.down(last_h)  # (B,1,d_c)
+
+            # Greedy stage-by-stage with residual updates
             digits = []
-            r_dc = self.lo_adapt.down(last_h)                     # (B,1,d_c)
-            for s in range(self.lo_vq.depth):
-                W = self.lo_adapt.stage_codebook(s)
-                logit_s = self.head._stage_logits(r_dc, W)        # (B,1,K)
-                idx_s = logit_s.argmax(dim=-1)                    # (B,1)
-                digits.append(idx_s.squeeze(1))
-                # residual update
-                r_dc = r_dc - F.embedding(idx_s, W)
-            next_id = self.codec.compose([d for d in digits])     # (B,1)
+            for s in range(depth):
+                W = self.lo_adapt.stage_codebook(s)  # (K, d_c)
+                logit_s = self.head._stage_logits(r_dc, W)  # (B,1,K)
+                idx_s = logit_s.argmax(dim=-1)  # (B,1)
+                digits.append(idx_s)  # keep time dim
+                r_dc = r_dc - F.embedding(idx_s, W)  # (B,1,d_c)
+
+            next_id = self.lo_codec.compose(digits)  # (B,1) or (B,)
+            if next_id.ndim == 1:
+                next_id = next_id.unsqueeze(1)  # (B,1)
 
             generated = torch.cat([generated, next_id], dim=1)
-            # stop early if all EOS/EOP (optional)
+            if kpm is not None:
+                kpm = F.pad(kpm, (0, 1), value=False)  # newly appended is real
+
+            # optional early stop if you actually predict specials
             if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
                 break
 
-            # keep mask all non-pad
-            kpm = torch.zeros_like(generated, dtype=torch.bool)
-
         return generated
+    #
+    # @torch.no_grad()
+    # def generate(self,
+    #              codes_hi: torch.Tensor,               # (B, S_hi) or (B, S_hi, D)
+    #              codes_lo: Optional[torch.Tensor] = None,  # (B, L) or None
+    #              src_key_padding_mask: Optional[torch.Tensor] = None,
+    #              max_len: Optional[int] = None,
+    #              max_new_tokens: Optional[int] = None,
+    #              seg_ids: Optional[torch.Tensor] = None
+    #              ) -> torch.Tensor:
+    #     """
+    #     Autoregressively generates low-level composed codes (B, L).
+    #     Within each time step, it selects stage indices sequentially (residual RVQ style).
+    #     """
+    #     device = codes_hi.device
+    #     memory = self._embed_memory(codes_hi)     # (B, S_hi, D)
+    #
+    #     if codes_lo is None:
+    #         B = memory.size(0)
+    #         generated = torch.full((B, 1), self.eos_id, device=device, dtype=torch.long)
+    #     else:
+    #         B, _ = codes_lo.shape
+    #         generated = codes_lo.clone()  # (B, L)
+    #
+    #     hard_cap = int(max_len or self.max_len)
+    #     plan_len = None
+    #
+    #     if seg_ids is not None and isinstance(seg_ids, (tuple, list)) and len(seg_ids == 2):
+    #         _, q_seg_full = seg_ids
+    #         # q_seg_full: (B, T_plan). We decode at most this many steps.
+    #         plan_len = int(q_seg_full.size(1))
+    #     target_len = hard_cap if plan_len is None else min(hard_cap, plan_len)
+    #
+    #     # Also respect max_new_tokens if set
+    #     if max_new_tokens is not None:
+    #         target_len = min(target_len, generated.size(1) + int(max_new_tokens))
+    #         # No padding in an ever-growing decode buffer; keep a dummy mask of zeros
+    #         kpm = torch.zeros_like(generated, dtype=torch.bool)
+    #
+    #     # # B = codes_hi.size(0)
+    #     # Lmax = max_len or self.max_len
+    #     # B, L = codes_lo.shape
+    #     #
+    #     # # generated = torch.full((B, 1), self.eos_id, device=device, dtype=torch.long)
+    #     # # if tgt_key_padding_mask is None:
+    #     # kpm = torch.zeros_like(codes_lo, dtype=torch.bool)
+    #     # # kpm = torch.zeros_like(generated, dtype=torch.bool)
+    #     # generated = codes_lo.clone()
+    #
+    #     cache = AttnCache()
+    #
+    #     # Decode until we reach the target length
+    #     while generated.size(1) < target_len:
+    #         dec_inp = self.lo_adapt.embed_composed(generated)  # (B, T, D)
+    #         tgt_mask = self._causal_mask(dec_inp.size(1), device)
+    #
+    #         h = self.decoder(dec_inp, memory,
+    #                          cache=cache,
+    #                          tgt_mask=tgt_mask,
+    #                          tgt_key_padding_mask=kpm,
+    #                          memory_key_padding_mask=src_key_padding_mask,
+    #                          seg_ids=seg_ids)  # (B, T, D)
+    #
+    #         last_h = h[:, -1:, :]  # (B,1,D)
+    #         # pick stage digits sequentially and compose
+    #         digits = []
+    #         r_dc = self.lo_adapt.down(last_h)  # (B,1,d_c)
+    #         for s in range(self.lo_vq.depth):
+    #             W = self.lo_adapt.stage_codebook(s)
+    #             logit_s = self.head._stage_logits(r_dc, W)  # (B,1,K)
+    #             idx_s = logit_s.argmax(dim=-1)  # (B,1)
+    #             digits.append(idx_s)
+    #             # residual update
+    #             r_dc = r_dc - F.embedding(idx_s, W)
+    #         next_id = self.lo_codec.compose([d for d in digits])  # (B,1)
+    #         generated = torch.cat([generated, next_id], dim=1)
+    #         if next_id.ndim == 1:
+    #             next_id = next_id.unsqueeze(1)
+    #         # stop early if all EOS/EOP (optional)
+    #         if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
+    #             break
+    #
+    #         # keep mask all non-pad
+    #         kpm = torch.zeros_like(generated, dtype=torch.bool)
+    #
+    #     return generated
+
+        # for _ in range(Lmax - 1):
+        #     dec_inp = self.lo_adapt.embed_composed(generated)    # (B, T, D)
+        #     tgt_mask = self._causal_mask(dec_inp.size(1), device)
+        #
+        #     h = self.decoder(dec_inp, memory,
+        #                      cache=cache,
+        #                      tgt_mask=tgt_mask,
+        #                      tgt_key_padding_mask=kpm,
+        #                      memory_key_padding_mask=src_key_padding_mask,
+        #                      seg_ids=seg_ids)                    # (B, T, D)
+        #
+        #     last_h = h[:, -1:, :]                                # (B,1,D)
+        #     # No teacher digits in inference; the head will greedy-condition residuals
+        #     logits = self.head(last_h, teacher_digits=None)
+        #     stage_logits: List[torch.Tensor] = logits["stage_logits"]  # each (B,1,K)
+        #
+        #     # pick stage digits sequentially and compose
+        #     digits = []
+        #     r_dc = self.lo_adapt.down(last_h)                     # (B,1,d_c)
+        #     for s in range(self.lo_vq.depth):
+        #         W = self.lo_adapt.stage_codebook(s)
+        #         logit_s = self.head._stage_logits(r_dc, W)        # (B,1,K)
+        #         idx_s = logit_s.argmax(dim=-1)                    # (B,1)
+        #         digits.append(idx_s.squeeze(1))
+        #         # residual update
+        #         r_dc = r_dc - F.embedding(idx_s, W)
+        #     next_id = self.lo_codec.compose([d for d in digits])     # (B,1)
+        #
+        #     generated = torch.cat([generated, next_id], dim=1)
+        #     # stop early if all EOS/EOP (optional)
+        #     if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
+        #         break
+        #
+        #     # keep mask all non-pad
+        #     kpm = torch.zeros_like(generated, dtype=torch.bool)
+        #
+        # return generated
