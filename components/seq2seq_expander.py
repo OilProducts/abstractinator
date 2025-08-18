@@ -2,6 +2,7 @@
 # CodeExpander: Sequence-to-Sequence model using the custom Transformer blocks. Saved here for reference.
 # ---------------------------------------------------------------------------
 from functools import lru_cache
+import math
 
 import torch
 import torch.nn as nn
@@ -9,7 +10,187 @@ import torch.nn.functional as F
 from typing import Optional
 
 from .swiglu import SwiGLU
-from .expander import MultiHeadAttentionRoPE
+from .rope import RoPECache, apply_rope
+# ---------------------------------------------------------------------------
+# Multi-Head Attention with RoPE
+# ---------------------------------------------------------------------------
+class MultiHeadAttentionRoPE(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, causal: bool = False):
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.causal = causal
+
+        self.rope = RoPECache(max_seqlen=2048, head_dim=self.head_dim, dtype=torch.bfloat16, device="cuda")
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        B, L_q, _ = query.shape
+        L_k = key.size(1)
+        H, d = self.num_heads, self.head_dim
+
+        q = self.q_proj(query).view(B, L_q, H, d).transpose(1, 2)  # (B,H,Lq,d)
+        k = self.k_proj(key).view(B, L_k, H, d).transpose(1, 2)
+        v = self.v_proj(value).view(B, L_k, H, d).transpose(1, 2)
+
+        # q = apply_rope(q)
+        # k = apply_rope(k)
+
+        L = q.size(-2)
+        cos, sin = self.rope.slice(L)  # views only, no kernels
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                scores = scores.masked_fill(attn_mask.bool()[None, None, :, :], float('-inf'))
+            else:
+                scores = scores.masked_fill(attn_mask.bool(), float('-inf'))
+        if key_padding_mask is not None:
+            mask = key_padding_mask[:, None, None, :].bool()
+            scores = scores.masked_fill(mask, float('-inf'))
+        if self.causal:
+            causal_mask = torch.triu(torch.ones(L_q, L_k, device=query.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)  # (B,H,Lq,d)
+        out = out.transpose(1, 2).contiguous().view(B, L_q, self.d_model)
+        return self.o_proj(out)
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-Head Attention with RoPE applied to Q and K.
+
+    Parameters
+    ----------
+    d_model   : total model width
+    num_heads : number of attention heads (d_model % num_heads == 0)
+    causal    : if True, apply standard causal (lower-triangular) masking
+
+    Notes
+    -----
+    - Accepts self- or cross-attention inputs (query vs key/value).
+    - RoPE tables are cached once per module via `RoPECache`.
+    """
+
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            causal: bool = False,
+            bias: bool = False,
+            rope_max_seqlen: int = 2048,
+            rope_base: float = 10000.0,
+            device: Optional[torch.device] = None
+    ):
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.causal = causal
+
+        # Cache is bf16 to reduce memory bandwidth; slices are views.
+        self.rope = RoPECache(
+            max_seqlen=2048,
+            head_dim=self.head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        # Standard projections (no bias change here for parity with original).
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
+
+    def forward(
+            self,
+            query: torch.Tensor,  # (B, L_q, d_model)
+            key: Optional[torch.Tensor] = None,  # (B, L_k, d_model)
+            value: Optional[torch.Tensor] = None,  # (B, L_k, d_model)
+            attn_mask: Optional[torch.Tensor] = None,  # broadcastable to (B, H, L_q, L_k)
+            key_padding_mask: Optional[torch.Tensor] = None,  # (B, L_k), True = mask
+    ) -> torch.Tensor:
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        B, L_q, _ = query.shape
+        L_k = key.size(1)
+        H, d = self.num_heads, self.head_dim
+        inv_sqrt_d = 1.0 / math.sqrt(d)
+
+        # Project and reshape into (B, H, L, d).
+        q = self.q_proj(query).view(B, L_q, H, d).transpose(1, 2)  # (B,H,L_q,d)
+        k = self.k_proj(key).view(B, L_k, H, d).transpose(1, 2)  # (B,H,L_k,d)
+        v = self.v_proj(value).view(B, L_k, H, d).transpose(1, 2)  # (B,H,L_k,d)
+
+        # Apply RoPE with per-length slices (views only).
+        cos_q, sin_q = self.rope.slice(L_q)
+        cos_k, sin_k = self.rope.slice(L_k)
+        q = apply_rope(q, cos_q, sin_q)
+        k = apply_rope(k, cos_k, sin_k)
+
+        # Attention scores: (B, H, L_q, L_k)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * inv_sqrt_d
+
+        # Optional masks -------------------------------------------------------
+        # attn_mask: supports 2D (L_q, L_k), 3D (B, L_q, L_k), or 4D (B, H, L_q, L_k).
+        if attn_mask is not None:
+            m = attn_mask
+            if m.dim() == 2:  # (L_q, L_k)
+                m = m[None, None, :, :]
+            elif m.dim() == 3:  # (B, L_q, L_k)
+                m = m[:, None, :, :]
+            # else assume already broadcastable 4D
+            scores = scores.masked_fill(m.bool(), float("-inf"))
+
+        # key_padding_mask: (B, L_k) -> broadcast to (B, H, L_q, L_k).
+        if key_padding_mask is not None:
+            m = key_padding_mask[:, None, None, :].bool()
+            scores = scores.masked_fill(m, float("-inf"))
+
+        # Causal mask: lower-triangular (query cannot see future keys).
+        if self.causal:
+            causal = torch.triu(
+                torch.ones(L_q, L_k, dtype=torch.bool, device=scores.device),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(causal, float("-inf"))
+        # ----------------------------------------------------------------------
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)  # (B,H,L_q,d)
+        out = out.transpose(1, 2).contiguous().view(B, L_q, self.d_model)
+        return self.o_proj(out)
+
 
 @lru_cache(maxsize=64)
 def _cached_causal_mask(length: int) -> torch.Tensor:
