@@ -9,8 +9,6 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from .utils import safe_softmax
 
-
-# @torch.compile
 class LearnedQueryAttention(nn.Module):
     """
     Multi-Head Attention where queries are derived from a set of learned vectors.
@@ -77,17 +75,6 @@ class LearnedQueryAttention(nn.Module):
 
         self.use_flex_attention = use_flex_attention
 
-        self._reset_parameters()
-
-        self._pad_for_scores: Optional[torch.Tensor]    = None  # [B, S] bool
-        self._qseg_for_scores: Optional[torch.Tensor]   = None  # [B, Q] int (−1 = invalid/pad query)
-        self._segid_for_scores: Optional[torch.Tensor]  = None  # [B, S] int
-
-    def _reset_parameters(self):
-        """
-        Initializes the weights of projection layers and the query template.
-        Uses Xavier uniform for projection weights and normal distribution for the query template.
-        """
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
@@ -95,129 +82,10 @@ class LearnedQueryAttention(nn.Module):
         # Initialize query_template with a small standard deviation
         nn.init.normal_(self.query_template, std=0.02)
 
+        self._pad_for_scores: Optional[torch.Tensor]    = None  # [B, S] bool
+        self._qseg_for_scores: Optional[torch.Tensor]   = None  # [B, Q] int (−1 = invalid/pad query)
+        self._segid_for_scores: Optional[torch.Tensor]  = None  # [B, S] int
 
-    # def _score_mod(self, scores, b, h, q, k):
-    #     """
-    #     scores: (Q_tile, K_tile)
-    #     b, h  : ints
-    #     q     : LongTensor shape () or (Q_tile,)
-    #     k     : LongTensor shape () or (K_tile,)
-    #     """
-    #     # 1) Make q/k explicitly 1-D so indexing and unsqueeze are shape-stable
-    #     q_idx = q.reshape(-1)  # () or (Q) -> (Q,)
-    #     k_idx = k.reshape(-1)  # () or (K) -> (K,)
-    #
-    #     # 2) Mask padded **keys** (K-only): (K,) -> (1, K)
-    #     if self._pad_for_scores is not None:
-    #         key_pad_1d = self._pad_for_scores[b].index_select(0, k_idx)  # (K,)
-    #         key_pad = key_pad_1d.unsqueeze(0)  # (1, K)
-    #         scores = scores.masked_fill(key_pad, float("-inf"))
-    #
-    #     # 3) Invalid **queries** (Q-only): (Q,) -> (Q,1)
-    #     if self._qseg_for_scores is not None:
-    #         qseg_1d = self._qseg_for_scores[b].index_select(0, q_idx)  # (Q,)
-    #         invalid_q = (qseg_1d < 0).unsqueeze(1)  # (Q,1)
-    #         scores = scores.masked_fill(invalid_q, float("-inf"))
-    #
-    #     # 4) Segment mismatch (Q,K) : (Q,1) vs (1,K) -> (Q,K)
-    #     if (self._qseg_for_scores is not None) and (self._segid_for_scores is not None):
-    #         # reuse qseg_1d if computed above; otherwise compute it now
-    #         if 'qseg_1d' not in locals():
-    #             qseg_1d = self._qseg_for_scores[b].index_select(0, q_idx)  # (Q,)
-    #         kseg_1d = self._segid_for_scores[b].index_select(0, k_idx)  # (K,)
-    #
-    #         qseg = qseg_1d.unsqueeze(1)  # (Q,1)
-    #         kseg = kseg_1d.unsqueeze(0)  # (1,K)
-    #         mismatch = (qseg != kseg)  # (Q,K)
-    #         scores = scores.masked_fill(mismatch, float("-inf"))
-    #
-    #     return scores
-
-    # def _score_mod(self, scores, b, h, q, k):
-    #     """
-    #     scores: (Q_tile, K_tile)
-    #     b, h  : ints
-    #     q     : LongTensor shape () or (Q_tile,)
-    #     k     : LongTensor shape () or (K_tile,)
-    #     """
-    #     # 1) Make q/k explicitly 1‑D so indexing and unsqueeze are shape‑stable
-    #     q_idx = q.reshape(-1)  # () or (Q) -> (Q,)
-    #     k_idx = k.reshape(-1)  # () or (K) -> (K,)
-    #
-    #     pad = self._pad_for_scores  # [B, S] bool or None
-    #     qsegS = self._qseg_for_scores  # [B, Q] long or None
-    #     ksegS = self._segid_for_scores  # [B, S] long or None
-    #
-    #     # 2) Mask padded **keys** (K-only): (K,) -> (1, K)
-    #     if pad is not None:
-    #         key_pad = pad[b].index_select(0, k_idx).unsqueeze(0)  # (1, K)
-    #         scores = scores.masked_fill(key_pad, float("-inf"))
-    #
-    #     # 3) Invalid **queries** (Q-only): (Q,) -> (Q,1)
-    #     qseg_1d = qsegS[b].index_select(0, q_idx) if qsegS is not None else None
-    #     if qseg_1d is not None:
-    #         invalid_q = (qseg_1d < 0).unsqueeze(1)  # (Q,1)
-    #         scores = scores.masked_fill(invalid_q, float("-inf"))
-    #
-    #     # 4) Segment mismatch (Q,K): (Q,1) vs (1,K) -> (Q,K)
-    #     if (qseg_1d is not None) and (ksegS is not None):
-    #         kseg_1d = ksegS[b].index_select(0, k_idx)  # (K,)
-    #         mismatch = (qseg_1d.unsqueeze(1) != kseg_1d.unsqueeze(0))
-    #         scores = scores.masked_fill(mismatch, float("-inf"))
-    #
-    #     return scores
-
-
-    def _score_mod(self, scores, b, h, q, k):
-        """
-        scores: (Q_tile, K_tile)
-        b, h  : ints
-        q     : LongTensor of shape (), (Q_tile,), or (Q_tile, 1)
-        k     : LongTensor of shape (), (K_tile,), or (1, K_tile)
-        """
-        # Coerce q/k into *per-row* and *per-col* 1‑D indices
-        def _row_1d(idx: torch.Tensor) -> torch.Tensor:
-            # return a vector of length Q_tile
-            if idx.numel() == 1:
-                return idx.view(1)
-            if idx.dim() == 1:
-                return idx
-            # broadcast grid (Q,1) or (Q,K): take first column
-            return idx[:, 0].contiguous().view(-1)
-
-        def _col_1d(idx: torch.Tensor) -> torch.Tensor:
-            # return a vector of length K_tile
-            if idx.numel() == 1:
-                return idx.view(1)
-            if idx.dim() == 1:
-                return idx
-            # broadcast grid (1,K) or (Q,K): take first row
-            return idx[0, :].contiguous().view(-1)
-
-        q_1d = _row_1d(q)   # (Q_tile,)
-        k_1d = _col_1d(k)   # (K_tile,)
-
-        # 1) Mask padded **keys** (K-only): (K,) -> (1, K)
-        if self._pad_for_scores is not None:
-            key_pad = self._pad_for_scores[b].index_select(0, k_1d).unsqueeze(0)  # (1, K_tile)
-            scores = scores.masked_fill(key_pad, float("-inf"))
-
-        # 2) Invalid **queries** (Q-only): (Q,) -> (Q,1)
-        if self._qseg_for_scores is not None:
-            qseg_1d = self._qseg_for_scores[b].index_select(0, q_1d)  # (Q_tile,)
-            invalid_q = (qseg_1d < 0).unsqueeze(1)                    # (Q_tile, 1)
-            scores = scores.masked_fill(invalid_q, float("-inf"))
-
-        # 3) Segment mismatch (Q,K) : (Q,1) vs (1,K) -> (Q,K)
-        if (self._qseg_for_scores is not None) and (self._segid_for_scores is not None):
-            # qseg_1d already computed above when qseg tensor exists
-            kseg_1d = self._segid_for_scores[b].index_select(0, k_1d)  # (K_tile,)
-            mismatch = (qseg_1d.unsqueeze(1) != kseg_1d.unsqueeze(0))  # (Q_tile, K_tile)
-            scores = scores.masked_fill(mismatch, float("-inf"))
-
-        return scores
-
-    # @torch.compile
     def forward(
         self,
         x: torch.Tensor,  # Input context: (B, S, D) for keys & values
@@ -231,7 +99,7 @@ class LearnedQueryAttention(nn.Module):
         """
         Performs the forward pass of the Learned Query Attention.
 
-        The `queries` are expected to be constructed by the caller, often by utilizing
+        The `queries` are expected to be constructed by the caller by utilizing
         `self.query_template`. For instance, if processing `N_seg` segments, `Q_tot`
         might be `N_seg * self.L`, where `self.L` is `num_queries_per_segment`.
         The `attn_mask` should be constructed to restrict attention appropriately,
@@ -320,9 +188,6 @@ class LearnedQueryAttention(nn.Module):
 
             ctx = flex_attention(q, k, v, block_mask=block_mask)  # no score_mod needed
 
-            # Fast path: FlexAttention with in-kernel gating
-            # ctx = flex_attention(q, k, v, score_mod=self._score_mod)  # (B,H,Q,d)
-
             # hygiene
             self._pad_for_scores = self._qseg_for_scores = self._segid_for_scores = None
 
@@ -345,39 +210,6 @@ class LearnedQueryAttention(nn.Module):
             for i in range(0, Q, CHUNK):
                 sl = slice(i, min(i + CHUNK, Q))
                 scores_i = scores[:, :, sl, :]  # (B,H,c,S)
-
-                # B, H, c, S = scores_i.shape[0], scores_i.shape[1], scores_i.shape[2], scores_i.shape[3]
-                #
-                # print("shapes:", "seg_id", seg_id.shape, seg_id.dtype,
-                #       "q_seg", q_seg.shape, q_seg.dtype,
-                #       "kpm", None if key_padding_mask is None else (key_padding_mask.shape, key_padding_mask.dtype))
-                #
-                # # A. Is padding nuking everything?
-                # if key_padding_mask is not None:
-                #     print("nonpad per batch:", (~key_padding_mask).sum(dim=-1).tolist())  # length S per batch
-                #     print("any nonpad?", (~key_padding_mask).any().item())
-                #
-                # # B. Do q_seg values exist in seg_id?
-                # for b in range(seg_id.size(0)):
-                #     ks = seg_id[b][seg_id[b] >= 0].unique()
-                #     qs = q_seg[b, sl] if q_seg.dim() == 2 else q_seg[b][:, sl]  # adapt if you keep extra dims
-                #     qs = qs[qs >= 0].unique()
-                #     inter = torch.isin(qs.to(torch.long), ks.to(torch.long))
-                #     print(f"[b={b}] |K|={ks.numel()} |Q|={qs.numel()} |K∩Q|={inter.numel()}",
-                #           "min/max K:",
-                #           (ks.min() if ks.numel() else None, ks.max() if ks.numel() else None),
-                #           "min/max Q:",
-                #           (qs.min() if qs.numel() else None, qs.max() if qs.numel() else None))
-                #
-                # # C. Are there NaNs in q_seg / seg_id?
-                # print("has NaN seg_id:", torch.isnan(seg_id.float()).any().item(),
-                #       "has NaN q_seg:", torch.isnan(q_seg.float()).any().item())
-
-
-
-
-
-
                 # if (q_seg is not None) and (seg_id is not None):
                     # (B,c,S) mismatch mask (small-ish) instead of full (B,H,c,S)
                 mismatch = (seg_id[:, None, :] != q_seg[:, sl].unsqueeze(-1))
@@ -396,31 +228,3 @@ class LearnedQueryAttention(nn.Module):
         out = self.out_proj(out)
 
         return out, attn_weights
-
-        # # Scaled dot-product attention scores
-        # # (B, H, Q_tot, d_h) @ (B, H, d_h, S) -> (B, H, Q_tot, S)
-        # scores = (q @ k) / math.sqrt(self.head_dim)
-        #
-        # # scores: (B,H,Q,S)
-        # combined_mask = attn_mask.view(B, self.num_heads, Q_tot, S)
-        # if key_padding_mask is not None:
-        #     combined_mask = combined_mask | key_padding_mask[:, None, None, :]  # (B,H,Q,S)
-        #
-        # # Apply softmax with the combined mask
-        # # `safe_softmax` is assumed to handle masking by setting masked scores to -inf before softmax
-        # attn_weights = safe_softmax(scores, combined_mask, dim=-1)  # (B, H, Q_tot, S)
-        #
-        # # Compute weighted sum of values (applying attention)
-        # # (B, H, Q_tot, S) @ (B, H, S, d_h) -> (B, H, Q_tot, d_h)
-        # output = attn_weights @ v
-        #
-        # # Concatenate heads: (B, H, Q_tot, d_h) -> (B, Q_tot, H, d_h) -> (B, Q_tot, D)
-        # output = output.permute(0, 2, 1, 3).reshape(B, Q_tot, self.d_model)
-        #
-        # # Apply output normalization (Post-LN style for this block's output) and final projection
-        # output_norm = self.out_norm(output)
-        # attn_output = self.out_proj(output_norm)
-        #
-        # # Return final output and mean attention weights for logging/inspection
-        # # Mean over heads: (B, H, Q_tot, S) -> (B, Q_tot, S)
-        # return attn_output, attn_weights.mean(dim=1)

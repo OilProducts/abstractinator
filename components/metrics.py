@@ -82,7 +82,7 @@ class TrainingMetrics:
 
     def update_from_batch(self, output: Dict, key_padding_mask: torch.Tensor) -> None:
         # Lazily capture device and create zero scalars
-        dev = output["total_loss"].device
+        dev = output["loss_total"].device
         if self._device is None:
             self._device = dev
         if self.total_loss_t is None:
@@ -102,9 +102,9 @@ class TrainingMetrics:
             self._ppl_sum_t = [zero.clone() for _ in range(self.num_levels)]
 
         # Window counters on device; no host syncs here
-        self.total_loss_t = self.total_loss_t + output["total_loss"].detach()
-        self.vq_loss_t = self.vq_loss_t + output["vq_loss"].detach()
-        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + output["avg_reconstruction_loss"].detach()
+        self.total_loss_t = self.total_loss_t + output["loss_total"].detach()
+        # self.vq_loss_t = self.vq_loss_t + output["vq_loss_t"].detach()
+        # self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + output["avg_reconstruction_loss_t"].detach()
         self.count += 1
         self.non_padded_tokens_t = self.non_padded_tokens_t + (~key_padding_mask).sum()
 

@@ -202,7 +202,7 @@ def _build_time_keep_fn(window: int):
     return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
 
 
-@lru_cache(maxsize=64)
+# @lru_cache(maxsize=64)
 def _cached_flex_sliding_mask(seq_len: int, window: int, device):
     keep = _build_time_keep_fn(window)
     return create_block_mask(keep, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, BLOCK_SIZE=128, device=device)
@@ -268,10 +268,10 @@ class SlidingWindowMLA(nn.Module):
         Returns (flex_mask, dense_mask). Flex path uses a cached time-only mask.
         Padding is handled in score_mod, not in the BlockMask.
         """
-        if use_flex:
-            # time-window only; cached (no closure over pad)
-            flex_mask = _cached_flex_sliding_mask(seq_len, window, device)
-            return flex_mask, None
+        # if use_flex:
+        # time-window only; cached (no closure over pad)
+        flex_mask = _cached_flex_sliding_mask(seq_len, window, device)
+        return flex_mask, None
 
         # ---------- dense mask path (fallback) ----------
         q_idx = torch.arange(seq_len, device=device)[:, None]
@@ -396,11 +396,11 @@ class SlidingWindowMLATransformerBlock(nn.Module):
             Output of the Transformer block.
         """
         # Attention (Pre‑LN)
-        if torch.isnan(x).any():
-            print('nan')
+        # if torch.isnan(x).any():
+        #     print('nan')
         x = self.norm1(x)  # [B, S, D]
-        if torch.isnan(x).any():
-            print('nan')
+        # if torch.isnan(x).any():
+        #     print('nan')
         x = x + self.attn(x, key_padding_mask=key_padding_mask)  # [B, S, D]
 
         # x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)

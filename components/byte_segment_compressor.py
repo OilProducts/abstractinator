@@ -27,8 +27,6 @@ class CompressorOutput:
     input_padding_mask: torch.Tensor
 
 
-# If you remove this, or do not use dynamic=True, there may be a segfault related to the caching of the LQA query
-# @torch.compile
 class ByteSegmentCompressor(nn.Module):
     """
     End-to-end module that processes a sequence of byte-level tokens.
@@ -57,7 +55,7 @@ class ByteSegmentCompressor(nn.Module):
 
     def __init__(
         self,
-        vocab_size: int = 259,
+        vocab_size: int = 260,
         dim: int = 256,
         heads: int = 8,  # Num heads for both encoder and pooler
         window: int = 128,  # Window size for shared encoder layers
@@ -216,17 +214,25 @@ class ByteSegmentCompressor(nn.Module):
                   for valid query vectors, this would need to be expanded/repeated.
         """
         # 1. Token embeddings and shared encoder
+        if not torch._dynamo.is_compiling():
+            V = self.embedding.num_embeddings
+            # Cheap, friendly check—remove once stable
+            if token_ids.numel():
+                tmin = int(token_ids.min())
+                tmax = int(token_ids.max())
+                assert 0 <= tmin and tmax < V, f"OOB token id(s): [{tmin}..{tmax}] vs V={V}"
+
         x = self.embedding(token_ids)
-        if torch.isnan(x).any():
-            print('nan')
+        # if torch.isnan(x).any():
+        #     print('nan')
         for layer in self.shared_layers:
             x = layer(x, key_padding_mask=key_padding_mask)
 
         # 2. Branch for next-token prediction
         lm_x = x
         for _idx, layer in enumerate(self.lm_layers):
-            if torch.isnan(lm_x).any():
-                print('nan')
+            # if torch.isnan(lm_x).any():
+            #     print('nan')
             lm_x = layer(lm_x, key_padding_mask=key_padding_mask)
         logits = self.logit_proj(self.lm_final_norm(lm_x))
 
