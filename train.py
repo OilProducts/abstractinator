@@ -13,14 +13,15 @@ from datasets import load_dataset  # Import Dataset for the dummy data
 from mlflow.tracking import MlflowClient
 from torch import optim
 from torch.utils.data import DataLoader
+import torch._dynamo as dynamo
 from transformers.optimization import get_scheduler
 
-# Assuming HierarchicalAutoencoder is in abstractinator.py and has KPM updates
 from components import HierarchicalAutoencoder
+from components import AbstractinatorPyramid
 from components.checkpoint_utils import load_base_components, save_base_components
-from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
+# from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.metrics import MlflowBatchLogger, TrainingMetrics
-from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
+# from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
 from components.tokenizer import ByteLevelTokenizer
 from components.utils import short_num
 from configs.base_config import (
@@ -30,7 +31,7 @@ from configs.base_config import (
     N_CPU as DEFAULT_N_CPU,
 )
 from configs.base_config import (
-    ExpConfig,
+    ExpConfig, PyramidConfig
 )
 from data_utils import tokenize_and_process_examples
 
@@ -40,6 +41,7 @@ LOGGER_NAME = "abstractinator.train"
 torch.backends.cuda.enable_flash_sdp(True)  # FlashAttn‑2*
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
+dynamo.config.capture_dynamic_output_shape_ops = True
 # torch._dynamo.config.recompile_limit = 512
 # torch._dynamo.config.capture_scalar_outputs = True
 
@@ -114,23 +116,25 @@ def initialize_model(
 
     logger = logging.getLogger(LOGGER_NAME)
 
-    model = HierarchicalAutoencoder(
-        num_levels=exp_config.num_levels,
-        compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
-        expander_level_configs=[asdict(e) for e in exp_config.expander_level_configs],
-        initial_vocab_size=exp_config.initial_vocab_size,
-        propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
-        aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
-        top_transformer_config=(
-            asdict(exp_config.top_transformer_config) if exp_config.top_transformer_config else None
-        ),
-        top_lm_loss_weight=exp_config.top_lm_loss_weight,
-        # use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
-        top_lm_mse_weight=exp_config.top_lm_mse_weight,
-        top_lm_ce_weight=exp_config.top_lm_ce_weight,
-        use_flex_attention=exp_config.flex_attention,
-        device=ExpConfig.device,
-    ).to(device)
+    model = AbstractinatorPyramid(cfg=exp_config.pyramid_config).to(device)
+
+    # model = HierarchicalAutoencoder(
+    #     num_levels=exp_config.num_levels,
+    #     compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
+    #     expander_level_configs=[asdict(e) for e in exp_config.expander_level_configs],
+    #     initial_vocab_size=exp_config.initial_vocab_size,
+    #     propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
+    #     aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
+    #     top_transformer_config=(
+    #         asdict(exp_config.top_transformer_config) if exp_config.top_transformer_config else None
+    #     ),
+    #     top_lm_loss_weight=exp_config.top_lm_loss_weight,
+    #     # use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
+    #     top_lm_mse_weight=exp_config.top_lm_mse_weight,
+    #     top_lm_ce_weight=exp_config.top_lm_ce_weight,
+    #     use_flex_attention=exp_config.flex_attention,
+    #     device=ExpConfig.device,
+    # ).to(device)
 
     if args.load_base_from:
         load_base_components(
@@ -150,10 +154,10 @@ def initialize_model(
         short_num(num_params),
     )
 
-    compressor_params = _count_params(model.compressors)
-    expander_params = _count_params(model.expanders)
-    logger.info("  Compressors: %s parameters", short_num(compressor_params))
-    logger.info("  Expanders: %s parameters", short_num(expander_params))
+    levels_params = _count_params(model.levels)
+    # expander_params = _count_params(model.expanders)
+    logger.info("  Total: %s parameters", short_num(levels_params))
+    # logger.info("  Expanders: %s parameters", short_num(expander_params))
     if getattr(model, "code_sequence_transformer", None) is not None:
         cst_params = _count_params(model.code_sequence_transformer)
         logger.info("  CodeSequenceTransformer: %s parameters", short_num(cst_params))
@@ -218,7 +222,7 @@ class Trainer:
 
         torch.set_float32_matmul_precision("high")
         torch.set_default_dtype(torch.bfloat16)
-        torch.set_printoptions(threshold=100_000)
+        # torch.set_printoptions(threshold=100_000)
         # torch._dynamo.config.capture_scalar_outputs = True
         # torch._dynamo.config.recompile_limit = 128
 
@@ -267,11 +271,11 @@ def train_loop(
 
     logger = logging.getLogger(LOGGER_NAME)
 
-    # mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
-    # mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
-    # mlflow_client = MlflowClient()
-    # mlflow_run_id = mlflow_run.info.run_id
-    # mlflow_logger = MlflowBatchLogger(mlflow_client, mlflow_run_id, exp_config.mlflow_batch_interval)
+    mlflow.set_experiment(getattr(exp_config, "project_name", "DefaultExperiment"))
+    mlflow_run = mlflow.start_run(run_name=getattr(exp_config, "run_name", "DefaultRun"))
+    mlflow_client = MlflowClient()
+    mlflow_run_id = mlflow_run.info.run_id
+    mlflow_logger = MlflowBatchLogger(mlflow_client, mlflow_run_id, exp_config.mlflow_batch_interval)
 
     tokenizer = ByteLevelTokenizer(
         add_bos=True,
@@ -348,7 +352,7 @@ def train_loop(
         else {},
     )
 
-    # mlflow.log_params(exp_config.as_dict())
+    mlflow.log_params(exp_config.as_dict())
 
     model.train()
     if args.load_base_from:
@@ -382,9 +386,9 @@ def train_loop(
     #         tokens = batch["input_ids"].to(device, non_blocking=True)
     #         key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
     #         out = model(tokens, key_padding_mask=key_padding_mask)
-    #         loss = out["total_loss"] / exp_config.gradient_accumulation_steps
+    #         loss = out["loss_total"] / exp_config.gradient_accumulation_steps
     #         loss.backward()
-    #         optimizer.step();
+    #         optimizer.step()
     #         optimizer.zero_grad()
     #
     # print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
@@ -414,8 +418,8 @@ def train_loop(
 
     for epoch in range(start_epoch, exp_config.num_epochs):
         logger.info("\n--- Epoch %s/%s ---", epoch + 1, exp_config.num_epochs)
-        _cached_cross_window_mask_cpu.cache_clear()
-        _cached_causal_mask_cpu.cache_clear()
+        # _cached_cross_window_mask_cpu.cache_clear()
+        # _cached_causal_mask_cpu.cache_clear()
         epoch_start_time = time.time()
         model.train()
         if args.load_base_from:
@@ -429,7 +433,7 @@ def train_loop(
             model_kpm = key_padding_mask if exp_config.propagate_key_padding_mask else None
 
             output_dict = model(tokens, key_padding_mask=model_kpm)
-            total_loss = output_dict["total_loss"]
+            total_loss = output_dict["loss_total"]
 
             loss_for_backward = total_loss / exp_config.gradient_accumulation_steps
             loss_for_backward.backward()
@@ -475,15 +479,15 @@ def train_loop(
                     if console_log_parts:
                         logger.info(" | ".join(console_log_parts))
 
-                    if metrics.count > 0:
-                        codebook_sizes = [c.codebook_size for c in exp_config.compressor_level_configs]
-                        metrics_dict = metrics.metrics_dict(
-                            learning_rate=optimizer.param_groups[0]["lr"],
-                            tokens_per_second=tokens_per_second,
-                            patches_per_second=patches_per_second,
-                            codebook_sizes=codebook_sizes,
-                        )
-                        # mlflow_logger.log(global_step, metrics_dict)
+                    # if metrics.count > 0:
+                    #     codebook_sizes = [c.codebook_size for c in exp_config.compressor_level_configs]
+                    #     metrics_dict = metrics.metrics_dict(
+                    #         learning_rate=optimizer.param_groups[0]["lr"],
+                    #         tokens_per_second=tokens_per_second,
+                    #         patches_per_second=patches_per_second,
+                    #         codebook_sizes=codebook_sizes,
+                    #     )
+                    #     mlflow_logger.log(global_step, metrics_dict)
 
                 metrics.reset_window()
                 time_of_last_optimizer_step_event = current_time
@@ -500,10 +504,10 @@ def train_loop(
                             input_gen_kpm = torch.zeros_like(input_gen_tokens, dtype=torch.bool).to(device)
 
                         reconstructed_tokens = model.generate_bytes(
-                            prompt_tokens=input_gen_tokens,
-                            key_padding_mask=input_gen_kpm,
-                            max_top_codes=exp_config.generation_max_len_override,
-                            decode_max_len=8,
+                            prompt=input_gen_tokens,
+                            prompt_kpm=input_gen_kpm,
+                            max_top_steps=exp_config.generation_max_len_override,
+                            max_child_len=8,
                         )
                         reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu())
 

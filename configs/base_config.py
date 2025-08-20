@@ -72,37 +72,95 @@ torch.set_default_dtype(DEFAULT_DTYPE)
 
 
 @dataclass
-class CompressorLevelConfig:
-    dim: int = 128
-    heads: int = 8
-    window: int = 64
-    head_dim: Optional[int] = 16  # K
-    kv_comp_dim: Optional[int] = 32  # d_c
-    q_comp_dim: Optional[int] = 48  # d_c`
-    retr_dim: Optional[int] = 32  # r
-    lm_window: Optional[int] = 64
-    compression_window: Optional[int] = 8
-    num_encoder_layers: int = 0
-    num_shared_encoder_layers: int = 0
-    num_lm_encoder_layers: Optional[int] = 14
-    num_compression_encoder_layers: Optional[int] = 4
-    encoder_ffn_dim_multiplier: int = 2
-    num_queries: int = 1
-    codebook_size: int = 8192
-    beta: float = 1.0
-    vq_reset_interval: int = 250
-    vq_depth: int = 1
-    entropy_delta: float = 0.0
-    entropy_abs_threshold: Optional[float] = None
-    target_compression_ratio: Optional[List[float]] = None
-    compression_loss_weight: float = 1.0
-    output_length: int = 512
+class AbstractinatorConfig:
+    #
+    # Shared / tokens
+    #
+    vocab_size: int = 260                     # byte-level at L0; for higher levels set to K_eff(prev)
+    D: int = 128                              # model dim for both compressor/expander
+    eos_id: int = 257
+    eop_id: int = 259
+    bos_id: int = 256
+    pad_id: int = 258
 
-    def __post_init__(self) -> None:
-        if self.lm_window is None:
-            self.lm_window = self.window
-        if self.compression_window is None:
-            self.compression_window = self.window
+    #
+    # Compressor (encoder) hyperparams
+    #
+    c_heads: int = 8
+    c_window: int = 128
+    c_num_encoder_layers: int = 3
+    c_num_shared_encoder_layers: int = 0
+    c_num_lm_encoder_layers: Optional[int] = 14
+    c_num_compression_encoder_layers: Optional[int] = None
+    c_num_queries: int = 1                    # IMPORTANT: use 1 unless you wire seg-to-query mapping (see note)
+    c_entropy_delta: float = 0.2
+    c_entropy_abs_threshold: Optional[float] = None
+    c_output_length: int = 1024                # max pooled queries (S_hat) * L, clipped to multiple of L
+    c_vq_K: int = 8192                         # K per stage
+    c_vq_depth: int = 1                       # 1 = single stage, >=2 = residual VQ
+    c_vq_d_c: Optional[int] = None            # d_c (defaults to compressor kv_comp_dim or 64)
+    c_vq_beta: float = 0.25
+    c_vq_reset_interval: int = 250
+
+    #
+    # Expander (decoder) hyperparams
+    #
+    d_layers: int = 4                         # N_dec
+    d_heads: int = 8
+    d_cross_window: int = 1
+    d_residual_conditioning: bool = True
+    d_use_sqdist_logits: bool = False
+    d_predict_specials: bool = True
+    d_max_len: int = 2048
+    d_lo_d_c: int = 64                        # only used if bottom level w/ LearnedCodebookAdapter; we use MS-RVQ so ignored
+
+    #
+    # Loss weights
+    #
+    w_code_ce: float = 1.0                    # stage-wise CE on digits
+    w_special_ce: float = 1.0                 # CE on special head (only where specials)
+    w_byte_lm_ce: float = 1.0                 # LM CE on compressor byte branch (for entropy modeling)
+    w_vq: float = 0.1                         # VQ loss weight
+
+    #
+    # Misc
+    #
+    device: Optional[torch.device] = None
+
+
+
+# @dataclass
+# class CompressorLevelConfig:
+#     dim: int = 128
+#     heads: int = 8
+#     window: int = 64
+#     head_dim: Optional[int] = 16  # K
+#     kv_comp_dim: Optional[int] = 32  # d_c
+#     q_comp_dim: Optional[int] = 48  # d_c`
+#     retr_dim: Optional[int] = 32  # r
+#     lm_window: Optional[int] = 64
+#     compression_window: Optional[int] = 8
+#     num_encoder_layers: int = 0
+#     num_shared_encoder_layers: int = 0
+#     num_lm_encoder_layers: Optional[int] = 14
+#     num_compression_encoder_layers: Optional[int] = 4
+#     encoder_ffn_dim_multiplier: int = 2
+#     num_queries: int = 1
+#     codebook_size: int = 8192
+#     beta: float = 1.0
+#     vq_reset_interval: int = 250
+#     vq_depth: int = 1
+#     entropy_delta: float = 0.2
+#     entropy_abs_threshold: Optional[float] = None
+#     target_compression_ratio: Optional[List[float]] = None
+#     compression_loss_weight: float = 1.0
+#     output_length: int = 512
+#
+#     def __post_init__(self) -> None:
+#         if self.lm_window is None:
+#             self.lm_window = self.window
+#         if self.compression_window is None:
+#             self.compression_window = self.window
 
 
 @dataclass
@@ -124,20 +182,28 @@ class TopTransformerConfig:
     lm_pad_id: int = 258
 
 
-@dataclass
-class ExpanderConfig:
-    dim_scale: float = 1.0
-    num_enc_layers: int = 2
-    num_dec_layers: int = 4
-    heads_scale: float = 1.0
-    eos_id: int = 1
-    max_len: int = 8192
-    use_decoder_only: bool = True
-    use_continuous_inputs: bool = True
-    cross_window: Optional[int] = 128  # If None, use the same window as the compressor level
-    hi_dim: int = 128  # Dimension of the high-level representation
-    lo_dim: int = 128  # Dimension of the low-level representation
+# @dataclass
+# class ExpanderConfig:
+#     dim_scale: float = 1.0
+#     num_enc_layers: int = 2
+#     num_dec_layers: int = 4
+#     heads_scale: float = 1.0
+#     eos_id: int = 1
+#     max_len: int = 8192
+#     use_decoder_only: bool = True
+#     use_continuous_inputs: bool = True
+#     cross_window: Optional[int] = 128  # If None, use the same window as the compressor level
+#     hi_dim: int = 128  # Dimension of the high-level representation
+#     lo_dim: int = 128  # Dimension of the low-level representation
+#
 
+
+@dataclass
+class PyramidConfig:
+    levels: List[AbstractinatorConfig] = field(default_factory=lambda: [AbstractinatorConfig()])
+    w_vq: float = 0.1
+    w_byte_lm: float = 1.0
+    use_top_code_lm: bool = False
 
 @dataclass
 class ExpConfig:
@@ -147,8 +213,9 @@ class ExpConfig:
     flex_attention: bool = FLEX_ATTENTION
     num_levels: int = 1
     initial_vocab_size: int = 260
-    compressor_level_configs: List[CompressorLevelConfig] = field(default_factory=lambda: [CompressorLevelConfig()])
-    expander_level_configs: List[ExpanderConfig] = field(default_factory=lambda: [ExpanderConfig()])
+    # compressor_level_configs: List[CompressorLevelConfig] = field(default_factory=lambda: [CompressorLevelConfig()])
+    # expander_level_configs: List[ExpanderConfig] = field(default_factory=lambda: [ExpanderConfig()])
+    pyramid_config: PyramidConfig = field(default_factory=lambda: PyramidConfig())
     aux_lm_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
     top_lm_mse_weight: float = 1.0
@@ -170,9 +237,9 @@ class ExpConfig:
     dataset_config: Optional[str] = None
     dataset_train_split: str = "train"
     text_column_name: str = "text"
-    generation_interval: int = 300
+    generation_interval: int = 100
     sample_prompt_for_generation: str = "In a land far away, "
-    generation_max_len_override: int = 128
+    generation_max_len_override: int = 16
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"
     resume_from_checkpoint: Optional[str] = None

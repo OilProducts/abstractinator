@@ -1,20 +1,22 @@
 import logging
-from typing import Any
+from typing import Tuple, List, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import torch._dynamo as dynamo
 
-logger = logging.getLogger(__name__)
 
-# import torch._dynamo as dynamo
-
-# @torch.compile
 class VectorQuantizer(nn.Module):
     """
-    An efficient Vector Quantizer (VQ) layer with EMA updates and robust,
-    performant code resetting.
+    Compile‑friendly VQ with EMA and vectorized, guard‑stable code resets.
+
+    Key properties:
+      • No Python mirrors used in forward() – only device tensors.
+      • No Python branching on GPU scalars (.item()).
+      • Resets run with constant shapes (R_MAX), gated by a 0‑dim tensor.
+      • Same API: forward(z) -> (z_q_ste, vq_loss, indices, perplexity)
     """
 
     def __init__(
@@ -29,249 +31,248 @@ class VectorQuantizer(nn.Module):
         reset_interval: int = 250,
         max_codes_to_reset_pct: float = 0.1,
         replacement_buffer_size: int = 65536,
-        vectors_per_step_to_buffer: int = 1024,  # Controls update overhead
+        vectors_per_step_to_buffer: int = 1024,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
         padding_token_id: int = 2,
         eop_token_id: int = 3,
     ):
         super().__init__()
-        self.K = K
-        self.D = D
-        self.beta = beta
-        self.ema = ema
-        self.decay = decay
-        self.eps = eps
+        self.K = int(K)
+        self.D = int(D)
+        self.beta = float(beta)
+        self.ema = bool(ema)
+        self.decay = float(decay)
+        self.eps = float(eps)
 
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.eop_token_id = eop_token_id
-        self.padding_token_id = padding_token_id
+        self.reset_codes = bool(reset_codes)
+        self.reset_interval = int(reset_interval)
+        self.max_codes_to_reset_pct = float(max_codes_to_reset_pct)
+        self.replacement_buffer_size = int(replacement_buffer_size)
+        self.vectors_per_step_to_buffer = int(vectors_per_step_to_buffer)
 
-        # Allow small K in tests; special tokens may be unused for code VQs
+        # specials
+        self.bos_token_id = int(bos_token_id)
+        self.eos_token_id = int(eos_token_id)
+        self.padding_token_id = int(padding_token_id)
+        self.eop_token_id = int(eop_token_id)
 
-        self.reset_codes = reset_codes
-        if self.reset_codes:
-            self.reset_interval = reset_interval
-            self.max_codes_to_reset_pct = max_codes_to_reset_pct
-            self.min_usage_threshold = 1.0
-            self.register_buffer("steps_since_last_reset", torch.tensor(0, dtype=torch.int64))
-            # Python mirror to avoid CUDA scalar sync on condition checks
-            self._steps_since_last_reset_py: int = 0
-
-            # Buffer settings
-            self.replacement_buffer_size = replacement_buffer_size
-            self.vectors_per_step_to_buffer = vectors_per_step_to_buffer
-            self.register_buffer(
-                "replacement_buffer",
-                torch.empty(replacement_buffer_size, D).zero_(),
-            )
-            self.register_buffer("buffer_idx", torch.tensor(0, dtype=torch.long))
-            self.register_buffer("buffer_is_full", torch.tensor(False, dtype=torch.bool))
-            # Python mirrors to avoid reading CUDA scalars on the host
-            self._buffer_idx_py: int = 0
-            self._buffer_full_py: bool = False
-
-        self.codebook = nn.Parameter(torch.randn(K, D))
-        if ema:
-            self.register_buffer("ema_cluster_size", torch.zeros(K))
+        # Codebook and EMA stats
+        self.codebook = nn.Parameter(torch.randn(self.K, self.D))
+        if self.ema:
+            self.register_buffer("ema_cluster_size", torch.zeros(self.K))
             self.register_buffer("ema_weight_sum", self.codebook.data.clone())
 
-    @torch.no_grad()
-    @torch._dynamo.disable()
-    def _update_replacement_buffer(self, new_vectors: torch.Tensor):
-        """Efficiently updates the circular buffer with a subset of new vectors."""
-        # --- PERFORMANCE FIX: Subsample vectors to reduce copy overhead ---
-        if new_vectors.size(0) > self.vectors_per_step_to_buffer:
-            perm = torch.randperm(new_vectors.size(0), device=new_vectors.device)[: self.vectors_per_step_to_buffer]
-            new_vectors = new_vectors[perm]
-
-        n_new = new_vectors.size(0)
-        # buff_size = self.replacement_buffer_size
-        # Avoid reading CUDA scalar with .item(); use Python mirror
-        # current_idx = int(self._buffer_idx_py)
-
-        B = self.replacement_buffer_size
-        idx0 = self.buffer_idx  # scalar LongTensor on correct device
-
-        # Ensure device match for the copy to avoid implicit sync paths
-        # dest_dev = self.replacement_buffer.device
-        # src = new_vectors.to(dest_dev, non_blocking=True)
-
-        write_idx = (idx0 + torch.arange(n_new, device=new_vectors.device, dtype=idx0.dtype)) % B  # (n_new,)
-
-        # If you guarantee n_new << B, this is fine; index_copy_ handles repeated idx
-        self.replacement_buffer.index_copy_(0, write_idx, new_vectors)
-
-        # Advance head and mark full if we wrapped
-        self.buffer_idx.add_(n_new).remainder_(B)
-        if not bool(self.buffer_is_full):
-            # safe to use Python here; this function is compile-disabled
-            if int(idx0) + int(n_new) >= int(B):
-                self.buffer_is_full.fill_(True)
-
-    @torch.no_grad()
-    @torch._dynamo.disable()
-    def _maybe_reset_dead_codes(self):
-        if not self.reset_codes:
-            return
-        self.steps_since_last_reset.add_(1)
-        if int(self.steps_since_last_reset) >= int(self.reset_interval):
-            self._reset_dead_codes()  # you can also mark this @disable if you want
-            self.steps_since_last_reset.zero_()
-
-
-    @torch.no_grad()
-    def _reset_dead_codes(self):
-        """Resets dead codes using fast random sampling from the buffer."""
-        if not self._buffer_full_py and self._buffer_idx_py == 0:
-            return
-
-        source_vectors = (
-            self.replacement_buffer if self._buffer_full_py else self.replacement_buffer[: self._buffer_idx_py]
-        )
-        num_available_replacements = source_vectors.size(0)
-
-        dead_code_candidates_indices = (self.ema_cluster_size < self.min_usage_threshold).nonzero(as_tuple=True)[0]
-        dead_code_candidates_indices = dead_code_candidates_indices[dead_code_candidates_indices != self.eop_token_id]
-        num_dead_candidates = dead_code_candidates_indices.size(0)
-        if num_dead_candidates == 0:
-            return
-
-        max_resettable_by_pct = int(self.K * self.max_codes_to_reset_pct)
-        num_to_reset = min(num_dead_candidates, num_available_replacements, max_resettable_by_pct)
-        if num_to_reset == 0:
-            return
-
-        perm = torch.randperm(num_dead_candidates, device=dead_code_candidates_indices.device)[:num_to_reset]
-        actual_dead_indices = dead_code_candidates_indices[perm]
-
-        # --- PERFORMANCE FIX: Replace expensive FPS with fast random sampling ---
-        rand_indices = torch.randint(0, num_available_replacements, (num_to_reset,), device=source_vectors.device)
-        replacement_vectors = source_vectors[rand_indices]
-
-        if self.training:
-            logger.info(
-                "VQ: Resetting %s dead codes via random sampling from buffer out of %s dead.",
-                num_to_reset,
-                num_dead_candidates,
+        # Replacement/reset machinery as DEVICE STATE (no Python mirrors)
+        if self.reset_codes:
+            # circular buffer of recent vectors
+            self.register_buffer(
+                "replacement_buffer",
+                torch.empty(self.replacement_buffer_size, self.D)
             )
+            self.replacement_buffer.zero_()
+            # 0‑dim device counters/flags
+            self.register_buffer("buffer_idx", torch.zeros((), dtype=torch.long))
+            self.register_buffer("buffer_is_full", torch.zeros((), dtype=torch.bool))
+            self.register_buffer("steps_since_last_reset", torch.zeros((), dtype=torch.long))
+            # dead threshold
+            self.min_usage_threshold = 1.0
+            # constant reset budget (shape‑stable)
+            self.R_MAX = int(max(0, round(self.K * self.max_codes_to_reset_pct)))
 
-        self.codebook.data[actual_dead_indices] = replacement_vectors
-        if self.ema:
-            self.ema_cluster_size[actual_dead_indices] = 1.0
-            self.ema_weight_sum[actual_dead_indices] = replacement_vectors.clone()
+    # ---------------------------
+    # Internal helpers (tensor‑only)
+    # ---------------------------
 
-    # _ema_update method remains the same...
     @torch.no_grad()
-    def _ema_update(self, encodings: torch.Tensor, flat_input: torch.Tensor):
-        if self.eop_token_id < encodings.size(1):
-            encodings = encodings.clone()
-            encodings[:, self.eop_token_id] = 0
+    def _update_replacement_buffer_tensor(self, flat_input: torch.Tensor) -> None:
+        """Device‑only circular buffer update. No Python guards, no graph breaks."""
+        N = flat_input.size(0)
+        if N == 0:
+            return
 
-        if self.padding_token_id < encodings.size(1):
-            encodings[:, self.padding_token_id] = 0
+        # optional subsample to cap copy cost
+        if N > self.vectors_per_step_to_buffer:
+            idx = torch.randperm(N, device=flat_input.device)[: self.vectors_per_step_to_buffer]
+            flat_input = flat_input.index_select(0, idx)
+            N = flat_input.size(0)
 
-        dw = encodings.T @ flat_input
-        cluster_size = encodings.sum(0)
-        self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
+        B = self.replacement_buffer_size  # Python constant
+        idx0 = self.buffer_idx            # 0‑dim LongTensor on device
+
+        write_idx = (idx0 + torch.arange(N, device=flat_input.device, dtype=torch.long)) % B
+        self.replacement_buffer.index_copy_(0, write_idx, flat_input)
+
+        # advance head and set 'full' flag if wrapped
+        new_idx = (idx0 + N) % B
+        self.buffer_idx.copy_(new_idx)
+
+        wrapped = (idx0 + N) >= B                # 0‑dim bool
+        self.buffer_is_full.logical_or_(wrapped) # in‑place OR
+
+    @torch.no_grad()
+    def _ema_update(self, encodings: torch.Tensor, flat_input: torch.Tensor) -> None:
+        """EMA updates (tensor‑only)."""
+        enc = encodings
+        # mask specials in EMA stats
+        if self.eop_token_id < enc.size(1):
+            enc = enc.clone()
+            enc[:, self.eop_token_id] = 0
+        if self.padding_token_id < enc.size(1):
+            if enc is encodings:
+                enc = enc.clone()
+            enc[:, self.padding_token_id] = 0
+
+        dw = enc.transpose(0, 1) @ flat_input    # (K,D)
+        cluster = enc.sum(0)                     # (K,)
+
+        self.ema_cluster_size.mul_(self.decay).add_(cluster, alpha=1 - self.decay)
         self.ema_weight_sum.mul_(self.decay).add_(dw, alpha=1 - self.decay)
-        n_total_clusters = self.ema_cluster_size.sum()
-        stabilized_cluster_size = (
-            (self.ema_cluster_size + self.eps) / (n_total_clusters + self.K * self.eps)
-        ) * n_total_clusters
-        self.codebook.data.copy_(self.ema_weight_sum / stabilized_cluster_size.unsqueeze(1))
+
+        n = self.ema_cluster_size.sum()
+        stabilized = ((self.ema_cluster_size + self.eps) / (n + self.K * self.eps)) * n
+        self.codebook.data.copy_(self.ema_weight_sum / stabilized.unsqueeze(1))
 
 
-    # @dynamo.disable
-    def forward(self, z: torch.Tensor) -> tuple[Tensor | Any, Tensor, Tensor, Any]:
-        B, Q, D_input = z.shape
-        flat_input = z.reshape(-1, self.D)
+    @torch.no_grad()
+    def _maybe_vectorized_reset(self) -> None:
+        """
+        Cheap, guard-stable resets:
+          • runs every step (no Python guards), but O(R_MAX) work only
+          • no Python .item() / .any() on device tensors
+          • constant shapes: candidates = R_MAX
+        """
+        if not self.reset_codes or self.R_MAX <= 0:
+            return
 
+        # step counter & gate
+        self.steps_since_last_reset.add_(1)
+        do_reset = self.steps_since_last_reset >= self.reset_interval  # 0-dim bool on device
+
+        # Quick exit via masking (no Python if): if not do_reset, all applies will be False
+        # Replacement buffer “valid count”
+        B = self.replacement_buffer_size
+        valid_count = torch.where(self.buffer_is_full,
+                                  torch.tensor(B, device=self.buffer_idx.device),
+                                  self.buffer_idx)  # 0-dim long
+        has_source = valid_count > 0  # 0-dim bool
+
+        # Sample R_MAX candidate code rows (constant shape)
+        rand_idx = torch.randint(0, self.K, (self.R_MAX,), device=self.codebook.device)
+
+        # Which of those candidates are dead? (exclude specials)
+        if self.ema:
+            usage = self.ema_cluster_size
+        else:
+            usage = torch.ones(self.K, device=self.codebook.device)
+
+        dead_mask = usage < self.min_usage_threshold
+        if self.eop_token_id < self.K:
+            dead_mask[self.eop_token_id] = False
+        if self.padding_token_id < self.K:
+            dead_mask[self.padding_token_id] = False
+
+        # Apply mask for sampled rows only; also gate by do_reset & has_source
+        apply_rows = dead_mask[rand_idx]
+        apply_rows &= do_reset
+        apply_rows &= has_source
+
+        # Sample replacement vectors (constant shape), modulo valid_count (safe even if buffer not full)
+        if self.R_MAX > 0:
+            # randint high must be Python int; then mod by runtime valid_count
+            rbuf_idx = torch.randint(0, B, (self.R_MAX,), device=self.replacement_buffer.device)
+            valid_count_safe = torch.clamp(valid_count, min=1)  # avoid div by zero
+            rbuf_idx = rbuf_idx % valid_count_safe
+            repl = self.replacement_buffer.index_select(0, rbuf_idx)  # (R_MAX, D)
+        else:
+            repl = torch.empty(0, self.D, device=self.codebook.device)
+
+        # Read current candidate rows and build their new values (row-wise where)
+        cand_old = self.codebook.index_select(0, rand_idx)  # (R_MAX, D)
+        cand_new = torch.where(apply_rows.unsqueeze(1), repl, cand_old)
+
+        # Write back candidate rows only (constant-length index_copy_)
+        self.codebook.index_copy_(0, rand_idx, cand_new)
+
+        if self.ema:
+            # ema_cluster_size: set to 1.0 for rows we actually reset
+            old_cnt = self.ema_cluster_size.index_select(0, rand_idx)
+            new_cnt = torch.where(apply_rows, torch.ones_like(old_cnt), old_cnt)
+            self.ema_cluster_size.index_copy_(0, rand_idx, new_cnt)
+
+            # ema_weight_sum: mirror codebook rows for rows we reset
+            old_sum = self.ema_weight_sum.index_select(0, rand_idx)
+            new_sum = torch.where(apply_rows.unsqueeze(1), cand_new, old_sum)
+            self.ema_weight_sum.index_copy_(0, rand_idx, new_sum)
+
+        # Zero the step counter when reset actually fired (tensor math; no Python if)
+        keep = (~do_reset).to(self.steps_since_last_reset.dtype)
+        self.steps_since_last_reset.mul_(keep)
+
+    # ---------------------------
+    # Forward
+    # ---------------------------
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        z: (B, Q, D)
+        returns:
+            z_q_ste: (B, Q, D) straight-through quantized vectors
+            vq_loss: scalar tensor
+            indices: (B, Q) argmin ids
+            perplexity: scalar tensor (excludes EOP/PAD)
+        """
+        B, Q, Din = z.shape
+        assert Din == self.D, f"Expected D={self.D}, got {Din}"
+
+        flat = z.reshape(-1, self.D)
+
+        # Update replacement buffer (tensor-only)
         if self.training and self.reset_codes:
-            self._update_replacement_buffer(flat_input.detach())
+            self._update_replacement_buffer_tensor(flat.detach())
 
-        dist_sq_input = flat_input.pow(2).sum(dim=1, keepdim=True)
-        dist_sq_codebook = self.codebook.pow(2).sum(dim=1)
-        dist_dot_product = -2 * torch.matmul(flat_input, self.codebook.T)
-        distances = dist_sq_input + dist_dot_product + dist_sq_codebook
-        indices = distances.argmin(dim=1)
+        # Nearest neighbors (squared L2)
+        x2 = (flat * flat).sum(dim=1, keepdim=True)                    # (N,1)
+        e2 = (self.codebook * self.codebook).sum(dim=1)                # (K,)
+        xe = F.linear(flat, self.codebook)                             # (N,K)
+        distances = x2 - 2 * xe + e2.unsqueeze(0)                      # (N,K)
+        indices = distances.argmin(dim=1)                              # (N,)
+
         z_q = F.embedding(indices, self.codebook).view(B, Q, self.D)
 
+        # VQ losses
         codebook_loss = F.mse_loss(z_q, z.detach())
         commitment_loss = F.mse_loss(z, z_q.detach())
         vq_loss = codebook_loss + (self.beta * commitment_loss)
+
+        # Straight-through
         z_q_ste = z + (z_q - z).detach()
 
+        # EMA + vectorized reset (no Python mirrors)
         if self.training:
             if self.ema:
-                encodings = F.one_hot(indices, self.K).type_as(flat_input)
-                self._ema_update(encodings, flat_input)
-
+                onehot = F.one_hot(indices, self.K).type_as(flat)      # (N,K)
+                self._ema_update(onehot, flat)
             if self.reset_codes:
-                self._maybe_reset_dead_codes()
+                self._maybe_vectorized_reset()
 
-                # # Maintain Python counter to avoid CUDA scalar sync in condition
-                # self._steps_since_last_reset_py += 1
-                # self.steps_since_last_reset.fill_(self._steps_since_last_reset_py)
-                # if self._steps_since_last_reset_py >= self.reset_interval:
-                #     self._reset_dead_codes()
-                #     self._steps_since_last_reset_py = 0
-                #     self.steps_since_last_reset.zero_()
-
+        # Perplexity (usage), exclude EOP/PAD
         if self.ema:
             counts = self.ema_cluster_size.clone()
         else:
-            counts = torch.bincount(indices, minlength=self.K).float()
+            counts = torch.bincount(indices, minlength=self.K).to(flat.dtype)
 
         if self.eop_token_id < counts.size(0):
             counts[self.eop_token_id] = 0
-
         if self.padding_token_id < counts.size(0):
             counts[self.padding_token_id] = 0
 
         counts = counts.clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
-        entropy = -(probs.float() * probs.float().log()).sum()
-        perplexity = entropy.exp().float()
+        entropy = -(probs * probs.log()).sum()
+        perplexity = entropy.exp().to(z.dtype).detach()
 
-        return z_q_ste, vq_loss, indices.view(B, Q), perplexity.detach()
-
-
-class ResidualVQ(nn.Module):
-    """
-    Two-stage residual vector quantiser in a compressed space (d_c).
-    """
-
-    def __init__(self, K0: int, K1: int, D: int = 256, d_c: int = 64, **vq_kwargs):
-        super().__init__()
-        self.down = nn.Linear(D, d_c, bias=False)
-        self.up = nn.Linear(d_c, D, bias=False)
-
-        # Stage-0 and Stage-1 VQs
-        self.vq0 = VectorQuantizer(K=K0, D=d_c, **vq_kwargs)
-        self.vq1 = VectorQuantizer(K=K1, D=d_c, **vq_kwargs)
-
-        # bfloat16‑friendly init: Xavier uniform for down, then copy transpose to up
-        with torch.no_grad():
-            nn.init.xavier_uniform_(self.down.weight)
-            self.up.weight.copy_(self.down.weight.T.to(self.up.weight.dtype))
-
-    def forward(self, z):
-        """
-        z : (B, Q, D)
-        returns ẑ, total_vq_loss, (idx0, idx1), perplexities
-        """
-        y0 = self.down(z)  # (B,Q,d_c)
-
-        q0, loss0, idx0, ppl0 = self.vq0(y0)
-        r1 = y0 - q0.detach()  # stop grad into q0 path
-
-        q1, loss1, idx1, ppl1 = self.vq1(r1)
-        z_hat = self.up(q0 + q1)
-
-        total_loss = loss0 + loss1
-        return z_hat, total_loss, (idx0, idx1), (ppl0, ppl1)
+        return z_q_ste, vq_loss, indices.view(B, Q), perplexity
 
 
 class MultiStageResidualVQ(nn.Module):
@@ -301,10 +302,10 @@ class MultiStageResidualVQ(nn.Module):
         max_codes_to_reset_pct: float = 0.1,
         replacement_buffer_size: int = 65536,
         vectors_per_step_to_buffer: int = 1024,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
-        padding_token_id: int = 2,
-        eop_token_id: int = 3,
+        bos_token_id: int = 256,
+        eos_token_id: int = 257,
+        padding_token_id: int = 258,
+        eop_token_id: int = 259,
     ) -> None:
         super().__init__()
         # if depth < 2:
@@ -413,22 +414,11 @@ class MultiStageResidualVQ(nn.Module):
     def stage_codebooks(self) -> list[torch.Tensor]:
         return [st.codebook for st in self.stages]
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Optional, Tuple, Dict
-
 class ComposedIndexCodec:
-    """
-    Converts between composed indices (0..K**depth-1) and per-stage digits (depth, each 0..K-1).
-    Handles special ids (bos/eos/pad/eop) by flagging them as special.
-    """
     def __init__(self, K: int, depth: int, bos: int, eos: int, pad: int, eop: int):
         self.K = int(K)
         self.depth = int(depth)
         self.special = {int(bos), int(eos), int(pad), int(eop)}
-        # map special -> [0..#special-1] for a tiny special head
         self.special_list = sorted(list(self.special))
         self.special_to_local = {sid: i for i, sid in enumerate(self.special_list)}
 
@@ -438,41 +428,48 @@ class ComposedIndexCodec:
             mask |= (x == sid)
         return mask
 
+    # Keep eager to avoid Inductor rewriting integer division into float paths
+    @dynamo.disable()
     def decompose(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
-        x: (B, L) composed ids (may include specials)
+        x: (B, L) nonnegative composed ids
         returns:
-            digits: list of length 'depth', each (B, L) in [0..K-1]; undefined at special positions
-            special_mask: (B, L) True where x is special
+          digits: list length=depth of (B, L) in [0..K-1]
+          special_mask: (B, L) bool
         """
+        x = x.long()
+        device = x.device
+        # base = [K^0, K^1, ..., K^(D-1)] as LONG
+        base = (self.K ** torch.arange(0, self.depth, device=device, dtype=torch.long))  # (D,)
+        # Integer division with explicit rounding keeps LONG dtype
+        q = torch.div(x.unsqueeze(-1), base, rounding_mode='trunc')                      # (B,L,D) long
+        digits = torch.remainder(q, self.K)                                             # (B,L,D) long
+        out = [digits[..., d] for d in range(self.depth)]                               # list of (B,L) long
         special = self.is_special(x)
-        x_work = x.clone()
-        digits = []
-        for _ in range(self.depth):
-            digits.append((x_work % self.K).long())
-            x_work = x_work // self.K
-        return digits, special
+        return out, special
 
+    @dynamo.disable()
     def compose(self, digits: List[torch.Tensor]) -> torch.Tensor:
         """
-        digits: list of length 'depth' of (B, L) in [0..K-1]
-        returns composed: (B, L)
+        digits: list length=depth of (B, L) in [0..K-1], long/int
+        returns composed: (B, L) long
         """
-        base = 1
-        out = torch.zeros_like(digits[0], dtype=torch.long)
-        for i, d in enumerate(digits):
-            if i > 0: base *= self.K
-            out = out + d.long() * base
-        return out
+        assert len(digits) == self.depth
+        device = digits[0].device
+        D = self.depth
+        stacked = torch.stack([d.long() for d in digits], dim=-1)                       # (B,L,D) long
+        base = (self.K ** torch.arange(0, D, device=device, dtype=torch.long))          # (D,) long
+        composed = (stacked * base).sum(dim=-1)                                         # (B,L) long
+        return composed.long()
 
+    @dynamo.disable()
     def special_local_index(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Map special ids to [0..#special-1], garbage for non-specials.
-        """
+        x = x.long()
         idx = torch.empty_like(x, dtype=torch.long)
         for sid, j in self.special_to_local.items():
             idx[x == sid] = j
         return idx
+
 
 
 class RVQEmbeddingAdapter(nn.Module):
