@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs import AbstractinatorConfig
-from .abstractinator import Abstractinator, insert_eop_fixed_len
+from .abstractinator import Abstractinator #, insert_eop_fixed_len
 from .vector_quantizer import ComposedIndexCodec
 
 @dataclass
@@ -46,14 +46,15 @@ class AbstractinatorPyramid(nn.Module):
         outs = []
         cur_ids, cur_kpm = tokens, kpm
         for L, level in enumerate(self.levels):
-            co = level.compress(cur_ids, key_padding_mask=cur_kpm)  # CompressorOutput
+            # co = level.compress(cur_ids, key_padding_mask=cur_kpm)  # CompressorOutput
+            co = level(cur_ids, key_padding_mask=cur_kpm)  # CompressorOutput
             outs.append(co)
             # next level inputs
-            cur_ids = co.vq_indices
-            if co.valid_mask is not None:
+            cur_ids = co['comp_out'].vq_indices
+            if co['comp_out'].valid_mask is not None:
                 # num_queries per segment (assume 1 unless configured otherwise)
                 q = level.compressor.num_queries_per_segment
-                cur_kpm = ~co.valid_mask.repeat_interleave(q, dim=1)
+                cur_kpm = ~co['comp_out'].valid_mask.repeat_interleave(q, dim=1)
             else:
                 cur_kpm = None
         return outs
@@ -74,81 +75,133 @@ class AbstractinatorPyramid(nn.Module):
         comp_outs = self.compress_all(tokens, key_padding_mask)
 
         # aggregate vq loss
-        vq_total = sum(co.vq_loss for co in comp_outs)
+        # vq_loss_total = 0.0
+        # for co in comp_outs:
+        #     vq_loss_total += co.loss_vq
 
-        # Build teacher-forcing targets from bottom→top inputs
-        targets: List[torch.Tensor] = []
-        tgt_kpms: List[Optional[torch.Tensor]] = []
-        for L, co in enumerate(comp_outs):        # bottom input for level L is tokens at that level
-            tgt = co.input_sequence               # (B, S_in at level L)
-            kpm = co.input_padding_mask
-            # EOP insertion for decoder at level L (so it learns to stop per segment)
-            if co.patch_end_mask is not None and kpm is not None:
-                eop_id = self.levels[L-1].compressor.vq.eop_token_id if L > 0 else self.levels[0].compressor.vq.eop_token_id
-                pad_id = self.levels[L-1].compressor.vq.padding_token_id if L > 0 else self.levels[0].compressor.vq.padding_token_id
-                tgt, kpm = insert_eop_fixed_len(tgt, co.patch_end_mask, kpm, eop_id=eop_id, pad_id=pad_id)
-            targets.append(tgt)
-            tgt_kpms.append(kpm)
+        vq_total = sum(co['loss_vq'] for co in comp_outs)
 
-        # Decode each level with teacher forcing
-        total_digit = torch.zeros((), device=device)
-        total_special = torch.zeros((), device=device)
-        total_byte_lm = torch.zeros((), device=device)
+        # # Build teacher-forcing targets from bottom→top inputs
+        # targets: List[torch.Tensor] = []
+        # tgt_kpms: List[Optional[torch.Tensor]] = []
+        # for L, co in enumerate(comp_outs):        # bottom input for level L is tokens at that level
+        #     tgt = co['comp_out'].input_sequence               # (B, S_in at level L)
+        #     kpm = co['comp_out'].input_padding_mask
+        #     # EOP insertion for decoder at level L (so it learns to stop per segment)
+        #     if co['comp_out'].patch_end_mask is not None and kpm is not None:
+        #         eop_id = self.levels[L-1].compressor.vq.eop_token_id if L > 0 else self.levels[0].compressor.vq.eop_token_id
+        #         pad_id = self.levels[L-1].compressor.vq.padding_token_id if L > 0 else self.levels[0].compressor.vq.padding_token_id
+        #         # tgt, kpm = insert_eop_fixed_len(tgt, co['comp_out'].patch_end_mask, kpm, eop_id=eop_id, pad_id=pad_id)
+        #     targets.append(tgt)
+        #     tgt_kpms.append(kpm)
+        #
+        # # Decode each level with teacher forcing
+        # total_digit = torch.zeros((), device=device)
+        # total_special = torch.zeros((), device=device)
+        # total_byte_lm = torch.zeros((), device=device)
 
 
-        for L, level in enumerate(self.levels):
-            # memory is *continuous* embeddings output at level L (hi)
-            memory = comp_outs[L].vq_embeddings        # (B, S_hi, D)
-            src_kpm = ~comp_outs[L].valid_mask if comp_outs[L].valid_mask is not None else None
+        # for L, level in enumerate(self.levels):
+        #     # memory is *continuous* embeddings output at level L (hi)
+        #     memory = comp_outs[L]['comp_out'].vq_embeddings        # (B, S_hi, D)
+        #     src_kpm = ~comp_outs[L]['comp_out'].valid_mask if comp_outs[L]['comp_out'].valid_mask is not None else None
+        #
+        #     # low side target is what the *next lower* compressor took as input,
+        #     # or bytes for bottom
+        #     codes_lo = targets[L]                      # (B, L_len) composed ids in that space
+        #     tgt_kpm = tgt_kpms[L]
+        #     seg_ids = comp_outs[L]['comp_out'].seg_id[:, :codes_lo.size(1)]
+        #
+        #     logits = level.decode_logits(
+        #         memory=memory, codes_lo=codes_lo,
+        #         src_key_padding_mask=src_kpm,
+        #         tgt_key_padding_mask=tgt_kpm,
+        #         seg_ids=seg_ids,
+        #     )
+        #
+        #     ce = factorized_code_ce(
+        #         stage_logits=logits["stage_logits"],
+        #         special_logits=logits.get("special_logits"),
+        #         targets=codes_lo,
+        #         codec=level.lo_codec,
+        #         tgt_kpm=tgt_kpm,
+        #     )
+        #     total_digit += ce["digit_ce"]
+        #     total_special += ce["special_ce"]
+        #
+        #     # Optional byte-LM CE—uses compressor LM branch at this level
+        #     if self.cfg.w_byte_lm > 0 and comp_outs[L]['comp_out'].entropy_model_logits.size(1) >= 2:
+        #         lm_logits = comp_outs[L]['comp_out'].entropy_model_logits[:, :-1, :]
+        #         lm_target = comp_outs[L]['comp_out'].input_sequence[:, 1:]
+        #         lm_kpm = comp_outs[L]['comp_out'].input_padding_mask[:, 1:] if comp_outs[L]['comp_out'].input_padding_mask is not None else None
+        #         per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
+        #         if lm_kpm is not None:
+        #             mask = ~lm_kpm
+        #             total_byte_lm += (per_tok * mask).sum() / mask.sum().clamp(min=1)
+        #         else:
+        #             total_byte_lm += per_tok.mean()
 
-            # low side target is what the *next lower* compressor took as input,
-            # or bytes for bottom
-            codes_lo = targets[L]                      # (B, L_len) composed ids in that space
-            tgt_kpm = tgt_kpms[L]
-            seg_ids = comp_outs[L].seg_id[:, :codes_lo.size(1)]
+        # vq_total = sum(co['loss_vq'] for co in comp_outs)
 
-            logits = level.decode_logits(
-                memory=memory, codes_lo=codes_lo,
-                src_key_padding_mask=src_kpm,
-                tgt_key_padding_mask=tgt_kpm,
-                seg_ids=seg_ids,
-            )
 
-            ce = factorized_code_ce(
-                stage_logits=logits["stage_logits"],
-                special_logits=logits.get("special_logits"),
-                targets=codes_lo,
-                codec=level.lo_codec,
-                tgt_kpm=tgt_kpm,
-            )
-            total_digit += ce["digit_ce"]
-            total_special += ce["special_ce"]
+        total_loss = sum(co['loss_total'] for co in comp_outs)
 
-            # Optional byte-LM CE—uses compressor LM branch at this level
-            if self.cfg.w_byte_lm > 0 and comp_outs[L].entropy_model_logits.size(1) >= 2:
-                lm_logits = comp_outs[L].entropy_model_logits[:, :-1, :]
-                lm_target = comp_outs[L].input_sequence[:, 1:]
-                lm_kpm = comp_outs[L].input_padding_mask[:, 1:] if comp_outs[L].input_padding_mask is not None else None
-                per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
-                if lm_kpm is not None:
-                    mask = ~lm_kpm
-                    total_byte_lm += (per_tok * mask).sum() / mask.sum().clamp(min=1)
+        # total_loss = (
+        #     total_digit + total_special
+        #     + self.cfg.w_vq * vq_total
+        #     + self.cfg.w_byte_lm * total_byte_lm
+        # )
+
+        # Optional Top-LM training (predict next top embedding)
+        top_lm_avg_loss = None
+        top_lm_details: dict[str, torch.Tensor] | None = None
+        if self.top_lm is not None and getattr(self.cfg, "use_top_code_lm", False):
+            top_co = comp_outs[-1]['comp_out']
+            top_mem = top_co.vq_embeddings                    # (B, S_hi, D)
+            top_kpm = (~top_co.valid_mask) if top_co.valid_mask is not None else None  # (B, S_hi)
+
+            # teacher-forced next-step prediction
+            if top_mem.size(1) >= 2:  # need at least 2 steps for next-step supervision
+                inp = top_mem[:, :-1, :]
+                tgt = top_mem[:, 1:, :]
+                kpm_in = top_kpm[:, :-1] if top_kpm is not None else None
+
+                lm_out = self.top_lm(inp, key_padding_mask=kpm_in)
+                pred = lm_out.get("predictions_pre_vq", lm_out.get("predictions"))  # (B,S-1,D)
+                # Masked MSE over non-padded positions
+                if kpm_in is not None:
+                    valid = (~kpm_in).float()
+                    mse = ((pred - tgt) ** 2).mean(dim=-1)
+                    mse = (mse * valid).sum() / valid.sum().clamp(min=1)
                 else:
-                    total_byte_lm += per_tok.mean()
+                    mse = ((pred - tgt) ** 2).mean()
 
-        total_loss = (
-            total_digit + total_special
-            + self.cfg.w_vq * vq_total
-            + self.cfg.w_byte_lm * total_byte_lm
-        )
+                top_vq_loss = lm_out.get("vq_loss", torch.zeros((), device=pred.device))
 
-        return {
+                top_lm_avg_loss = mse
+                top_lm_details = {
+                    "top_code_mse": mse,
+                    "top_code_vq_loss": top_vq_loss,
+                }
+
+        # Collect useful diagnostics for logging
+        all_codebook_perplexities = [co['comp_out'].vq_perplexity for co in comp_outs]
+
+        out = {
+            "comp_outs": comp_outs,
             "loss_total": total_loss,
-            "loss_digit_ce": total_digit,
-            "loss_special_ce": total_special,
+            # "loss_digit_ce": total_digit,
+            # "loss_special_ce": total_special,
             "loss_vq": vq_total,
-            "loss_byte_lm_ce": total_byte_lm,
+            # "loss_byte_lm_ce": total_byte_lm,
+            "all_codebook_perplexities": all_codebook_perplexities,
         }
+
+        if top_lm_avg_loss is not None and top_lm_details is not None:
+            out["avg_top_code_lm_loss"] = top_lm_avg_loss
+            out["top_code_lm_loss_details"] = top_lm_details
+
+        return out
 
     @torch.no_grad()
     def generate_bytes(
@@ -168,17 +221,22 @@ class AbstractinatorPyramid(nn.Module):
         buf = prompt.clone()
         kpm = prompt_kpm
 
+        # 1) compress bytes to top
+        comp_all = self.compress_all(buf, kpm)
+        top_co = comp_all[-1]
+        top_mem = top_co['comp_out'].vq_embeddings
+        top_kpm = ~top_co['comp_out'].valid_mask if top_co['comp_out'].valid_mask is not None else None
         for _ in range(max_top_steps):
-            # 1) compress bytes to top
-            comp_all = self.compress_all(buf, kpm)
-            top_co = comp_all[-1]
-            top_mem = top_co.vq_embeddings
-            top_kpm = ~top_co.valid_mask if top_co.valid_mask is not None else None
+
 
             if self.top_lm and top_sample_fn:
                 # predict one new top vector (continuous)
-                next_top = top_sample_fn(self.top_lm, top_mem, top_kpm)  # (1,D)
-                hi_seq = torch.cat([top_mem, next_top.unsqueeze(1)], dim=1)
+                next_segment_idx = (~top_kpm).sum()
+                next_top = top_sample_fn(top_mem, top_kpm)['predictions_pre_vq'][:,next_segment_idx,:]  # (1,D)
+                top_mem[:, next_segment_idx, :] = next_top  # (B, S_hi, D)
+                top_kpm[:, next_segment_idx] = False  # mark as valid
+                hi_seq = top_mem  #[:,:next_segment_idx,:] = next_top.unsqueeze(1)
+
             else:
                 # no top LM: just expand under the newest top segment
                 hi_seq = top_mem
