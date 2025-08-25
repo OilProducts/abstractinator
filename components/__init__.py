@@ -33,7 +33,6 @@ from .checkpoint_utils import (
     save_base_components as save_base_components,
 )
 from .code_sequence_transformer import CodeSequenceTransformer as CodeSequenceTransformer
-from .hierarchical_autoencoder import HierarchicalAutoencoder as HierarchicalAutoencoder
 from .swiglu import SwiGLU as SwiGLU
 from .tokenizer import ByteLevelTokenizer as ByteLevelTokenizer
 
@@ -43,7 +42,6 @@ __all__ += [
     "save_base_components",
     "CodeSequenceTransformer",
     "DecoderOnlyExpander",
-    "HierarchicalAutoencoder",
     "SwiGLU",
     "ByteLevelTokenizer",
 ]
