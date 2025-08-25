@@ -10,6 +10,7 @@ from .byte_segment_compressor import ByteSegmentCompressor, CompressorOutput
 from .vector_quantizer import MultiStageResidualVQ, ComposedIndexCodec
 from .expander import DecoderOnlyExpanderRVQ
 
+
 class Abstractinator(nn.Module):
     """
     One-level unit that:
@@ -111,17 +112,16 @@ class Abstractinator(nn.Module):
         """
         return self.compressor(token_ids, key_padding_mask=key_padding_mask)
 
-
     def uncompress(
-        self,
-        memory: torch.Tensor,                     # (B,S_hi,D) or (B,S_hi) if discrete & hi_vq provided
-        *,
-        target_low: Optional[torch.Tensor] = None,    # teacher-forced path when provided
-        seg_ids: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: Optional[int] = None,
-        seed: Optional[torch.Tensor] = None,
+            self,
+            memory: torch.Tensor,  # (B,S_hi,D) or (B,S_hi) if discrete & hi_vq provided
+            *,
+            target_low: Optional[torch.Tensor] = None,  # teacher-forced path when provided
+            seg_ids: Optional[torch.Tensor] = None,
+            src_key_padding_mask: Optional[torch.Tensor] = None,
+            tgt_key_padding_mask: Optional[torch.Tensor] = None,
+            max_new_tokens: Optional[int] = None,
+            seed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Inverse of compress (per level):
@@ -148,10 +148,6 @@ class Abstractinator(nn.Module):
                 seg_ids=seg_ids,
             )
             return {"generated": out}
-
-
-
-
 
     def decode_logits(
             self,
@@ -183,7 +179,7 @@ class Abstractinator(nn.Module):
         Masks out specials for digit CE, and uses specials only for special CE.
         """
         stage_logits: List[torch.Tensor] = logits["stage_logits"]  # list of (B, L, K)
-        teacher_digits, _ = self.lo_codec.decompose(codes_lo)      # list of (B,L)
+        teacher_digits, _ = self.lo_codec.decompose(codes_lo)  # list of (B,L)
 
         valid = torch.ones_like(codes_lo, dtype=torch.bool)
         if tgt_key_padding_mask is not None:
@@ -197,16 +193,13 @@ class Abstractinator(nn.Module):
 
         return {"digit_ce": digit_loss, "special_ce": torch.zeros((), device=codes_lo.device)}
 
-
-
-
     def forward(
-        self,
-        token_ids: torch.Tensor,                            # (B,S_in) low stream
-        key_padding_mask: Optional[torch.Tensor] = None,    # (B,S_in) True==PAD
-        *,
-        insert_eop: bool = True,
-        return_logits: bool = False,
+            self,
+            token_ids: torch.Tensor,  # (B,S_in) low stream
+            key_padding_mask: Optional[torch.Tensor] = None,  # (B,S_in) True==PAD
+            *,
+            insert_eop: bool = True,
+            return_logits: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for one level:
@@ -224,32 +217,17 @@ class Abstractinator(nn.Module):
         comp: CompressorOutput = self.compressor(token_ids, key_padding_mask=key_padding_mask)
 
         # hi memory for decoder (continuous)
-        memory = comp.vq_embeddings                          # (B, Ŝ*L, D) when num_queries>1; (B,Ŝ,D) when L==1
+        memory = comp.vq_embeddings  # (B, Ŝ*L, D) when num_queries>1; (B,Ŝ,D) when L==1
         # src KPM (True==pad) over memory rows
         if comp.valid_mask is not None:
             if self.compressor.num_queries_per_segment == 1:
-                src_kpm = ~comp.valid_mask                   # (B, Ŝ)
+                src_kpm = ~comp.valid_mask  # (B, Ŝ)
             else:
                 # Expand per-query; simplest policy = all queries are valid where segment is valid
                 Lq = self.compressor.num_queries_per_segment
                 src_kpm = ~comp.valid_mask.repeat_interleave(Lq, dim=1)  # (B, Ŝ*Lq)
         else:
             src_kpm = None
-
-        # # ---- 2) Build targets for low stream (teacher forcing), with optional EOP insertion ----
-        # tgt = comp.input_sequence.clone()                    # (B, S_in)
-        # tgt_kpm = comp.input_padding_mask.clone() if comp.input_padding_mask is not None else None
-        # seg_ids = comp.seg_id.clone()                        # (B, S_in) maps each token to a segment id
-        #
-        # # if insert_eop and (comp.patch_end_mask is not None) and (tgt_kpm is not None):
-        # eop_tgt, eop_tgt_kpm, eop_seg_ids = _insert_eop_fixed_len_with_seg(
-        #     seq=tgt,
-        #     end_mask=comp.patch_end_mask,
-        #     kpm=tgt_kpm,
-        #     seg=seg_ids,
-        #     eop_id=cfg.eop_id,
-        #     pad_id=cfg.pad_id,
-        # )
 
         # ---- 2) Targets: NO EOP insertion ----
         tgt = comp.input_sequence  # (B, S_in)
@@ -275,7 +253,7 @@ class Abstractinator(nn.Module):
             tgt_key_padding_mask=tgt_kpm,
             seg_ids=seg_ids,
         )
-        stage_logits: List[torch.Tensor] = logits["stage_logits"]      # len=depth, each (B,L,K)
+        stage_logits: List[torch.Tensor] = logits["stage_logits"]  # len=depth, each (B,L,K)
         special_logits: Optional[torch.Tensor] = logits.get("special_logits")
 
         # ---- 4) Losses ----
@@ -292,7 +270,7 @@ class Abstractinator(nn.Module):
         # byte-LM CE (entropy branch)
         byte_lm_ce = torch.zeros((), device=dev)
         if cfg.w_byte_lm_ce > 0.0 and comp.entropy_model_logits.size(1) >= 2:
-            lm_logits = comp.entropy_model_logits[:, :-1, :]          # predict next low token
+            lm_logits = comp.entropy_model_logits[:, :-1, :]  # predict next low token
             lm_target = comp.input_sequence[:, 1:]
             lm_kpm = comp.input_padding_mask[:, 1:] if comp.input_padding_mask is not None else None
             per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
@@ -305,9 +283,9 @@ class Abstractinator(nn.Module):
         vq_loss = comp.vq_loss
 
         total = (
-            cfg.w_code_ce * digit_ce
-            + cfg.w_byte_lm_ce * byte_lm_ce
-            + cfg.w_vq * vq_loss
+                cfg.w_code_ce * digit_ce
+                + cfg.w_byte_lm_ce * byte_lm_ce
+                + cfg.w_vq * vq_loss
         )
 
         # ---- 5) Metrics (compression) ----
@@ -327,7 +305,6 @@ class Abstractinator(nn.Module):
             out["codes_lo_targets"] = tgt.detach()
             out["stage_logits_last"] = stage_logits[-1].detach()
         return out
-
 
     @torch.no_grad()
     def encode_for_next_level(
@@ -401,7 +378,7 @@ def _compression_stats(comp: CompressorOutput, input_kpm: Optional[torch.Tensor]
 
 
 def _factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
-    digits, is_special = codec.decompose(targets)   # list[(B,L)], (B,L)
+    digits, is_special = codec.decompose(targets)  # list[(B,L)], (B,L)
 
     # If no special head, we train specials via digits too
     mask_specials_in_digits = (special_logits is not None)
@@ -427,76 +404,3 @@ def _factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
             special_loss = (ce_sp * sp_mask).sum() / sp_mask.sum().clamp(min=1)
 
     return {"digit_ce": digit_loss, "special_ce": special_loss}
-
-
-# @torch._dynamo.disable()
-# @torch.no_grad()
-# def _insert_eop_fixed_len_with_seg(
-#     seq: torch.Tensor,              # (B,S)
-#     end_mask: torch.Tensor,         # (B,S) True at last token of segment
-#     kpm: torch.Tensor,              # (B,S) True==PAD
-#     seg: torch.Tensor,              # (B,S) segment id per token (0..Ŝ-1)
-#     eop_id: int,
-#     pad_id: int,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#     """
-#     Length-preserving EOP insertion *and* seg-id update, without relying on PAD budget.
-#     Always inserts an EOP after every kept segment-end token. If there is not enough
-#     space, later elements are truncated. New EOP tokens inherit the segment id of the
-#     token they follow.
-#     """
-#     import torch.nn.functional as F
-#
-#     B, S = seq.shape
-#     device = seq.device
-#
-#     # Align end_mask to sequence length
-#     if end_mask.size(1) != S:
-#         end_mask = end_mask[:, :S] if end_mask.size(1) > S else F.pad(end_mask, (0, S - end_mask.size(1)), value=False)
-#
-#     real = ~kpm                                # real (non-PAD) tokens
-#     end_mask = end_mask & real                 # only real tokens can end segments
-#
-#     # "Units" accounting: a normal token costs 1, an end-of-seg token costs 2 (token + EOP)
-#     units = real.to(torch.int64) + end_mask.to(torch.int64)          # (B,S) in {0,1,2}
-#     cum_units = torch.cumsum(units, dim=1)                            # inclusive prefix of units
-#
-#     # Greedy keep-from-left: include token i iff all items up to *and including* its EOP fit
-#     keep_tok = real & (cum_units <= S)                                 # (B,S) bool
-#
-#     # Among kept tokens, EOPs are exactly those with end_mask
-#     keep_eop = keep_tok & end_mask                                     # (B,S) bool
-#
-#     # Compute output positions using only the kept units:
-#     # For token i, its output pos = (# of kept units strictly before i).
-#     units_kept = keep_tok.to(torch.int64) + keep_eop.to(torch.int64)   # 1 or 2 at kept tokens, else 0
-#     cum_kept = torch.cumsum(units_kept, dim=1)                          # inclusive
-#     pos_tok = cum_kept - units_kept                                     # token lands here
-#     pos_eop = pos_tok + 1                                               # eop lands immediately after its token
-#
-#     # Prepare outputs
-#     out = seq.new_full((B, S), pad_id)
-#     out_kpm = torch.ones_like(kpm, dtype=torch.bool)  # True==PAD
-#     out_seg = torch.zeros_like(seg)
-#
-#     # Scatter kept tokens
-#     if keep_tok.any():
-#         batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(seq)
-#         out[batch_idx[keep_tok], pos_tok[keep_tok]] = seq[keep_tok]
-#         out_kpm[batch_idx[keep_tok], pos_tok[keep_tok]] = False
-#         out_seg[batch_idx[keep_tok], pos_tok[keep_tok]] = seg[keep_tok]
-#
-#     # Scatter their EOPs (always adjacent; guaranteed in-range by the keep rule)
-#     if keep_eop.any():
-#         batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(seq)
-#         out[batch_idx[keep_eop], pos_eop[keep_eop]] = eop_id
-#         out_kpm[batch_idx[keep_eop], pos_eop[keep_eop]] = False
-#         out_seg[batch_idx[keep_eop], pos_eop[keep_eop]] = seg[keep_eop]  # inherit seg id
-#
-#     # Fill seg ids for remaining PADs with last known seg id (safe filler)
-#     last_seg = seg.masked_fill(kpm, -1).max(dim=1).values.clamp(min=0)  # (B,)
-#     pad_mask = out_kpm
-#     if pad_mask.any():
-#         out_seg[pad_mask] = last_seg.unsqueeze(1).expand_as(out_seg)[pad_mask]
-#
-#     return out, out_kpm, out_seg
