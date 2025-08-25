@@ -7,19 +7,19 @@ import os
 
 import torch
 
-from .hierarchical_autoencoder import HierarchicalAutoencoder
+from components import AbstractinatorPyramid
 
 logger = logging.getLogger(__name__)
 
 
-def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
+def save_base_components(model: AbstractinatorPyramid, path: str) -> None:
     """Save only the compressor and expander weights from ``model``.
 
     The resulting file can be used to initialize another model with pretrained
     base components.
 
     Args:
-        model: The :class:`HierarchicalAutoencoder` containing the components.
+        model: The :class:`AbstractinatorPyramid` containing the components.
         path: Destination file path.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -34,11 +34,11 @@ def save_base_components(model: HierarchicalAutoencoder, path: str) -> None:
 
 
 def load_base_components(
-    model: HierarchicalAutoencoder,
-    path: str,
-    *,
-    freeze: bool = True,
-    map_location: str | torch.device | None = "cpu",
+        model: AbstractinatorPyramid,
+        path: str,
+        *,
+        freeze: bool = True,
+        map_location: str | torch.device | None = "cpu",
 ) -> None:
     """Load pretrained compressors and expanders from ``path``.
 
@@ -65,8 +65,8 @@ def load_base_components(
         compressors_sd = state["compressors"]
         expanders_sd = state["expanders"]
     else:
-        compressors_sd = {k[len("compressors.") :]: v for k, v in state.items() if k.startswith("compressors.")}
-        expanders_sd = {k[len("expanders.") :]: v for k, v in state.items() if k.startswith("expanders.")}
+        compressors_sd = {k[len("compressors."):]: v for k, v in state.items() if k.startswith("compressors.")}
+        expanders_sd = {k[len("expanders."):]: v for k, v in state.items() if k.startswith("expanders.")}
 
     # Load compressors starting from the bottom level.  The saved checkpoint may
     # contain fewer levels than ``model`` when fine‑tuning a larger hierarchy.

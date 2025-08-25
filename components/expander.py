@@ -13,6 +13,7 @@ from .sliding_window_attention import AttnCache, SegmentCausalCrossAttention
 from .swiglu import SwiGLU
 from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, \
     LearnedCodebookAdapter
+from .mla import MultiheadLatentAttention, CausalMLA
 
 
 @lru_cache(maxsize=64)
@@ -67,6 +68,180 @@ def _to_additive_mask(
         bias = kpm_bias if bias is None else (bias + kpm_bias)
 
     return bias
+
+class MLASelfAttention(nn.Module):
+    """
+    Drop-in for MultiHeadAttentionFused using MultiheadLatentAttention (MLA).
+    Preserves: attn_mask (bool), key_padding_mask. Causality enforced via block mask.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        *,
+        head_dim: Optional[int] = None,     # default: d_model // num_heads
+        kv_comp_dim: int = 32,              # c
+        q_comp_dim: int = 16,               # d_c'
+        retr_dim: int = 32,                 # r (even)
+        rope_max_seqlen: int = 8192,
+        use_flex_attention: bool = False,   # keep False unless you wired flex_attention/safe_softmax
+    ):
+        super().__init__()
+        H = num_heads
+        K = head_dim or (d_model // num_heads)
+        assert retr_dim % 2 == 0, "retr_dim must be even"
+        # Compress values/keys into c once per token
+        self.kv_comp = nn.Linear(d_model, kv_comp_dim, bias=False)
+        self.mla = MultiheadLatentAttention(
+            dim_q=d_model, num_heads=H, head_dim=K,
+            kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
+            rope_max_seqlen=rope_max_seqlen, use_flex_attention=use_flex_attention
+        )
+
+    @staticmethod
+    def _build_block_mask(
+        Lq: int, Lk: int, device: torch.device,
+        attn_mask: Optional[torch.Tensor], key_padding_mask: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """
+        Returns boolean mask (True = mask out) shaped [B,1,Lq,Lk] or [1,1,Lq,Lk].
+        Combines: causal upper‑tri, attn_mask (bool/broadcast), and key_padding_mask.
+        """
+        # Causal mask (Lq x Lk): True where k > q
+        causal = torch.triu(torch.ones((Lq, Lk), dtype=torch.bool, device=device), diagonal=1)
+
+        mask = causal.unsqueeze(0).unsqueeze(0)  # [1,1,Lq,Lk]
+
+        if attn_mask is not None:
+            m = attn_mask
+            if m.dtype != torch.bool:
+                # Treat large negative additive bias as masked
+                m = (m <= torch.finfo(m.dtype).min / 2).to(torch.bool)
+            if m.dim() == 2:            # (Lq, Lk)
+                m = m[None, None, :, :]
+            elif m.dim() == 3:          # (B, Lq, Lk)
+                m = m[:, None, :, :]
+            # else assume (B,H,Lq,Lk) or (B,1,Lq,Lk)
+            mask = mask | m.to(device)
+
+        if key_padding_mask is not None:
+            # (B, Lk) True = PAD ⇒ mask out entire column
+            kpm = key_padding_mask[:, None, None, :].to(device=device, dtype=torch.bool)
+            mask = mask | kpm
+
+        return mask
+
+    def forward(
+        self,
+        query: torch.Tensor,                          # (B, L, D)
+        key: Optional[torch.Tensor] = None,           # ignored; self-attn
+        value: Optional[torch.Tensor] = None,         # ignored; self-attn
+        attn_mask: Optional[torch.Tensor] = None,     # bool or additive
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True=pad
+        cache: Optional[Dict[str, torch.Tensor]] = None,   # optional in future
+    ) -> torch.Tensor:
+        x = query
+        B, L, D = x.shape
+        dev = x.device
+
+        # Compress once per token for values/keys
+        kv_c = self.kv_comp(x)  # [B, L, c]
+
+        block_mask = self._build_block_mask(L, L, dev, attn_mask, key_padding_mask)  # causal + extras
+
+        # Training/block mode (no cache here; you can add MLA caches later if needed)
+        out = self.mla(hidden_q=x, kv_c=kv_c, block_mask=block_mask)
+        return out
+
+class MLASegmentedCrossAttention(nn.Module):
+    """
+    Drop-in for SegmentCausalCrossAttention using MLA.
+    Enforces segment lookback with a boolean block mask:
+      allow keys where (q_seg - lookback) <= k_seg <= q_seg.
+    """
+    def __init__(
+        self,
+        q_dim: int,
+        kv_dim: int,
+        d_attn: int,         # keep = q_dim for parity with your block
+        n_heads: int,
+        lookback: int = 0,
+        kv_comp_dim: int = 32,
+        q_comp_dim: int = 16,
+        retr_dim: int = 32,
+        rope_max_seqlen: int = 8192,
+        use_flex_attention: bool = False,
+    ):
+        super().__init__()
+        assert d_attn == q_dim, "Set d_attn=q_dim to mirror your original block."
+        self.lookback = int(lookback)
+
+        # Compress memory to c
+        self.kv_comp = nn.Linear(kv_dim, kv_comp_dim, bias=False)
+
+        # MLA over (q_dim, n_heads)
+        K = q_dim // n_heads
+        self.mla = MultiheadLatentAttention(
+            dim_q=q_dim, num_heads=n_heads, head_dim=K,
+            kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
+            rope_max_seqlen=rope_max_seqlen, use_flex_attention=use_flex_attention
+        )
+
+    @staticmethod
+    def _combine_masks(
+        base: Optional[torch.Tensor],    # [B,1,Lq,Lk] or None
+        extra: Optional[torch.Tensor]    # [B,1,Lq,Lk] or None
+    ) -> Optional[torch.Tensor]:
+        if base is None:  return extra
+        if extra is None: return base
+        return base | extra
+
+    def _lookback_mask(self, seg_id_q: torch.Tensor, Lk: int) -> torch.Tensor:
+        """
+        Build [B,1,Lq,Lk] boolean mask (True = mask out) based on segment lookback.
+        k_seg is assumed to be 0..Lk-1 (one segment per memory position).
+        """
+        B, Lq = seg_id_q.shape
+        dev = seg_id_q.device
+        k_seg = torch.arange(Lk, device=dev).view(1, 1, Lk)      # [1,1,Lk]
+        q_seg = seg_id_q.view(B, Lq, 1)                          # [B,Lq,1]
+        good = (k_seg <= q_seg) & (k_seg >= (q_seg - self.lookback))
+        mask = ~good                                             # [B,Lq,Lk]
+        return mask.unsqueeze(1)                                 # [B,1,Lq,Lk]
+
+    def forward(
+        self,
+        q: torch.Tensor,                   # (B, Lq, q_dim)
+        kv_src: torch.Tensor,              # (B, Lk, kv_dim)
+        seg_id: torch.Tensor,              # (B, Lq) int
+        q_pos_ids: torch.Tensor,           # (B, Lq) or (Lq,)  (unused here; MLA handles RoPE internally)
+        kv_pos_ids: torch.Tensor,          # (Lk,)             (unused; absolute write in training)
+        kv_mask: Optional[torch.Tensor] = None,     # (B, Lk) bool True = pad
+        q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool True = pad (zeroed after)
+        cache: Optional[Dict[str, torch.Tensor]] = None,  # optional in future
+    ) -> torch.Tensor:
+        B, Lq, _ = q.shape
+        Lk = kv_src.size(1)
+        dev = q.device
+
+        kv_c = self.kv_comp(kv_src)  # [B, Lk, c]
+
+        # Segment lookback ⇒ block mask
+        block = self._lookback_mask(seg_id.to(device=dev, dtype=torch.long), Lk)
+
+        # Padding on keys
+        if kv_mask is not None:
+            kpm = kv_mask[:, None, None, :].to(device=dev, dtype=torch.bool)  # [B,1,1,Lk]
+            block = self._combine_masks(block, kpm)
+
+
+        out = self.mla(q, kv_c, block_mask=block)  # [B,Lq,q_dim]
+
+        if q_pad_mask is not None:
+            out = out.masked_fill(q_pad_mask.to(device=dev, dtype=torch.bool).unsqueeze(-1), 0.0)
+        return out
+
+
 
 
 class MultiHeadAttentionFused(nn.Module):
@@ -190,6 +365,177 @@ class MultiHeadAttentionFused(nn.Module):
         return self.out_proj(out)
 
 
+class SegmentCausalCrossAttention(nn.Module):
+    """
+    Cross-attention where queries attend to a *compressed* memory of segments.
+    RoPE is mandatory and applied segment-relatively (Q: per query positions;
+    K: per selected memory segment positions).
+    """
+
+    def __init__(
+        self,
+        q_dim: int,
+        kv_dim: int,
+        d_attn: int,
+        n_heads: int,
+        lookback: int = 0,
+        dropout: float = 0.0,
+        bias: bool = False,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__()
+        assert d_attn % n_heads == 0, "d_attn must be divisible by n_heads"
+
+        self.q_dim = q_dim
+        self.kv_dim = kv_dim
+        self.d_attn = d_attn
+        self.n_heads = n_heads
+        self.hdim = d_attn // n_heads
+        self.scale = self.hdim ** -0.5
+        self.lookback = int(lookback)
+        self.device = device
+
+        self.rope_cache = RoPECache(max_seqlen=8192, head_dim=self.hdim, dtype=torch.bfloat16, device=device)
+
+        assert (self.hdim % 2) == 0, "RoPE requires even head dim per head"
+        # cache must match Dh/2
+        half_in_cache = self.rope_cache.cos.size(-1)
+        assert half_in_cache * 2 == self.hdim, \
+            f"RoPECache head_dim mismatch: cache half={half_in_cache}, Dh/2={self.hdim//2}"
+
+
+        # Projections
+        self.q_proj = nn.Linear(q_dim, d_attn, bias=bias)
+        self.kv_proj = nn.Linear(kv_dim, 2 * d_attn, bias=bias)
+        self.o_proj = nn.Linear(d_attn, q_dim, bias=bias)
+        self.drop = nn.Dropout(dropout)
+
+        # small perf: reuse offsets tensor
+        self.register_buffer("offsets", torch.arange(self.lookback + 1), persistent=False)
+
+    def forward(
+        self,
+        q: torch.Tensor,                   # (B, Lq, q_dim)
+        kv_src: torch.Tensor,              # (B, Lkv, kv_dim)
+        seg_id: torch.Tensor,              # (B, Lq) int   (used for windowing)
+        q_pos_ids: torch.Tensor,           # (B, Lq) or (Lq,) int  (positions for Q)
+        kv_pos_ids: torch.Tensor,          # (Lkv,) int            (positions for K/V segments)
+        kv_mask: Optional[torch.Tensor] = None,   # (B, Lkv) bool – True => mask out
+        q_pad_mask: Optional[torch.Tensor] = None,# (B, Lq)  bool – True => padding
+        cache: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        B, Lq, _ = q.shape
+        device, dtype = q.device, q.dtype
+        H, Dh = self.n_heads, self.hdim
+
+        # --- RoPE tables (views) with dtype/device hygiene
+        cos_all = self.rope_cache.cos.to(dtype=dtype, device=device)  # (1,1,Smax,Dh/2)
+        sin_all = self.rope_cache.sin.to(dtype=dtype, device=device)
+        Smax = cos_all.size(2)
+
+        # --- 1) Q projection & RoPE(Q)
+        qh = self._split_heads(self.q_proj(q))  # (B,H,Lq,Dh)
+
+        # positions for Q: prefer per-batch (B,Lq); if (Lq,), broadcast
+        if q_pos_ids.dim() == 1:
+            q_pos = q_pos_ids.to(device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+        else:
+            q_pos = q_pos_ids.to(device=device, dtype=torch.long)
+        q_pos = torch.clamp(q_pos, 0, Smax - 1)                          # (B,Lq)
+
+        # gather cos/sin for Q: (B,1,Lq,Dh/2), broadcast over heads
+        q_cos = torch.take_along_dim(cos_all.expand(B, 1, -1, -1), q_pos[:, None, :, None], dim=2)
+        q_sin = torch.take_along_dim(sin_all.expand(B, 1, -1, -1), q_pos[:, None, :, None], dim=2)
+        qh = apply_rope(qh, q_cos, q_sin)                                 # (B,H,Lq,Dh)
+
+        # --- 2) K/V: cached vs recompute (use python bool)
+        has_cache = (
+            cache is not None
+            and isinstance(cache.get("k", None), torch.Tensor)
+            and isinstance(cache.get("v", None), torch.Tensor)
+        )
+
+        if has_cache:
+            kh = cache["k"].clone(memory_format=torch.contiguous_format)  # (B,H,Lkv,Dh), *unrotated*
+            vh = cache["v"].clone(memory_format=torch.contiguous_format)  # (B,H,Lkv,Dh)
+        else:
+            kv = self.kv_proj(kv_src)                                     # (B,Lkv,2*D)
+            k, v = kv.split(self.d_attn, dim=-1)                          # (B,Lkv,D), (B,Lkv,D)
+            kh = self._split_heads(k)                                     # (B,H,Lkv,Dh)
+            vh = self._split_heads(v)                                     # (B,H,Lkv,Dh)
+
+        Lkv = kh.size(2)
+        Kw = self.lookback + 1
+
+        # --- 3) Segment window indices
+        offsets = self.offsets.to(device)  # (Kw,)
+        gather = seg_id.to(device).unsqueeze(-1) - offsets                 # (B,Lq,Kw)
+        neg_mask = gather < 0
+        gather_clamped = torch.clamp(gather, 0, Lkv - 1)                   # (B,Lq,Kw)
+
+        # --- 4) Select K/V windows
+        idx = gather_clamped.unsqueeze(1).unsqueeze(-1).expand(-1, H, -1, -1, Dh)  # (B,H,Lq,Kw,Dh)
+        k_sel = torch.take_along_dim(kh.unsqueeze(3), idx, dim=2)           # (B,H,Lq,Kw,Dh)
+        v_sel = torch.take_along_dim(vh.unsqueeze(3), idx, dim=2)           # (B,H,Lq,Kw,Dh)
+
+        # --- 4b) RoPE(K) *after* selection using per-window positions
+        # build per-window K positions from kv_pos_ids
+        kv_pos_ids = kv_pos_ids.to(device=device, dtype=torch.long)        # (Lkv,)
+        # (B,1,Lq,Kw)
+        k_pos = torch.take_along_dim(
+            kv_pos_ids.view(1, 1, Lkv, 1).expand(B, 1, -1, Kw),
+            gather_clamped.unsqueeze(1), dim=2
+        )
+        k_pos = torch.clamp(k_pos, 0, Smax - 1)                             # (B,1,Lq,Kw)
+
+        # gather cos/sin for these positions: (B,1,Lq,Kw,Dh/2)
+        k_cos = torch.take_along_dim(
+            cos_all.unsqueeze(3).expand(B, 1, -1, Kw, cos_all.size(-1)),
+            k_pos.unsqueeze(-1), dim=2
+        )
+        k_sin = torch.take_along_dim(
+            sin_all.unsqueeze(3).expand(B, 1, -1, Kw, sin_all.size(-1)),
+            k_pos.unsqueeze(-1), dim=2
+        )
+
+        k_sel = apply_rope(k_sel, k_cos, k_sin)                             # (B,H,Lq,Kw,Dh)
+
+        # --- 5) Attention
+        scores = (qh.unsqueeze(-2) * k_sel).sum(dim=-1) * self.scale       # (B,H,Lq,Kw)
+
+        # --- 6) Masks
+        if kv_mask is None:
+            kvm_win = torch.zeros((B, Lq, Kw), dtype=torch.bool, device=device)
+        else:
+            kv_mask_b = kv_mask.to(device=device, dtype=torch.bool)        # (B,Lkv)
+            b_idx = torch.arange(B, device=device)[:, None, None]
+            kvm_win = kv_mask_b[b_idx, gather_clamped]                      # (B,Lq,Kw)
+
+        neg_inf = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(kvm_win.unsqueeze(1), neg_inf)
+        scores = scores.masked_fill(neg_mask.unsqueeze(1), neg_inf)
+
+        # --- 7) Softmax + mix
+        probs = self.drop(F.softmax(scores, dim=-1))                        # (B,H,Lq,Kw)
+        out = (probs.unsqueeze(-1) * v_sel).sum(dim=-2)                     # (B,H,Lq,Dh)
+
+        # --- 8) Merge heads, project, pad mask
+        out = out.transpose(1, 2).reshape(B, Lq, self.d_attn)               # (B,Lq,D)
+        out = self.o_proj(out)                                              # (B,Lq,q_dim)
+
+        if q_pad_mask is not None:
+            out = out.masked_fill(q_pad_mask.to(device=device, dtype=torch.bool).unsqueeze(-1), 0.0)
+        return out
+
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, _ = x.shape
+        return (
+            x.reshape(B, L, self.n_heads, self.hdim)
+             .permute(0, 2, 1, 3)
+             .contiguous()
+        )
+
+
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
@@ -197,7 +543,10 @@ class SlidingDecoderBlock(nn.Module):
         super().__init__()
         self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
-        self.self_attn = MultiHeadAttentionFused(d_model, num_heads, causal=True)
+        self.self_attn = CausalMLA(
+            dim_q=d_model, num_heads=num_heads, kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32,
+            retr_dim=d_model // num_heads, rope_max_seqlen=8192, use_flex_attention=True
+        )
         self.norm2 = nn.RMSNorm(d_model)
         self.cross_attn = SegmentCausalCrossAttention(
             q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False
@@ -209,6 +558,8 @@ class SlidingDecoderBlock(nn.Module):
             self,
             x: torch.Tensor,
             memory: torch.Tensor,
+            q_pos_ids: torch.Tensor | None = None,
+            kv_pos_ids: torch.Tensor | None = None,
             seg_ids: torch.Tensor | None = None,
             cache: AttnCache | None = None,
             tgt_mask: torch.Tensor | None = None,
@@ -216,12 +567,14 @@ class SlidingDecoderBlock(nn.Module):
             memory_key_padding_mask: torch.Tensor | None = None,
             # cross_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = x + self.self_attn(self.norm1(x), attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
+        x = x + self.self_attn(self.norm1(x), key_padding_mask=tgt_key_padding_mask) # attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
 
         x = x + self.cross_attn(
             self.norm2(x),
             kv_src=memory,
             seg_id=seg_ids,
+            q_pos_ids=q_pos_ids,
+            kv_pos_ids=kv_pos_ids,
             kv_mask=memory_key_padding_mask,
             q_pad_mask=tgt_key_padding_mask,
         )
@@ -245,6 +598,8 @@ class SlidingDecoder(nn.Module):
             self,
             x: torch.Tensor,
             memory: torch.Tensor,
+            q_pos_ids: torch.Tensor | None = None,
+            kv_pos_ids: torch.Tensor | None = None,
             cache: AttnCache | None = None,
             tgt_mask: torch.Tensor | None = None,
             tgt_key_padding_mask: torch.Tensor | None = None,
@@ -256,6 +611,8 @@ class SlidingDecoder(nn.Module):
             x = layer(
                 x,
                 memory,
+                q_pos_ids=q_pos_ids,
+                kv_pos_ids=kv_pos_ids,
                 cache=cache,
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
@@ -288,7 +645,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                  lo_d_c: int = 64,  # Factorized rank for bytes
                  residual_conditioning: bool = True,
                  use_sqdist_logits: bool = False,
-                 predict_specials: bool = True,
                  device: Optional[torch.device] = None):
         super().__init__()
         self.lo_vq = lo_vq
@@ -304,8 +660,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         if lo_vq is not None:
             self.lo_adapt = RVQEmbeddingAdapter(lo_vq, target_D=D,
                                                 use_shared_proj=True,
-                                                # tie_up_down=True,
-                                                specials_in_D=True)
+                                                tie_up_down=True)
             self.lo_codec = ComposedIndexCodec(K=lo_vq.K, depth=lo_vq.depth,
                                                bos=lo_vq.bos_token_id, eos=lo_vq.eos_token_id,
                                                pad=lo_vq.padding_token_id, eop=lo_vq.eop_token_id)
@@ -316,8 +671,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1, eop=-1)
 
         # ---- high side (memory) ----
-        self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True,
-                                            specials_in_D=True) if hi_vq is not None else None
+        self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True) if hi_vq is not None else None
 
         # Your existing decoder block
         self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=D, kv_dim=D)
@@ -325,8 +679,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         # Factorized head
         self.head = RVQFactorizedHead(self.lo_adapt,
                                       residual_conditioning=residual_conditioning,
-                                      use_sqdist_logits=use_sqdist_logits,
-                                      predict_specials=predict_specials)
+                                      use_sqdist_logits=use_sqdist_logits)
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
         return get_causal_mask(length, device)
@@ -355,12 +708,19 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         memory = self._embed_memory(codes_hi)  # (B, S_hi, D)
         dec_inp = self._embed_decoder_inputs(codes_lo)  # (B, L, D)
 
+        L_q = codes_lo.size(1)
+        L_kv = memory.size(1)
+        q_pos_ids = torch.arange(L_q, device=device)
+        kv_pos_ids = torch.arange(L_kv, device=device)
+
         tgt_mask = self._causal_mask(codes_lo.size(1), device)
         adjusted_tgt_kpm = None
         if tgt_key_padding_mask is not None:
             adjusted_tgt_kpm = F.pad(tgt_key_padding_mask[:, :-1], (1, 0), value=False)
 
         h = self.decoder(dec_inp, memory,
+                         q_pos_ids=q_pos_ids,
+                         kv_pos_ids=kv_pos_ids,
                          tgt_mask=tgt_mask,
                          tgt_key_padding_mask=adjusted_tgt_kpm,
                          memory_key_padding_mask=src_key_padding_mask,
@@ -386,6 +746,9 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         device = codes_hi.device
         B = codes_hi.size(0)
         memory = self._embed_memory(codes_hi)  # (B, S_hi, D)
+
+        kv_pos_ids = torch.arange(memory.size(1), device=device)
+
         generated = codes_lo.clone()  # (B, T)
         kpm = tgt_key_padding_mask.clone() if tgt_key_padding_mask is not None \
             else torch.zeros_like(generated, dtype=torch.bool)
@@ -410,15 +773,19 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             return seg_ids
 
         depth = self.lo_codec.depth  # works for both MS-RVQ and learned single-stage
-
-        for _ in range(steps_budget):
+        new_tokens = torch.zeros((B, 0), dtype=generated.dtype, device=device)  # (B,0)
+        for step in range(steps_budget):
             T = generated.size(1)
+            q_pos_ids = torch.arange(T, device=device)
+
             dec_inp = self.lo_adapt.embed_composed(generated)  # (B, T, D)
             tgt_mask = self._causal_mask(T, device)
             seg_ids_cur = _align_seg_ids(T)  # (B, T)
 
             h = self.decoder(
                 dec_inp, memory,
+                q_pos_ids=q_pos_ids,
+                kv_pos_ids=kv_pos_ids,
                 cache=cache,
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=kpm,
@@ -426,7 +793,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 seg_ids=seg_ids_cur,
             )  # (B, T, D)
 
-            last_h = h[:, -1:, :]  # (B,1,D)
+            last_h = h[:, -1, :]  # (B,1,D)
             r_dc = self.lo_adapt.down(last_h)  # (B,1,d_c)
 
             # Greedy stage-by-stage with residual updates
@@ -442,12 +809,13 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             if next_id.ndim == 1:
                 next_id = next_id.unsqueeze(1)  # (B,1)
 
-            generated = torch.cat([generated, next_id], dim=1)
-            if kpm is not None:
-                kpm = F.pad(kpm, (0, 1), value=False)  # newly appended is real
-
-            # optional early stop if you actually predict specials
+            # Append next_id to the sequence and extend masks accordingly
+            generated = torch.cat([generated, next_id], dim=1)  # (B, T+1)
+            kpm = F.pad(kpm, (0, 1), value=False)  # new token is real (not PAD)
+            new_tokens = torch.cat([new_tokens, next_id], dim=1)
+            # Early stop on EOS/EOP (after appending)
             if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
                 break
 
-        return generated
+
+        return new_tokens

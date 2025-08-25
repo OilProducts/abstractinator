@@ -7,23 +7,22 @@ from .mla import CausalMLATransformerBlock
 from .vector_quantizer import VectorQuantizer
 
 
-# @torch.compile(dynamic=True)
 class CodeSequenceTransformer(nn.Module):
     """Causal Transformer that predicts continuous embeddings."""
 
     def __init__(
-        self,
-        embed_dim: int,
-        dim: int,
-        num_layers: int,
-        num_heads: int,
-        ffn_dim_multiplier: int = 4,
-        head_dim: int | None = 32,  # K
-        kv_comp_dim: int | None = 64,  # d_c
-        q_comp_dim: int | None = 96,  # d_c`
-        retr_dim: int | None = 32,  # r
-        vq: VectorQuantizer | None = None,
-        use_flex_attention: bool = True,
+            self,
+            embed_dim: int,
+            dim: int,
+            num_layers: int,
+            num_heads: int,
+            ffn_dim_multiplier: int = 4,
+            head_dim: int | None = 32,  # K
+            kv_comp_dim: int | None = 64,  # d_c
+            q_comp_dim: int | None = 96,  # d_c`
+            retr_dim: int | None = 32,  # r
+            vq: VectorQuantizer | None = None,
+            use_flex_attention: bool = True,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -50,12 +49,11 @@ class CodeSequenceTransformer(nn.Module):
         self.final_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, embed_dim)
 
-
     @torch.compile
     def forward(
-        self,
-        input_embeddings: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
+            self,
+            input_embeddings: torch.Tensor,
+            key_padding_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Process a sequence of embeddings.
 
@@ -92,10 +90,10 @@ class CodeSequenceTransformer(nn.Module):
 
     @torch.no_grad()
     def generate_embeddings(
-        self,
-        prefix: torch.Tensor,
-        key_padding_mask: torch.Tensor | None = None,
-        max_len: int | None = None,
+            self,
+            prefix: torch.Tensor,
+            key_padding_mask: torch.Tensor | None = None,
+            max_len: int | None = None,
     ) -> torch.Tensor:
         """Autoregressively generate embeddings until EOS is produced."""
         assert self.vq is not None, "generate_embeddings requires a VectorQuantizer"

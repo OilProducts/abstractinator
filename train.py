@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader
 import torch._dynamo as dynamo
 from transformers.optimization import get_scheduler
 
-from components import HierarchicalAutoencoder
 from components import AbstractinatorPyramid
+from components import CodeSequenceTransformer
 from components.checkpoint_utils import load_base_components, save_base_components
 # from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.metrics import MlflowBatchLogger, TrainingMetrics
@@ -111,30 +111,49 @@ def load_experiment_config(args: argparse.Namespace) -> tuple[str, int, ExpConfi
 
 def initialize_model(
     args: argparse.Namespace, exp_config: ExpConfig, device: str
-) -> tuple[HierarchicalAutoencoder, optim.Optimizer, int, int]:
+) -> tuple[AbstractinatorPyramid, optim.Optimizer, int, int]:
     """Instantiate the model, optimizer and restore any checkpoints."""
 
     logger = logging.getLogger(LOGGER_NAME)
 
-    model = AbstractinatorPyramid(cfg=exp_config.pyramid_config).to(device)
+    # Optional Top LM instantiation
+    top_lm = None
+    try:
+        use_top_lm = bool(getattr(exp_config.pyramid_config, "use_top_code_lm", False))
+    except Exception:
+        use_top_lm = False
 
-    # model = HierarchicalAutoencoder(
-    #     num_levels=exp_config.num_levels,
-    #     compressor_level_configs=[asdict(c) for c in exp_config.compressor_level_configs],
-    #     expander_level_configs=[asdict(e) for e in exp_config.expander_level_configs],
-    #     initial_vocab_size=exp_config.initial_vocab_size,
-    #     propagate_key_padding_mask=exp_config.propagate_key_padding_mask,
-    #     aux_lm_loss_weight=exp_config.aux_lm_loss_weight,
-    #     top_transformer_config=(
-    #         asdict(exp_config.top_transformer_config) if exp_config.top_transformer_config else None
-    #     ),
-    #     top_lm_loss_weight=exp_config.top_lm_loss_weight,
-    #     # use_continuous_expander_inputs=exp_config.expander.use_continuous_inputs,
-    #     top_lm_mse_weight=exp_config.top_lm_mse_weight,
-    #     top_lm_ce_weight=exp_config.top_lm_ce_weight,
-    #     use_flex_attention=exp_config.flex_attention,
-    #     device=ExpConfig.device,
-    # ).to(device)
+    if use_top_lm and getattr(exp_config, "top_transformer_config", None) is not None:
+        tcfg = exp_config.top_transformer_config
+        # Match top level embedding dimension
+        try:
+            top_level_cfg = exp_config.pyramid_config.levels[-1]
+            embed_dim = int(getattr(top_level_cfg, "D"))
+        except Exception:
+            embed_dim = int(getattr(tcfg, "embed_dim", 128))
+
+        top_lm = CodeSequenceTransformer(
+            embed_dim=embed_dim,
+            dim=int(getattr(tcfg, "dim", max(128, embed_dim))),
+            num_layers=int(getattr(tcfg, "num_layers", 12)),
+            num_heads=int(getattr(tcfg, "num_heads", 8)),
+            ffn_dim_multiplier=int(getattr(tcfg, "ffn_dim_multiplier", 4)),
+            head_dim=getattr(tcfg, "head_dim", 32),
+            kv_comp_dim=getattr(tcfg, "kv_comp_dim", 64),
+            q_comp_dim=getattr(tcfg, "q_comp_dim", 96),
+            retr_dim=getattr(tcfg, "retr_dim", 32),
+            vq=None,  # wired after model is constructed
+            use_flex_attention=bool(getattr(exp_config, "flex_attention", True)),
+        )
+
+    model = AbstractinatorPyramid(cfg=exp_config.pyramid_config, top_lm=top_lm).to(device)
+
+    # If we constructed a top LM, attach the top-level compressor VQ so it can quantize/pick EOS
+    if top_lm is not None and hasattr(model, "levels") and len(model.levels) > 0:
+        try:
+            model.top_lm.vq = model.levels[-1].compressor.vq
+        except Exception:
+            pass
 
     if args.load_base_from:
         load_base_components(
@@ -154,13 +173,135 @@ def initialize_model(
         short_num(num_params),
     )
 
-    levels_params = _count_params(model.levels)
-    # expander_params = _count_params(model.expanders)
-    logger.info("  Total: %s parameters", short_num(levels_params))
-    # logger.info("  Expanders: %s parameters", short_num(expander_params))
+    # High-level component breakdown
+    levels_params = _count_params(model.levels) if hasattr(model, "levels") else 0
+    logger.info("  Levels (all): %s parameters", short_num(levels_params))
+
+    # Optional top LM module (high level)
+    top_lm = getattr(model, "top_lm", None)
+    if top_lm is not None:
+        top_lm_params = _count_params(top_lm)
+        logger.info("  Top LM: %s parameters", short_num(top_lm_params))
+
+        # Finer breakdown for CodeSequenceTransformer (avoid shadowing by aliasing)
+        try:
+            from components import CodeSequenceTransformer as _CST  # safe alias
+            if isinstance(top_lm, _CST):
+                in_proj = _count_params(getattr(top_lm, "in_proj", top_lm))
+                enc = _count_params(getattr(top_lm, "encoder", top_lm))
+                f_norm = _count_params(getattr(top_lm, "final_norm", top_lm))
+                out_proj = _count_params(getattr(top_lm, "out_proj", top_lm))
+                logger.info(
+                    "    Top LM breakdown → in: %s | encoder: %s | norm: %s | out: %s",
+                    short_num(in_proj), short_num(enc), short_num(f_norm), short_num(out_proj),
+                )
+        except Exception:
+            pass
+
+    # Backward-compat: some older models exposed a code_sequence_transformer
     if getattr(model, "code_sequence_transformer", None) is not None:
         cst_params = _count_params(model.code_sequence_transformer)
         logger.info("  CodeSequenceTransformer: %s parameters", short_num(cst_params))
+
+    # Per-level breakdown with a finer split for compressor/expander internals
+    if hasattr(model, "levels"):
+        total_comp = 0
+        total_exp = 0
+
+        # Helper to safely count attributes that may not exist
+        def _safe_count(mod: torch.nn.Module | None) -> int:
+            try:
+                return _count_params(mod) if mod is not None else 0
+            except Exception:
+                return 0
+
+        for li, lvl in enumerate(model.levels):
+            comp = getattr(lvl, "compressor", None)
+            expn = getattr(lvl, "expander", None)
+
+            comp_params = _safe_count(comp)
+            exp_params = _safe_count(expn)
+            total_comp += comp_params
+            total_exp += exp_params
+            logger.info(
+                "  L%s: %s total | compress %s | decompress %s",
+                li,
+                short_num(comp_params + exp_params),
+                short_num(comp_params),
+                short_num(exp_params),
+            )
+
+            # Compressor breakdown
+            if comp is not None:
+                emb = _safe_count(getattr(comp, "embedding", None))
+                shared = _safe_count(getattr(comp, "shared_layers", None))
+                comp_layers = _safe_count(getattr(comp, "compression_layers", None))
+                lm_layers = _safe_count(getattr(comp, "lm_layers", None))
+                lm_norm = _safe_count(getattr(comp, "lm_final_norm", None))
+                lm_head = _safe_count(getattr(comp, "logit_proj", None))
+                pool = _safe_count(getattr(comp, "pooler", None))
+                vq = getattr(comp, "vq", None)
+                vq_total = _safe_count(vq)
+                vq_down = _safe_count(getattr(vq, "down", None))
+                vq_up = _safe_count(getattr(vq, "up", None))
+                # sum stage codebooks (VectorQuantizer.codebook)
+                vq_stage_params = 0
+                try:
+                    stages = getattr(vq, "stages", [])
+                    for st in stages:
+                        vq_stage_params += _safe_count(st)
+                except Exception:
+                    pass
+
+                # Counts + small context
+                try:
+                    n_shared = len(getattr(comp, "shared_layers", []))
+                except Exception:
+                    n_shared = 0
+                try:
+                    n_comp = len(getattr(comp, "compression_layers", []))
+                except Exception:
+                    n_comp = 0
+                try:
+                    n_lm = len(getattr(comp, "lm_layers", []))
+                except Exception:
+                    n_lm = 0
+
+                logger.info(
+                    "    ├─ Compressor breakdown → embed: %s | shared(%d): %s | compression(%d): %s",
+                    short_num(emb), n_shared, short_num(shared), n_comp, short_num(comp_layers),
+                )
+                logger.info(
+                    "    │  LM branch → layers(%d): %s | norm: %s | logits: %s",
+                    n_lm, short_num(lm_layers), short_num(lm_norm), short_num(lm_head),
+                )
+                logger.info(
+                    "    │  Pooler: %s | VQ total: %s (down: %s, up: %s, stages: %s)",
+                    short_num(pool), short_num(vq_total), short_num(vq_down), short_num(vq_up), short_num(vq_stage_params),
+                )
+
+            # Expander breakdown
+            if expn is not None:
+                lo_adapt = _safe_count(getattr(expn, "lo_adapt", None))
+                hi_adapt = _safe_count(getattr(expn, "hi_adapt", None))
+                dec = _safe_count(getattr(expn, "decoder", None))
+                head = _safe_count(getattr(expn, "head", None))
+
+                try:
+                    n_dec_layers = len(getattr(getattr(expn, "decoder", None), "layers", []))
+                except Exception:
+                    n_dec_layers = 0
+
+                logger.info(
+                    "    └─ Expander breakdown → lo_adapter: %s | hi_adapter: %s | decoder(%d): %s | head: %s",
+                    short_num(lo_adapt), short_num(hi_adapt), n_dec_layers, short_num(dec), short_num(head),
+                )
+
+        logger.info(
+            "  All compressors: %s | All decompressors: %s",
+            short_num(total_comp),
+            short_num(total_exp),
+        )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=exp_config.learning_rate)
@@ -187,7 +328,7 @@ def initialize_model(
 
 
 def save_checkpoint(
-    model: HierarchicalAutoencoder,
+    model: AbstractinatorPyramid,
     optimizer: optim.Optimizer,
     epoch: int,
     step: int,
@@ -222,9 +363,10 @@ class Trainer:
 
         torch.set_float32_matmul_precision("high")
         torch.set_default_dtype(torch.bfloat16)
-        # torch.set_printoptions(threshold=100_000)
-        # torch._dynamo.config.capture_scalar_outputs = True
+        torch.set_printoptions(threshold=100_000)
+        torch._dynamo.config.capture_scalar_outputs = True
         # torch._dynamo.config.recompile_limit = 128
+        # torch.autograd.set_detect_anomaly(True)
 
         (
             self.model,
@@ -258,7 +400,7 @@ class Trainer:
 
 
 def train_loop(
-    model: HierarchicalAutoencoder,
+    model: AbstractinatorPyramid,
     optimizer: optim.Optimizer,
     exp_config: ExpConfig,
     device: str,
@@ -364,14 +506,25 @@ def train_loop(
     #     torch.cuda.synchronize()
     training_start_time = time.time()
     metrics = TrainingMetrics(
-        num_levels=exp_config.num_levels,
-        aux_lm_enabled=exp_config.get("aux_lm_loss_weight", 0.0) > 0,
-        top_lm_enabled=exp_config.get("top_lm_loss_weight", 0.0) > 0,
+        num_levels=len(getattr(model, "levels", [])) if getattr(model, "levels", None) is not None else exp_config.num_levels,
+        aux_lm_enabled=True,  # entropy model loss is always tracked for logging
+        top_lm_enabled=getattr(exp_config.pyramid_config, "use_top_code_lm", False),
     )
+
+    # Capture codebook sizes once for MLflow metadata
+    codebook_sizes: list[int] | None = None
+    if hasattr(model, "levels") and model.levels is not None:
+        codebook_sizes = []
+        try:
+            for lvl in model.levels:
+                vq = getattr(lvl.compressor, "vq", None)
+                codebook_sizes.append(int(getattr(vq, "K", 0)) if vq is not None else 0)
+        except Exception:
+            codebook_sizes = None
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
     model = torch.compile(model)
-    #
+
     # from torch.profiler import profile, record_function, ProfilerActivity
     #
     # with profile(
@@ -381,7 +534,7 @@ def train_loop(
     #         profile_memory=True,
     #         # with_modules=True,
     # ) as prof:
-    #     for _ in range(50):  # run ~50 optimizer steps
+    #     for _ in range(500):  # run ~50 optimizer steps
     #         batch = next(iter(train_dataloader))
     #         tokens = batch["input_ids"].to(device, non_blocking=True)
     #         key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
@@ -435,6 +588,13 @@ def train_loop(
             output_dict = model(tokens, key_padding_mask=model_kpm)
             total_loss = output_dict["loss_total"]
 
+            # Add Top-LM loss if enabled and present
+            if getattr(exp_config.pyramid_config, "use_top_code_lm", False) and "avg_top_code_lm_loss" in output_dict:
+                w_top = float(getattr(exp_config, "top_lm_loss_weight", 1.0))
+                w_mse = float(getattr(exp_config, "top_lm_mse_weight", 1.0))
+                # CE path not currently modeled; include only MSE component here
+                total_loss = total_loss + w_top * (w_mse * output_dict["avg_top_code_lm_loss"])
+
             loss_for_backward = total_loss / exp_config.gradient_accumulation_steps
             loss_for_backward.backward()
 
@@ -479,15 +639,14 @@ def train_loop(
                     if console_log_parts:
                         logger.info(" | ".join(console_log_parts))
 
-                    # if metrics.count > 0:
-                    #     codebook_sizes = [c.codebook_size for c in exp_config.compressor_level_configs]
-                    #     metrics_dict = metrics.metrics_dict(
-                    #         learning_rate=optimizer.param_groups[0]["lr"],
-                    #         tokens_per_second=tokens_per_second,
-                    #         patches_per_second=patches_per_second,
-                    #         codebook_sizes=codebook_sizes,
-                    #     )
-                    #     mlflow_logger.log(global_step, metrics_dict)
+                    if metrics.count > 0:
+                        metrics_dict = metrics.metrics_dict(
+                            learning_rate=optimizer.param_groups[0]["lr"],
+                            tokens_per_second=tokens_per_second,
+                            patches_per_second=patches_per_second,
+                            codebook_sizes=codebook_sizes,
+                        )
+                        mlflow_logger.log(global_step, metrics_dict)
 
                 metrics.reset_window()
                 time_of_last_optimizer_step_event = current_time
@@ -497,7 +656,7 @@ def train_loop(
                     model.eval()
                     with torch.no_grad():
                         sample_text = exp_config.sample_prompt_for_generation
-                        input_gen_tokens = tokenizer.encode(sample_text).unsqueeze(0).to(device)
+                        input_gen_tokens = tokenizer.encode(sample_text, add_eos=False).unsqueeze(0).to(device).to(torch.int64)
 
                         input_gen_kpm = None
                         if exp_config.propagate_key_padding_mask:
@@ -508,6 +667,7 @@ def train_loop(
                             prompt_kpm=input_gen_kpm,
                             max_top_steps=exp_config.generation_max_len_override,
                             max_child_len=8,
+                            top_sample_fn=model.top_lm,
                         )
                         reconstructed_text = tokenizer.decode(reconstructed_tokens.squeeze(0).cpu())
 
@@ -516,8 +676,8 @@ def train_loop(
                         logger.info("Reconstructed Text:\n%s", reconstructed_text)
                         logger.info("------------------------------------------")
 
-                        # mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
-                        # mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
+                        mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
+                        mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
 
                     model.train()
                     if args.load_base_from:
@@ -556,8 +716,8 @@ def train_loop(
     logger.info("Training finished.")
     if exp_config.save_base_components_path:
         save_base_components(model, exp_config.save_base_components_path)
-    # mlflow_logger.flush()
-    # mlflow.end_run()
+    mlflow_logger.flush()
+    mlflow.end_run()
 
 
 def main() -> None:
