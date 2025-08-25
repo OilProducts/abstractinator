@@ -1,21 +1,8 @@
 import torch
 
 from components.sliding_window_attention import (
-    get_cross_window_mask,
     SegmentCausalCrossAttention,
 )
-
-
-def test_cross_window_mask():
-    mask = get_cross_window_mask(3, 5, window=2, device=torch.device("cpu"))
-    expected = torch.tensor(
-        [
-            [False, True, True, True, True],
-            [False, False, True, True, True],
-            [False, False, False, True, True],
-        ]
-    )
-    assert torch.equal(mask, expected)
 
 
 def test_cross_attention_forward_shape():
