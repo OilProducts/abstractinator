@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .swiglu import SwiGLU
-from .rope import RoPECache, apply_rope
+from components.swiglu import SwiGLU
+from components.rope import RoPECache, apply_rope
 # ---------------------------------------------------------------------------
 # Multi-Head Attention with RoPE
 # ---------------------------------------------------------------------------
