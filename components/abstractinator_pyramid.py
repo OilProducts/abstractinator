@@ -7,17 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs import AbstractinatorConfig
-from .abstractinator import Abstractinator #, insert_eop_fixed_len
+from .abstractinator import Abstractinator
 from .vector_quantizer import ComposedIndexCodec
 
 @dataclass
 class PyramidConfig:
     levels: List[AbstractinatorConfig]
-    w_vq: float = 0.1
+    w_vq: float = 1.0
     w_byte_lm: float = 0.0
     use_top_code_lm: bool = False
-    # If you keep a top LM, expose a tiny interface:
-    # predict_one_next(top_context: (B,S,D), kpm: (B,S)?) -> (B,D)
 
 class AbstractinatorPyramid(nn.Module):
     def __init__(self,
@@ -38,7 +36,6 @@ class AbstractinatorPyramid(nn.Module):
         self.levels = nn.ModuleList(levels)
         self.top_lm = top_lm
 
-    # @torch.no_grad()
     def compress_all(
         self, tokens: torch.Tensor, kpm: Optional[torch.Tensor]
     ) -> List[Any]:
@@ -73,84 +70,9 @@ class AbstractinatorPyramid(nn.Module):
         B = tokens.size(0)
         device = tokens.device
         comp_outs = self.compress_all(tokens, key_padding_mask)
-
-        # aggregate vq loss
-        # vq_loss_total = 0.0
-        # for co in comp_outs:
-        #     vq_loss_total += co.loss_vq
-
         vq_total = sum(co['loss_vq'] for co in comp_outs)
 
-        # # Build teacher-forcing targets from bottom→top inputs
-        # targets: List[torch.Tensor] = []
-        # tgt_kpms: List[Optional[torch.Tensor]] = []
-        # for L, co in enumerate(comp_outs):        # bottom input for level L is tokens at that level
-        #     tgt = co['comp_out'].input_sequence               # (B, S_in at level L)
-        #     kpm = co['comp_out'].input_padding_mask
-        #     # EOP insertion for decoder at level L (so it learns to stop per segment)
-        #     if co['comp_out'].patch_end_mask is not None and kpm is not None:
-        #         eop_id = self.levels[L-1].compressor.vq.eop_token_id if L > 0 else self.levels[0].compressor.vq.eop_token_id
-        #         pad_id = self.levels[L-1].compressor.vq.padding_token_id if L > 0 else self.levels[0].compressor.vq.padding_token_id
-        #         # tgt, kpm = insert_eop_fixed_len(tgt, co['comp_out'].patch_end_mask, kpm, eop_id=eop_id, pad_id=pad_id)
-        #     targets.append(tgt)
-        #     tgt_kpms.append(kpm)
-        #
-        # # Decode each level with teacher forcing
-        # total_digit = torch.zeros((), device=device)
-        # total_special = torch.zeros((), device=device)
-        # total_byte_lm = torch.zeros((), device=device)
-
-
-        # for L, level in enumerate(self.levels):
-        #     # memory is *continuous* embeddings output at level L (hi)
-        #     memory = comp_outs[L]['comp_out'].vq_embeddings        # (B, S_hi, D)
-        #     src_kpm = ~comp_outs[L]['comp_out'].valid_mask if comp_outs[L]['comp_out'].valid_mask is not None else None
-        #
-        #     # low side target is what the *next lower* compressor took as input,
-        #     # or bytes for bottom
-        #     codes_lo = targets[L]                      # (B, L_len) composed ids in that space
-        #     tgt_kpm = tgt_kpms[L]
-        #     seg_ids = comp_outs[L]['comp_out'].seg_id[:, :codes_lo.size(1)]
-        #
-        #     logits = level.decode_logits(
-        #         memory=memory, codes_lo=codes_lo,
-        #         src_key_padding_mask=src_kpm,
-        #         tgt_key_padding_mask=tgt_kpm,
-        #         seg_ids=seg_ids,
-        #     )
-        #
-        #     ce = factorized_code_ce(
-        #         stage_logits=logits["stage_logits"],
-        #         special_logits=logits.get("special_logits"),
-        #         targets=codes_lo,
-        #         codec=level.lo_codec,
-        #         tgt_kpm=tgt_kpm,
-        #     )
-        #     total_digit += ce["digit_ce"]
-        #     total_special += ce["special_ce"]
-        #
-        #     # Optional byte-LM CE—uses compressor LM branch at this level
-        #     if self.cfg.w_byte_lm > 0 and comp_outs[L]['comp_out'].entropy_model_logits.size(1) >= 2:
-        #         lm_logits = comp_outs[L]['comp_out'].entropy_model_logits[:, :-1, :]
-        #         lm_target = comp_outs[L]['comp_out'].input_sequence[:, 1:]
-        #         lm_kpm = comp_outs[L]['comp_out'].input_padding_mask[:, 1:] if comp_outs[L]['comp_out'].input_padding_mask is not None else None
-        #         per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
-        #         if lm_kpm is not None:
-        #             mask = ~lm_kpm
-        #             total_byte_lm += (per_tok * mask).sum() / mask.sum().clamp(min=1)
-        #         else:
-        #             total_byte_lm += per_tok.mean()
-
-        # vq_total = sum(co['loss_vq'] for co in comp_outs)
-
-
         total_loss = sum(co['loss_total'] for co in comp_outs)
-
-        # total_loss = (
-        #     total_digit + total_special
-        #     + self.cfg.w_vq * vq_total
-        #     + self.cfg.w_byte_lm * total_byte_lm
-        # )
 
         # Optional Top-LM training (predict next top embedding)
         top_lm_avg_loss = None
@@ -205,77 +127,184 @@ class AbstractinatorPyramid(nn.Module):
 
     @torch.no_grad()
     def generate_bytes(
-        self,
-        prompt: torch.Tensor,               # (1, S0) bytes
-        prompt_kpm: Optional[torch.Tensor] = None,
-        max_top_steps: int = 256,
-        max_child_len: int = 64,
-        top_sample_fn: Optional[Any] = None,  # if you keep a top LM
+            self,
+            prompt: torch.Tensor,  # (1, S0) bytes
+            prompt_kpm: torch.Tensor | None = None,
+            *,
+            max_top_steps: int = 256,
+            max_child_len: int = 128,
+            lo_window: int = 128,  # low-side AR context window (like training)
+            top_sample_fn=None,  # optional CodeSequenceTransformer
+            honor_eos: bool = True,
     ) -> torch.Tensor:
         """
-        Segment-wise generation from the top level down.
-        If no top LM, we just use the last available top memory row as 'parent' to expand bottom.
+        Top-down generation where each level stops when that level's compressor LM
+        declares a segment boundary (entropy-based), i.e., patch_end_mask[..., -1] == True.
+
+        Returns only the newly generated bytes (continuation).
         """
         self.eval()
         assert prompt.size(0) == 1
-        buf = prompt.clone()
-        kpm = prompt_kpm
+        device = prompt.device
+        if prompt_kpm is None:
+            prompt_kpm = torch.zeros_like(prompt, dtype=torch.bool, device=device)
 
-        # 1) compress bytes to top
-        comp_all = self.compress_all(buf, kpm)
-        top_co = comp_all[-1]
-        top_mem = top_co['comp_out'].vq_embeddings
-        top_kpm = ~top_co['comp_out'].valid_mask if top_co['comp_out'].valid_mask is not None else None
+        all_new_bytes = []
+
+        def _valid_len(kpm: torch.Tensor | None, S: int) -> int:
+            if kpm is None:
+                return S
+            real = (~kpm[0]).nonzero(as_tuple=False)
+            return int(real[-1].item()) + 1 if real.numel() else 0
+
         for _ in range(max_top_steps):
+            # ── Phase 1: Upward compression on current bytes ─────────────────────
+            comp_all = self.compress_all(prompt, prompt_kpm)
+            top_comp = comp_all[-1]['comp_out']
+            top_mem = top_comp.vq_embeddings  # (1, S_hi, D)
+            top_kpm = (~top_comp.valid_mask) if top_comp.valid_mask is not None else None
 
-
-            if self.top_lm and top_sample_fn:
-                # predict one new top vector (continuous)
-                next_segment_idx = (~top_kpm).sum()
-                next_top = top_sample_fn(top_mem, top_kpm)['predictions_pre_vq'][:,next_segment_idx,:]  # (1,D)
-                top_mem[:, next_segment_idx, :] = next_top  # (B, S_hi, D)
-                top_kpm[:, next_segment_idx] = False  # mark as valid
-                hi_seq = top_mem  #[:,:next_segment_idx,:] = next_top.unsqueeze(1)
-
+            # ── Phase 2: Top-level "append a new row" (optional) ────────────────
+            # If you have a top LM, predict one new row into the first padded slot.
+            if (self.top_lm is not None) and (top_sample_fn is not None) and (top_kpm is not None):
+                valid = int((~top_kpm).sum().item())
+                assert valid < top_mem.size(1), "No free top rows to write a new segment."
+                lm_out = top_sample_fn(top_mem[:, :valid, :].contiguous(), key_padding_mask=top_kpm[:, :valid].contiguous())
+                next_top = lm_out.get("predictions_pre_vq", lm_out.get("predictions"))[:, -1, :]
+                # materialize the new row
+                top_mem = top_mem.clone()
+                top_kpm = top_kpm.clone()
+                top_mem[:, valid, :] = next_top
+                top_kpm[:, valid] = False
+                hi_memory = top_mem[:, :valid + 1, :]
+                src_kpm = top_kpm[:, :valid + 1]
+                target_row = valid
             else:
-                # no top LM: just expand under the newest top segment
-                hi_seq = top_mem
-
-            # 2) expand down the stack (L-1..0), generating codes with EOP/EOS stop
-            # codes_seed = torch.full((1,1), self.levels[0].eos_id, dtype=torch.long, device=buf.device)
-            seg_ids = torch.full((1,1), hi_seq.size(1)-1, dtype=torch.long, device=buf.device)
-            cur_hi = hi_seq
-            for L in reversed(range(len(self.levels))):
-                # seed is the EOS of the low space for the *current* level
-                codes_seed = torch.full(
-                    (1, 1), int(self.levels[L].expander.eos_id),
-                    dtype=torch.long, device=buf.device
-                )
-                codes = self.levels[L].generate_codes(
-                    hi_memory=cur_hi, seed_lo=codes_seed,
-                    src_key_padding_mask=None, seg_ids=seg_ids,
-                    max_new_tokens=max_child_len,
-                )
-                # For L>0, the generated 'codes' become hi_memory for the level below;
-                # map to embeddings if you want continuous memory at the next step.
-                if L > 0:
-                    # discrete hi for next level
-                    cur_hi = codes
-                    codes_seed = torch.full_like(codes_seed, self.levels[L-1].eos_id)
-                    seg_ids = torch.full_like(seg_ids, cur_hi.size(1)-1)
+                # Continue under last existing row
+                if top_kpm is not None:
+                    valid = int((~top_kpm).sum().item())
+                    target_row = valid - 1
+                    hi_memory = top_mem[:, :valid, :]
+                    src_kpm = top_kpm[:, :valid]
                 else:
-                    # bottom: bytes
-                    new_bytes = codes[:, 1:]  # drop seed
-                    buf = torch.cat([buf, new_bytes], dim=1)
+                    target_row = top_mem.size(1) - 1
+                    hi_memory = top_mem
+                    src_kpm = None
 
-            # 3) stop on EOS/EOP at bottom
-            last = int(buf[0, -1].item())
-            if last in (self.levels[0].eos_id, self.levels[0].eop_id):
+            # ── Phase 3: Downward expansion with entropy-based stop ─────────────
+            cur_hi = hi_memory
+            cur_src = src_kpm
+            bottom_new = None
+
+            for L in reversed(range(len(self.levels))):
+                lvl = self.levels[L]
+                compL = comp_all[L]['comp_out']
+
+                # Build low-side seed = tokens from START OF LAST SEGMENT to end (truncate to lo_window-1)
+                # This preserves the compressor's "since last break" state.
+                seqL = compL.input_sequence  # (1, S_L)
+                kpmL = compL.input_padding_mask  # (1, S_L) or None
+                segL = compL.seg_id  # (1, S_L)
+                real_lenL = _valid_len(kpmL, seqL.size(1))
+                if real_lenL == 0:
+                    # Fallback: 1-token EOS seed mapped to target_row
+                    seed_lo = torch.full((1, 1), int(lvl.expander.eos_id), dtype=seqL.dtype, device=device)
+                    seed_seg = torch.full((1, 1), int(cur_hi.size(1) - 1), dtype=segL.dtype, device=device)
+                else:
+                    last_idx = real_lenL - 1
+                    # start index of last segment in *current prompt* at this level
+                    start_last = int(compL.first_byte_idx[0, last_idx].item())
+                    # trailing window but not before start_last
+                    seed_start = max(start_last, real_lenL - (lo_window - 1))
+                    seed_lo = seqL[:, seed_start:real_lenL]
+                    seed_seg = segL[:, seed_start:real_lenL].clone()
+                    # force the last seed token to map to the row we expand under
+                    seed_seg[:, -1] = int(cur_hi.size(1) - 1)
+
+                # Multi-query: map to query row 0, like training
+                Lq = lvl.compressor.num_queries_per_segment
+                if Lq > 1:
+                    seed_seg = seed_seg * Lq
+
+                # Incrementally generate until *this level’s* compressor LM says "boundary now".
+                run_lo = seed_lo
+                run_seg = seed_seg
+
+                # --- incremental generation at level L, entropy-stop outside this block ---
+                for _t in range(max_child_len):
+                    # 0) Make sure we leave headroom if the decoder has a hard max_len
+                    max_len = getattr(lvl.expander, "max_len", None)
+                    if max_len is not None and run_lo.size(1) >= max_len:
+                        # keep last (max_len-1) tokens so the model can append one
+                        keep = max_len - 1
+                        run_lo = run_lo[:, -keep:]
+                        run_seg = run_seg[:, -keep:]
+
+                    # 1) Extend seg_ids for the *future* step(s) we request
+                    steps = 1
+                    seg_ext = torch.cat([run_seg, run_seg[:, -1:].expand(1, steps)], dim=1)
+                    assert seg_ext.size(1) == run_lo.size(1) + steps
+
+                    # 2) Generate
+                    gen = lvl.generate_codes(
+                        hi_memory=cur_hi,
+                        seed_lo=run_lo,
+                        src_key_padding_mask=cur_src if L == len(self.levels) - 1 else None,
+                        seg_ids=seg_ext,
+                        max_new_tokens=steps,
+                    )
+
+                    # 3) Normalize return convention
+                    if gen.size(1) == run_lo.size(1) + steps:
+                        # expander returns prefix+new
+                        new_tok = gen[:, -steps:]  # (1, 1)
+                        run_lo = gen  # carry full sequence forward
+                        run_seg = seg_ext  # keep aligned seg ids
+                    elif gen.size(1) == steps:
+                        # expander returns only the new tokens
+                        new_tok = gen  # (1, 1)
+                        run_lo = torch.cat([run_lo, new_tok], dim=1)
+                        run_seg = torch.cat([run_seg, run_seg[:, -1:].expand(1, steps)], dim=1)
+                    else:
+                        # Unexpected: treat as "no token" and bail with a hint
+                        # (you can raise instead if you prefer)
+                        print("Warn: unexpected generate() shape", gen.shape)
+                        break
+
+                    # 4) Optional EOS policy
+                    if honor_eos and (new_tok == lvl.expander.eos_id).all():
+                        break
+
+                    # 5) Your entropy-based boundary check (unchanged):
+                    comp_tmp = lvl.compressor(run_lo, key_padding_mask=None)
+                    if bool(comp_tmp.patch_end_mask[0, run_lo.size(1) - 1].item()):
+                        break
+
+                # "New tokens" for this level (exclude the seed)
+                new_lo = run_lo[:, seed_lo.size(1):]
+
+                if L == 0:
+                    bottom_new = new_lo
+                else:
+                    # For the next lower level, the entire sequence (seed+new) acts as discrete hi memory.
+                    cur_hi = run_lo
+                    cur_src = None  # discrete memory has no src pad mask
+
+            # If nothing new at bottom, stop the outer loop
+            if bottom_new is None or bottom_new.size(1) == 0:
+                print(f'Warning: no new bottom bytes generated, stopping.')
                 break
 
-            kpm = torch.zeros_like(buf, dtype=torch.bool)
+            # Append to bytes and continue
+            all_new_bytes.append(bottom_new)
+            prompt = torch.cat([prompt, bottom_new], dim=1)
+            prompt_kpm = torch.cat([prompt_kpm, torch.zeros_like(bottom_new, dtype=torch.bool)], dim=1)
 
-        return buf
+            # Optional overall EOS/EOP policy at byte level (only EOS remains now)
+            if honor_eos and (bottom_new[:, -1:] == self.levels[0].expander.eos_id).all():
+                break
+
+        return torch.cat(all_new_bytes, dim=1) if all_new_bytes else prompt.new_zeros((1, 0), dtype=prompt.dtype)
 
 
 def factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
