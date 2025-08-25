@@ -36,6 +36,8 @@ class VectorQuantizer(nn.Module):
         eos_token_id: int = 1,
         padding_token_id: int = 2,
         eop_token_id: int = 3,
+        forbidden_ids: Optional[List[int]] = None,
+        protected_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.K = int(K)
@@ -56,6 +58,15 @@ class VectorQuantizer(nn.Module):
         self.eos_token_id = int(eos_token_id)
         self.padding_token_id = int(padding_token_id)
         self.eop_token_id = int(eop_token_id)
+
+        self.register_buffer("forbidden_mask", torch.zeros(self.K, dtype=torch.bool))
+        if forbidden_ids:
+            self.forbidden_mask[torch.tensor(forbidden_ids, dtype=torch.long)] = True
+
+        self.register_buffer("protected_mask", torch.zeros(self.K, dtype=torch.bool))
+        if protected_ids:
+            self.protected_mask[torch.tensor(protected_ids, dtype=torch.long)] = True
+
 
         # Codebook and EMA stats
         self.codebook = nn.Parameter(torch.randn(self.K, self.D))
@@ -167,6 +178,9 @@ class VectorQuantizer(nn.Module):
             usage = torch.ones(self.K, device=self.codebook.device)
 
         dead_mask = usage < self.min_usage_threshold
+        dead_mask = dead_mask.clone()
+        if self.protected_mask.any():
+            dead_mask[self.protected_mask] = False
         if self.eop_token_id < self.K:
             dead_mask[self.eop_token_id] = False
         if self.padding_token_id < self.K:
@@ -236,7 +250,10 @@ class VectorQuantizer(nn.Module):
         e2 = (self.codebook * self.codebook).sum(dim=1)                # (K,)
         xe = F.linear(flat, self.codebook)                             # (N,K)
         distances = x2 - 2 * xe + e2.unsqueeze(0)                      # (N,K)
-        indices = distances.argmin(dim=1)                              # (N,)
+        if self.forbidden_mask.any():
+            big = torch.finfo(distances.dtype).max
+            distances = distances.masked_fill(self.forbidden_mask.unsqueeze(0), big)
+        indices = distances.argmin(dim=1)
 
         z_q = F.embedding(indices, self.codebook).view(B, Q, self.D)
 
@@ -353,6 +370,13 @@ class MultiStageResidualVQ(nn.Module):
             eop_token_id=eop_token_id,
         )
         self.stages = nn.ModuleList([VectorQuantizer(K=self.K, D=d_c, **vq_kwargs) for _ in range(self.depth)])
+
+        reserved_stage0 = [K - 1, K - 2, K - 3, K - 4]  # order: PAD, BOS, EOS, EOP
+        self.stages[0].forbidden_mask[...] = False
+        self.stages[0].protected_mask[...] = False
+        for idx in reserved_stage0:
+            self.stages[0].forbidden_mask[idx] = True
+            self.stages[0].protected_mask[idx] = True
 
         # Sentinel pad vector in the D-space
         self.register_buffer("pad_vector", torch.zeros(D))
@@ -484,8 +508,7 @@ class RVQEmbeddingAdapter(nn.Module):
                  vq: "MultiStageResidualVQ",
                  target_D: int,
                  use_shared_proj: bool = True,
-                 tie_up_down: bool = False,
-                 specials_in_D: bool = True):
+                 tie_up_down: bool = False):
         super().__init__()
         self.vq = vq
         self.K = vq.K
@@ -508,15 +531,6 @@ class RVQEmbeddingAdapter(nn.Module):
             self.down = DownProj(Wdc)  # D -> d_c
             self.up = UpProj(Wdc)  # d_c -> D
 
-        # tiny special table in target D
-        self.special_ids = sorted({int(vq.bos_token_id),
-                                   int(vq.eos_token_id),
-                                   int(vq.padding_token_id),
-                                   int(vq.eop_token_id)})
-        self.special_to_local = {sid: i for i, sid in enumerate(self.special_ids)}
-        self.special_emb = (nn.Embedding(len(self.special_ids), self.D)
-                            if specials_in_D else None)
-
 
     @torch.no_grad()
     def stage_codebook(self, s: int) -> torch.Tensor:
@@ -524,45 +538,19 @@ class RVQEmbeddingAdapter(nn.Module):
         return self.vq.stages[s].codebook.detach()
 
 
-
     def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
-        """
-        Compile-friendly embedding:
-        - No boolean masked assignment
-        - No .any() branches
-        - All indices passed to Embedding are always in-range
-        """
+        """Embed composed ids via factorized codebooks only."""
         idx = idx.long()
         B, L = idx.shape
         dev = idx.device
         dtype = self.up.Wdc.dtype
-
-        # 1) Build special mask (no branching)
-        special_mask = torch.zeros_like(idx, dtype=torch.bool)
-        for sid in self.special_ids:
-            special_mask |= (idx == sid)
-
-        # 2) Non-special path for ALL positions (sanitize specials to 0 first)
-        idx_ns = torch.where(special_mask, idx.new_zeros(()), idx)
-        # decompose always on sanitized indices (safe)
-        digits, _ = self.vq.codec.decompose(idx_ns)  # list len=depth, each (B,L) in [0..K-1]
+        digits, _ = self.vq.codec.decompose(idx)  # list len=depth, each (B,L) in [0..K-1]
         y_dc = torch.zeros(B, L, self.d_c, device=dev, dtype=dtype)
         for s in range(self.depth):
-            W = self.stage_codebook(s)  # (K, d_c), detached in your adapter
+            W = self.stage_codebook(s)  # (K, d_c)
             y_dc = y_dc + F.embedding(digits[s], W)
-        out_ns = self.up(y_dc)  # (B,L,D)
+        return self.up(y_dc)
 
-        # 3) Specials path computed for ALL positions (indices always valid)
-        if self.special_emb is None:
-            # No branch on special_mask.any(); just return merged = out_ns
-            return out_ns
-        local = torch.zeros_like(idx)  # 0 everywhere, fill specials to local ids
-        for sid, j in self.special_to_local.items():
-            local = torch.where(idx == sid, local.new_full((), j), local)
-        out_sp = self.special_emb(local)  # (B,L,D) safe for all positions
-
-        # 4) Merge without masked assignment (pure where)
-        return torch.where(special_mask.unsqueeze(-1), out_sp, out_ns)
 
 
 class RVQFactorizedHead(nn.Module):
@@ -580,8 +568,7 @@ class RVQFactorizedHead(nn.Module):
     def __init__(self,
                  adapter: RVQEmbeddingAdapter,
                  residual_conditioning: bool = True,
-                 use_sqdist_logits: bool = False,
-                 predict_specials: bool = True):
+                 use_sqdist_logits: bool = False):
         super().__init__()
         self.adapt = adapter
         self.depth = adapter.depth
@@ -590,9 +577,6 @@ class RVQFactorizedHead(nn.Module):
         self.D = adapter.D
         self.residual_conditioning = residual_conditioning
         self.use_sqdist_logits = use_sqdist_logits
-        self.predict_specials = predict_specials
-        self.has_specials = adapter.special_emb is not None and predict_specials
-        self.special_head = nn.Linear(self.D, len(adapter.special_ids), bias=False) if self.has_specials else None
 
     def _stage_logits(self, r_dc: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
         # r_dc: (B, L, d_c), codebook: (K, d_c)
@@ -608,12 +592,11 @@ class RVQFactorizedHead(nn.Module):
     def forward(self,
                 h: torch.Tensor,                    # (B, L, D) decoder hidden
                 teacher_digits: Optional[List[torch.Tensor]] = None
-                ) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
+                ) -> Dict[str, List[torch.Tensor]]:
         """
         Returns:
             {
               "stage_logits": [ (B,L,K) for s in 0..depth-1 ],
-              "special_logits": (B,L,num_special) or None
             }
         """
         y0 = self.adapt.down(h)                      # (B, L, d_c)
@@ -633,8 +616,7 @@ class RVQFactorizedHead(nn.Module):
                     e = F.embedding(logits_s.argmax(dim=-1), W)
                 r = r - e.detach()                   # stop gradients across stages
 
-        special_logits = self.special_head(h) if self.has_specials else None
-        return {"stage_logits": out, "special_logits": special_logits}
+        return {"stage_logits": out}
 
 class LearnedCodebookAdapter(nn.Module):
     """

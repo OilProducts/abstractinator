@@ -41,7 +41,9 @@ class TrainingMetrics:
 
     def __init__(self, num_levels: int, aux_lm_enabled: bool, top_lm_enabled: bool, tok_s_window: int = 10) -> None:
         self.num_levels = num_levels
-        self.aux_lm_enabled = aux_lm_enabled
+        # Entropy-model (aux LM) is considered always-on for logging; if a
+        # batch omits it, we still report 0 to make gaps visible.
+        self.aux_lm_enabled = True
         self.top_lm_enabled = top_lm_enabled
         self._tok_s_deque = deque(maxlen=tok_s_window)
         self._ppl_ema = SmoothEMA(num_levels, alpha=0.9)
@@ -60,7 +62,7 @@ class TrainingMetrics:
         self.avg_reconstruction_loss_t = None
         self.reconstruction_loss_details: Dict[str, torch.Tensor] = defaultdict(torch.Tensor)
 
-        self.avg_aux_lm_loss_t = None
+        self.avg_aux_lm_loss_t = None  # entropy_model_loss accumulator
         self.aux_lm_loss_details: Dict[str, torch.Tensor] = defaultdict(torch.Tensor)
 
         self.avg_top_code_lm_loss_t = None
@@ -103,8 +105,14 @@ class TrainingMetrics:
 
         # Window counters on device; no host syncs here
         self.total_loss_t = self.total_loss_t + output["loss_total"].detach()
-        # self.vq_loss_t = self.vq_loss_t + output["vq_loss_t"].detach()
-        # self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + output["avg_reconstruction_loss_t"].detach()
+        # VQ loss at pyramid level
+        self.vq_loss_t = self.vq_loss_t + output.get("loss_vq", torch.zeros((), device=dev)).detach()
+        # Reconstruction/entropy losses are now per-level under comp_outs; fall back to
+        # 0 if omitted in a given batch (we still report 0 to surface gaps).
+        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + (
+            output.get("loss_digit_ce", torch.zeros((), device=dev))
+            + output.get("loss_special_ce", torch.zeros((), device=dev))
+        ).detach()
         self.count += 1
         self.non_padded_tokens_t = self.non_padded_tokens_t + (~key_padding_mask).sum()
 
@@ -112,11 +120,7 @@ class TrainingMetrics:
             prev = self.reconstruction_loss_details.get(k)
             self.reconstruction_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
 
-        if self.aux_lm_enabled and "avg_aux_lm_loss" in output:
-            self.avg_aux_lm_loss_t = self.avg_aux_lm_loss_t + output["avg_aux_lm_loss"].detach()
-            for k, v in output.get("aux_lm_loss_details", {}).items():
-                prev = self.aux_lm_loss_details.get(k)
-                self.aux_lm_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
+        # Entropy model loss (formerly Aux LM) – aggregated below from comp_outs
 
         if self.top_lm_enabled and "avg_top_code_lm_loss" in output:
             self.avg_top_code_lm_loss_t = self.avg_top_code_lm_loss_t + output["avg_top_code_lm_loss"].detach()
@@ -128,13 +132,37 @@ class TrainingMetrics:
                 elif k == "top_code_vq_loss":
                     self.top_code_vq_loss_t = self.top_code_vq_loss_t + v.detach()
 
-        if "compression_ratios" in output:
-            self._saw_compression = True
-            # Per-level input/output lengths from compression results
-            comp_steps = output.get("compression_results", {}).get("steps", [])
-            for lvl, step in enumerate(comp_steps):
-                self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + (~step.input_padding_mask).sum()
-                self.output_seq_lengths_t[lvl] = self.output_seq_lengths_t[lvl] + step.patch_end_mask.sum()
+        # New structure: aggregate from per-level comp_outs
+        if "comp_outs" in output:
+            comp_outs = output["comp_outs"]
+            for lvl, co in enumerate(comp_outs):
+                # Reconstruction components per level
+                if isinstance(co, dict):
+                    if "loss_digit_ce" in co:
+                        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + co["loss_digit_ce"].detach()
+                    if "loss_special_ce" in co:
+                        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + co["loss_special_ce"].detach()
+                    # Entropy model loss (byte LM CE)
+                    if "loss_byte_lm_ce" in co:
+                        if self.avg_aux_lm_loss_t is None:
+                            self.avg_aux_lm_loss_t = torch.zeros((), device=dev, dtype=torch.float32)
+                        self.avg_aux_lm_loss_t = self.avg_aux_lm_loss_t + co["loss_byte_lm_ce"].detach()
+
+                    # Compression lengths from the compressor output
+                    comp = co.get("comp_out")
+                    if comp is not None:
+                        if self.input_seq_lengths_t[lvl] is None:
+                            self.input_seq_lengths_t[lvl] = torch.zeros((), device=dev, dtype=torch.float32)
+                        if self.output_seq_lengths_t[lvl] is None:
+                            self.output_seq_lengths_t[lvl] = torch.zeros((), device=dev, dtype=torch.float32)
+                        if getattr(comp, "input_padding_mask", None) is not None:
+                            self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + (~comp.input_padding_mask).sum()
+                        elif getattr(comp, "input_sequence", None) is not None:
+                            # fallback: count full length if no mask provided
+                            self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + comp.input_sequence.new_full((), comp.input_sequence.size(1)).to(torch.long)
+                        if getattr(comp, "patch_end_mask", None) is not None:
+                            self.output_seq_lengths_t[lvl] = self.output_seq_lengths_t[lvl] + comp.patch_end_mask.sum()
+                        self._saw_compression = True
 
         if "all_codebook_perplexities" in output:
             self._saw_perplexities = True
@@ -184,32 +212,20 @@ class TrainingMetrics:
         total_eta_sec: float,
         patches_per_second: List[float],
     ) -> List[str]:
-        # if self.count == 0:
-        #     return []
-        # parts = [
-        #     f"{timestamp}",
-        #     f"Epoch {epoch}/{num_epochs}",
-        #     f"OptStep {global_step}",
-        #     f"MB {minibatch_index}/{total_minibatches}",
-        #     f"Loss {(self.total_loss_t / self.count).item():.4f}",
-        #     f"Reco {(self.avg_reconstruction_loss_t / self.count).item():.4f}",
-        #     f"VQ {(self.vq_loss_t / self.count).item():.4f}",
-        #     f"Tok/s {short_num(avg_tok_s)}",
-        #     f"Bytes {short_num(self.total_bytes_processed)}",
-        #     f"ETA {format_duration(total_eta_sec)}",
-        # ]
 
         if self.count == 0:
             return []
 
         # gather the scalar tensors once
         scalars = [
-            self.total_loss_t, self.avg_reconstruction_loss_t, self.vq_loss_t,
-            (self.avg_aux_lm_loss_t if self.aux_lm_enabled else torch.zeros((), device=self.total_loss_t.device)),
+            self.total_loss_t,
+            self.avg_reconstruction_loss_t,
+            self.vq_loss_t,
+            (self.avg_aux_lm_loss_t if self.avg_aux_lm_loss_t is not None else torch.zeros((), device=self.total_loss_t.device)),
             (self.avg_top_code_lm_loss_t if self.top_lm_enabled else torch.zeros((), device=self.total_loss_t.device)),
         ]
         vals = torch.stack(scalars).to(torch.float32) / max(1, self.count)
-        loss_total, reco, vq, aux, top = vals.detach().cpu().tolist()
+        loss_total, reco, vq, entropy_loss, top = vals.detach().cpu().tolist()
 
         parts = [
             f"{timestamp}",
@@ -223,11 +239,8 @@ class TrainingMetrics:
             f"Bytes {short_num(self.total_bytes_processed)}",
             f"ETA {format_duration(total_eta_sec)}",
         ]
-        if self.aux_lm_enabled: parts.append(f"AuxLM {aux:.4f}")
-        if self.top_lm_enabled and self.count > 0: parts.append(f"TopLM {top:.4f}")
-
-        # if self.aux_lm_enabled:
-        #     parts.append(f"AuxLM {(self.avg_aux_lm_loss_t / self.count).item():.4f}")
+        # Always include entropy-model loss, even when zero, to surface gaps
+        parts.append(f"Entropy {entropy_loss:.4f}")
 
         if self.top_lm_enabled:
             if self.count > 0:
@@ -274,12 +287,11 @@ class TrainingMetrics:
                 parts.append(f"{k}:{(v / self.count).item():.4f}")
             else:
                 parts.append(f"{k}:{float(v) / self.count:.4f}")
-        if self.aux_lm_enabled:
-            for k, v in self.aux_lm_loss_details.items():
-                if isinstance(v, torch.Tensor):
-                    parts.append(f"{k}:{(v / self.count).item():.4f}")
-                else:
-                    parts.append(f"{k}:{float(v) / self.count:.4f}")
+        for k, v in self.aux_lm_loss_details.items():
+            if isinstance(v, torch.Tensor):
+                parts.append(f"{k}:{(v / self.count).item():.4f}")
+            else:
+                parts.append(f"{k}:{float(v) / self.count:.4f}")
 
         return parts
 
@@ -293,10 +305,14 @@ class TrainingMetrics:
         if self.count == 0:
             return {}
 
+        zero_dev = torch.zeros((), device=self.total_loss_t.device)
         md: Dict[str, float] = {
             "loss/total_avg_accum": float((self.total_loss_t / self.count).item()),
             "loss/vq_avg_accum": float((self.vq_loss_t / self.count).item()),
             "loss/reconstruction_avg_accum": float((self.avg_reconstruction_loss_t / self.count).item()),
+            "loss/entropy_model_avg_accum": float(((
+                (self.avg_aux_lm_loss_t if self.avg_aux_lm_loss_t is not None else zero_dev)
+            ) / max(1, self.count)).item()),
             "performance/tokens_per_sec": tokens_per_second,
             "loss/top_code_lm_avg_accum": float((self.avg_top_code_lm_loss_t / self.count).item()) if self.top_lm_enabled else 0.0,
             "loss/top_code_mse_avg_accum": float((self.top_code_mse_t / self.count).item()) if self.top_lm_enabled else 0.0,
@@ -313,8 +329,8 @@ class TrainingMetrics:
             md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
         for k, v in self.reconstruction_loss_details.items():
             md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
-        if self.aux_lm_enabled:
-            md["loss/aux_lm_avg_accum"] = float((self.avg_aux_lm_loss_t / self.count).item())
+        # Entropy model loss details (if any) are included under loss_detail_avg_accum/
+        if self.avg_aux_lm_loss_t is not None:
             for k, v in self.aux_lm_loss_details.items():
                 md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
 
@@ -343,8 +359,6 @@ class TrainingMetrics:
                 md[f"vq_metrics_ema/smooth_perplexity_L{lvl}"] = self._ppl_ema.values[lvl]
 
         return md
-
-    # (No local formatting helpers; use shared utils)
 
 
 class MlflowBatchLogger:

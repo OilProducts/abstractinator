@@ -17,7 +17,7 @@ exp_config = _base_exp_config #: ExpConfig = deepcopy(_base_exp_config)
 exp_config.batch_size = 2 #16
 exp_config.gradient_accumulation_steps = 1
 exp_config.sequence_length = 2048
-
+exp_config.generation_interval = 500
 
 exp_config.num_epochs = 2
 exp_config.num_levels = 2

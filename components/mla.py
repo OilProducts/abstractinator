@@ -365,7 +365,7 @@ class MultiheadLatentAttention(nn.Module):
         # --------- 6) Output path: compressed → model dimension --------------
         if use_fused_output and self._U_fused is not None:
             # (B,H,S,c) × (H,c,dim_q) → (B,S,dim_q)
-            out = torch.einsum("bhsd,h dD->bsD", ctx_c, self._U_fused)
+            out = torch.einsum("bhsd,hdD->bsD", ctx_c, self._U_fused)
         else:
             # two‑step (training/default): c→K (per head), concat heads, proj to dim_q
             ctx_lat = torch.einsum("bhsd,hdK->bhsK", ctx_c, self.w_kc_kv.transpose(1, 2))  # [B,H,S,K]
@@ -491,6 +491,8 @@ class SlidingWindowMLA(nn.Module):
         # optional hygiene: clear the attribute so nothing stale lingers
         self.mla._pad_for_scores = None
         return ctx
+
+
 
 
 class SlidingWindowMLATransformerBlock(nn.Module):

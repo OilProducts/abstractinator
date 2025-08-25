@@ -1,230 +1,185 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import flex_attention
 
-from .utils import safe_softmax
 
 class LearnedQueryAttention(nn.Module):
     """
-    Multi-Head Attention where queries are derived from a set of learned vectors.
+    Cross-attention where the queries are learned inside the module.
 
-    This module performs multi-head attention using a key-value context `x` and
-    a set of `queries`. It owns a `query_template` (L learned vectors), which is
-    intended to be used by a calling module (e.g., by tiling or adapting it per
-    segment) to construct the actual `queries` tensor passed to the `forward` method.
+    - Owns a learnable template of L queries (shape: L x D).
+    - At runtime, repeats that template across a fixed Q_max "query slots".
+      slot q maps to segment = q // L and template row = q % L.
+    - Segment-local pooling is enforced via a block mask (flex) or by masking scores.
 
-    The module handles attention masking (both a generic attention mask and a key
-    padding mask) and applies RMS normalization to the input `x` (keys/values)
-    and to the output of the attention mechanism before a final projection.
-
-    Attributes:
-        d_model (int): The embedding dimension.
-        num_heads (int): The number of attention heads.
-        head_dim (int): The dimension of each attention head (embed_dim // num_heads).
-        L (int): The number of unique learned query vectors in `query_template`.
-                 This is set by `num_queries_per_segment` in the constructor.
-        in_norm (nn.RMSNorm): RMS normalization applied to the input `x`.
-        out_norm (nn.RMSNorm): RMS normalization applied to the attention output
-                                 before the final projection.
-        query_template (nn.Parameter): A learnable tensor of shape (L, D). This serves
-                                      as a template for generating the actual queries
-                                      used in the attention mechanism.
-        q_proj (nn.Linear): Linear projection for queries.
-        k_proj (nn.Linear): Linear projection for keys.
-        v_proj (nn.Linear): Linear projection for values.
-        out_proj (nn.Linear): Final linear projection for the output.
+    Args:
+        embed_dim: model dimension D
+        num_queries_per_segment: L (queries per segment)
+        max_queries: Q_max (static total query slots returned)
+        num_heads: attention heads
+        use_flex_attention: use torch.nn.attention.flex_attention when True
     """
 
     def __init__(
-        self,
-        embed_dim: int,
-        num_queries_per_segment: int,  # Defines the size L of query_template
-        num_heads: int,
-        use_flex_attention: bool = True,
+            self,
+            embed_dim: int,
+            num_queries_per_segment: int,
+            max_queries: int,
+            num_heads: int,
+            use_flex_attention: bool = True,
     ):
         super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError("embed_dim must be divisible by num_heads for multi-head attention.")
+        assert embed_dim % num_heads == 0
+        self.d_model = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.d_model // self.num_heads
 
-        self.d_model = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        # L: Number of distinct learned query vectors in the template
-        self.L = num_queries_per_segment
+        # queries per segment (L) and static output length (Q_max)
+        self.L = int(num_queries_per_segment)
+        self.Q_max = int(max_queries)
+        assert self.Q_max > 0 and self.L > 0
+        assert (self.Q_max % self.L) == 0, "Q_max must be a multiple of L"
 
-        self.in_norm = nn.RMSNorm(embed_dim)
-        self.out_norm = nn.RMSNorm(embed_dim)
+        # learned query template: (L, D)
+        self.query_template = nn.Parameter(torch.randn(self.L, self.d_model))
 
-        # Learned query template – (L, D).
-        # This template is intended to be used by the caller to construct the
-        # `queries` tensor passed to the forward method. For example, in a
-        # segmented attention scenario, these L queries might be repeated for each segment.
-        self.query_template = nn.Parameter(torch.randn(self.L, embed_dim))
-
-        # Linear projections for Q, K, V and output. Bias is often disabled
-        # in transformer components but can be included if desired.
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-
-        self.use_flex_attention = use_flex_attention
+        # projections & norms
+        self.in_norm = nn.RMSNorm(self.d_model)
+        self.out_norm = nn.RMSNorm(self.d_model)
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
-        # Initialize query_template with a small standard deviation
         nn.init.normal_(self.query_template, std=0.02)
 
-        self._pad_for_scores: Optional[torch.Tensor]    = None  # [B, S] bool
-        self._qseg_for_scores: Optional[torch.Tensor]   = None  # [B, Q] int (−1 = invalid/pad query)
-        self._segid_for_scores: Optional[torch.Tensor]  = None  # [B, S] int
+        self.use_flex_attention = bool(use_flex_attention)
+
+    def _owned_queries(self, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Build (B, Q_max, D) query tensor by tiling the L-row template.
+        slot q uses template row (q % L).
+        """
+        slot = torch.arange(self.Q_max, device=device) % self.L  # (Q_max,)
+        q_once = self.query_template[slot].to(dtype=dtype)  # (Q_max, D)
+        return q_once.unsqueeze(0).expand(B, -1, -1).contiguous()  # (B, Q_max, D)
+
+    @staticmethod
+    def _num_segments(seg_id: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        nseg[b] = #segments present in real (non-pad) keys of row b.
+        seg_id must be contiguous non-decreasing integers starting at 0.
+        """
+        if key_padding_mask is not None:
+            kseg_real = torch.where(key_padding_mask, seg_id.new_full((), -1), seg_id)
+            return (kseg_real.amax(dim=1).clamp(min=-1) + 1).to(torch.long)  # (B,)
+        return (seg_id.amax(dim=1) + 1).to(torch.long)
 
     def forward(
-        self,
-        x: torch.Tensor,  # Input context: (B, S, D) for keys & values
-        queries: torch.Tensor,  # Pre-built queries: (B, Q_tot, D)
-        q_seg: Optional[torch.Tensor] = None,  # Segment indices for queries: (B, Q_tot), int
-        seg_id: Optional[torch.Tensor] = None,  # Segment indices for keys/
-        attn_mask: Optional[torch.Tensor] = None,  # Attention mask: (B*H, Q_tot, S), boolean (True where masked)
-        key_padding_mask: torch.Tensor | None = None,  # Key padding mask: (B, S), boolean (True where padded)
-        return_attn: bool = False,
+            self,
+            x: torch.Tensor,  # (B, S, D)  keys/values
+            seg_id: torch.Tensor,  # (B, S)     segment id per key position
+            key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) True==pad
+            return_attn: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Performs the forward pass of the Learned Query Attention.
-
-        The `queries` are expected to be constructed by the caller by utilizing
-        `self.query_template`. For instance, if processing `N_seg` segments, `Q_tot`
-        might be `N_seg * self.L`, where `self.L` is `num_queries_per_segment`.
-        The `attn_mask` should be constructed to restrict attention appropriately,
-        e.g., to within segments.
-
-        Args:
-            x (torch.Tensor): The input tensor providing keys and values.
-                Shape: (batch_size, sequence_length_kv, embed_dim).
-            queries (torch.Tensor): The pre-constructed query tensor.
-                Shape: (batch_size, total_num_queries, embed_dim).
-            attn_mask (torch.Tensor): Boolean attention mask. `True` indicates
-                positions that should be masked (ignored) during attention.
-                The shape (batch_size * num_heads, total_num_queries, sequence_length_kv)
-                is expected to align with internal reshaping.
-            key_padding_mask (Optional[torch.Tensor]): Boolean mask for padded
-                elements in `x`. `True` indicates a padded key/value position.
-                Shape: (batch_size, sequence_length_kv).
-
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-            - attn_output (torch.Tensor): The output of the attention mechanism.
-              Shape: (batch_size, total_num_queries, embed_dim).
-            - attn_weights (torch.Tensor): The attention weights, averaged over heads.
-              Shape: (batch_size, total_num_queries, sequence_length_kv).
-              Suitable for logging or analysis (consider detaching if not used for gradients).
+            pooled: (B, Q_max, D)
+            attn_weights: (empty) or (B, Q_max, S) if return_attn=False/True
         """
-        B, S, D_x = x.shape
-        Q = queries.size(1)
+        B, S, D = x.shape
+        assert D == self.d_model, f"x dim {D} != model dim {self.d_model}"
 
-        if D_x != self.d_model:
-            raise ValueError(f"Input feature dimension {D_x} does not match model dimension {self.d_model}")
-        if queries.size(2) != self.d_model:
-            raise ValueError(
-                f"Queries feature dimension {queries.size(2)} does not match model dimension {self.d_model}"
-            )
-
-        # Normalize the input context (keys and values) - Pre-LN style for K/V
+        # Build static-shape queries that we own
+        queries = self._owned_queries(B, x.device, x.dtype)  # (B, Q_max, D)
         x_norm = self.in_norm(x)
 
-        # Project queries, keys, and values
-        q_proj = self.q_proj(queries)  # (B, Q_tot, D)
+        # projections and reshape for MH attention
+        q_proj = self.q_proj(queries)  # (B, Q_max, D)
         k_proj = self.k_proj(x_norm)  # (B, S, D)
         v_proj = self.v_proj(x_norm)  # (B, S, D)
 
-        # Reshape and permute for multi-head attention
-        # q: (B, Q_tot, D) -> (B, Q_tot, H, d_h) -> (B, H, Q_tot, d_h)
-        q = q_proj.view(B, Q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        # k: (B, S, D) -> (B, S, H, d_h) -> (B, H, d_h, S) (transpose last two dims for matmul)
-        k = k_proj.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        # v: (B, S, D) -> (B, S, H, d_h) -> (B, H, S, d_h)
-        v = v_proj.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = q_proj.view(B, self.Q_max, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B,H,Q,d)
+        k = k_proj.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B,H,S,d)
+        v = v_proj.view(B, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B,H,S,d)
 
+        # How many segments are real in each batch row?
+        nseg = self._num_segments(seg_id, key_padding_mask)  # (B,)
 
         if self.use_flex_attention:
-            # Wire small side tensors for score_mod
-            self._pad_for_scores   = key_padding_mask.to(torch.bool).contiguous() if key_padding_mask is not None else None
-            self._qseg_for_scores  = q_seg.contiguous() if q_seg is not None else None
-            self._segid_for_scores = seg_id.contiguous() if seg_id is not None else None
+            # Segment-local block mask in flex: keep(b,h,q,k) if
+            # q < nseg[b]*L AND seg_id[b,k] == (q // L) AND ~pad[b,k]
+            from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
-            from torch.nn.attention.flex_attention import create_block_mask
+            pad = key_padding_mask.to(torch.bool).contiguous() if key_padding_mask is not None else None
+            kseg = seg_id.to(torch.long).contiguous()
 
-            def _keep_factory(pad: torch.Tensor | None, qseg: torch.Tensor | None, kseg: torch.Tensor | None):
-                pad = None if pad is None else pad.to(torch.bool).contiguous()
-                qseg = None if qseg is None else qseg.contiguous()
-                kseg = None if kseg is None else kseg.contiguous()
+            L = self.L
+            Q_max = self.Q_max
 
-                def keep(b, h, q, k):
-                    # True == keep (allowed)
-                    ok = torch.ones_like(q == q, dtype=torch.bool)  # shape broadcastable to (Q,K)
-                    if pad is not None:
-                        ok &= ~pad[b, k]  # disallow padded keys
-                    if (qseg is not None) and (kseg is not None):
-                        ok &= (qseg[b, q] == kseg[b, k])  # require same segment
-                    if qseg is not None:
-                        ok &= (qseg[b, q] >= 0)  # drop invalid queries
-                    return ok
+            Bn, Hn, Qn, Sn = q.size(0), q.size(1), q.size(2), k.size(2)
+            assert Qn == Q_max and Q_max % L == 0
 
-                return keep
+            # --- vmap‑friendly keep(): use tensor ops only, no .item(), no int() ---
+            def keep(b, h, qidx, kidx):
+                # All of b,h,qidx,kidx are 0‑dim LongTensors under vmap.
+                # nseg[b] is 0‑dim LongTensor; arithmetic stays in tensor world.
+                valid_q = qidx < nseg[b] * L  # 0‑dim bool tensor
+                qseg = torch.div(qidx, L, rounding_mode='floor')
+                same_seg = kseg[b, kidx].eq(qseg)
+                if pad is not None:
+                    not_pad = (~pad[b, kidx])
+                else:
+                    # 0‑dim True tensor on the right device/dtype
+                    not_pad = qidx.eq(qidx)  # always True, stays a tensor
+                return valid_q & same_seg & not_pad
 
-            keep = _keep_factory(key_padding_mask, q_seg, seg_id)
+            # Keep the Python callback out of Dynamo graphs
+            # with dynamo.disable():
             block_mask = create_block_mask(
-                keep,
-                B=None, H=None, Q_LEN=q.size(2), KV_LEN=k.size(2),  # or explicit B/H if you prefer
+                keep, B=Bn, H=Hn, Q_LEN=Qn, KV_LEN=Sn,
                 BLOCK_SIZE=128, device=q.device
             )
-
-            ctx = flex_attention(q, k, v, block_mask=block_mask)  # no score_mod needed
-
-            # hygiene
-            self._pad_for_scores = self._qseg_for_scores = self._segid_for_scores = None
-
-            # We generally don't need per-head weights in training; avoid materializing them
-            attn_weights = queries.new_empty(0) if not return_attn else None  # (optional: compute via fallback if really needed)
+            ctx = flex_attention(q, k, v, block_mask=block_mask)
+            attn_weights = queries.new_empty(0) if not return_attn else None
 
         else:
-            # Fallback: standard dot-prod attention, still mask padding cheaply,
-            # and apply segment gating in manageable chunks (no huge (B·H,Q,S) mask).
+            # Fallback: standard attention with segment gating on scores
             scale = 1.0 / math.sqrt(self.head_dim)
-            # (B,H,Q,d) @ (B,H,d,S) → (B,H,Q,S)
-            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B,H,Q,S)
 
-            # cheap broadcast for padding
             if key_padding_mask is not None:
                 scores = scores.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
 
-            CHUNK = 128  # segment-gating chunk (Q axis)
-            outs, atts = [], []
-            for i in range(0, Q, CHUNK):
-                sl = slice(i, min(i + CHUNK, Q))
-                scores_i = scores[:, :, sl, :]  # (B,H,c,S)
-                # if (q_seg is not None) and (seg_id is not None):
-                    # (B,c,S) mismatch mask (small-ish) instead of full (B,H,c,S)
-                mismatch = (seg_id[:, None, :] != q_seg[:, sl].unsqueeze(-1))
-                    # scores_i = scores_i.masked_fill(mismatch[:, None, :, :], float("-inf"))
-                attn_i = safe_softmax(scores_i, mismatch[:, None, :, :], dim=-1)  # (B,H,c,S)
-                outs.append(torch.matmul(attn_i, v))           # (B,H,c,d)
-                if return_attn:
-                    atts.append(attn_i.mean(dim=1))            # (B,c,S)
+            # segment mismatch mask: (B,Q,S)
+            seg_q = (torch.arange(self.Q_max, device=x.device) // self.L)[None, :]  # (1,Q)
+            mismatch = (seg_id[:, None, :] != seg_q[:, :, None])  # (B,Q,S)
+            scores = scores.masked_fill(mismatch[:, None, :, :], float("-inf"))
 
-            ctx = torch.cat(outs, dim=2)                        # (B,H,Q,d)
-            attn_weights = torch.cat(atts, dim=1) if return_attn else queries.new_empty(0)
+            # drop invalid trailing queries: q >= nseg[b]*L
+            valid_q = (torch.arange(self.Q_max, device=x.device)[None, :] <
+                       (nseg * self.L)[:, None])  # (B,Q)
+            scores = scores.masked_fill(~valid_q[:, None, :, None], float("-inf"))
 
-        # Concat heads → (B,Q,D)
-        out = ctx.permute(0, 2, 1, 3).reshape(B, Q, self.d_model)
+            attn = torch.softmax(scores, dim=-1)  # (B,H,Q,S)
+            ctx = torch.matmul(attn, v)  # (B,H,Q,d)
+            attn_weights = attn.mean(dim=1) if return_attn else queries.new_empty(0)
+
+        out = ctx.permute(0, 2, 1, 3).reshape(B, self.Q_max, self.d_model)
         out = self.out_norm(out)
         out = self.out_proj(out)
 
-        return out, attn_weights
+        # Zero out invalid query slots so downstream components can be statically-shaped
+        valid_q_mask = (torch.arange(self.Q_max, device=x.device)[None, :] <
+                        (nseg * self.L)[:, None])  # (B,Q)
+        out = out * valid_q_mask.to(out.dtype).unsqueeze(-1)
+
+        return out, (attn_weights if return_attn else out.new_empty(()))

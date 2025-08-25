@@ -54,32 +54,35 @@ class ByteSegmentCompressor(nn.Module):
     """
 
     def __init__(
-        self,
-        vocab_size: int = 260,
-        dim: int = 256,
-        heads: int = 8,  # Num heads for both encoder and pooler
-        window: int = 128,  # Window size for shared encoder layers
-        head_dim: int | None = 32,
-        kv_comp_dim: int | None = 32,
-        q_comp_dim: int | None = 48,
-        retr_dim: int | None = 32,
-        lm_window: int | None = None,
-        compression_window: int | None = None,
-        num_encoder_layers: int = 3,
-        encoder_ffn_dim_multiplier: int = 4,
-        num_shared_encoder_layers: int = 0,
-        num_lm_encoder_layers: int | None = None,
-        num_compression_encoder_layers: int | None = None,
-        num_queries: int = 1,  # L: Number of queries per segment for the pooler
-        codebook_size: int = 512,  # K: Number of codes in VQ codebook (per stage if vq_depth>1)
-        vq_depth: int = 1,  # Number of residual VQ stages; 1 means single-stage VQ
-        vq_d_c: int | None = None,  # Compressed dim used inside residual VQ
-        beta: float = 0.25,  # Beta for VQ commitment loss
-        vq_reset_interval: int = 250,
-        entropy_delta: float = 0.0,
-        entropy_abs_threshold: float | None = None,
-        use_flex_attention: bool = True,
-        output_length: int = 512,
+            self,
+            vocab_size: int = 260,
+            dim: int = 256,
+            heads: int = 8,  # Num heads for both encoder and pooler
+            window: int = 128,  # Window size for shared encoder layers
+
+            # MLA params
+            head_dim: int | None = 32,
+            kv_comp_dim: int | None = 64,  # d_c
+            q_comp_dim: int | None = 96,  # d_c`
+            retr_dim: int | None = 32,
+
+            lm_window: int | None = None,
+            compression_window: int | None = None,
+            num_encoder_layers: int = 3,
+            encoder_ffn_dim_multiplier: int = 4,
+            num_shared_encoder_layers: int = 0,
+            num_lm_encoder_layers: int | None = None,
+            num_compression_encoder_layers: int | None = None,
+            num_queries: int = 1,  # L: Number of queries per segment for the pooler
+            codebook_size: int = 512,  # K: Number of codes in VQ codebook (per stage if vq_depth>1)
+            vq_depth: int = 1,  # Number of residual VQ stages; 1 means single-stage VQ
+            vq_d_c: int | None = None,  # Compressed dim used inside residual VQ
+            beta: float = 0.25,  # Beta for VQ commitment loss
+            vq_reset_interval: int = 250,
+            entropy_delta: float = 0.0,
+            entropy_abs_threshold: float | None = None,
+            use_flex_attention: bool = True,
+            output_length: int = 512,
     ):
         super().__init__()
         self.num_queries_per_segment = num_queries
@@ -106,17 +109,17 @@ class ByteSegmentCompressor(nn.Module):
         self.shared_layers = nn.ModuleList(
             [
                 # _compiled(
-                    SlidingWindowMLATransformerBlock(
-                        dim=dim,
-                        num_heads=heads,
-                        window_size=window,
-                        head_dim=head_dim,
-                        kv_comp_dim=kv_comp_dim,
-                        q_comp_dim=q_comp_dim,
-                        retr_dim=retr_dim,
-                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                        use_flex_attention=self.use_flex_attention,
-                    )
+                SlidingWindowMLATransformerBlock(
+                    dim=dim,
+                    num_heads=heads,
+                    window_size=window,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
+                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                    use_flex_attention=self.use_flex_attention,
+                )
                 # )
                 for _ in range(num_shared_encoder_layers)
             ]
@@ -125,17 +128,17 @@ class ByteSegmentCompressor(nn.Module):
         self.compression_layers = nn.ModuleList(
             [
                 # _compiled(
-                    SlidingWindowMLATransformerBlock(
-                        dim=dim,
-                        num_heads=heads,
-                        window_size=self.compression_window,
-                        head_dim=head_dim,
-                        kv_comp_dim=kv_comp_dim,
-                        q_comp_dim=q_comp_dim,
-                        retr_dim=retr_dim,
-                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                        use_flex_attention=self.use_flex_attention,
-                    )
+                SlidingWindowMLATransformerBlock(
+                    dim=dim,
+                    num_heads=heads,
+                    window_size=self.compression_window,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
+                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                    use_flex_attention=self.use_flex_attention,
+                )
                 # )
                 for _ in range(num_compression_encoder_layers)
             ]
@@ -144,17 +147,17 @@ class ByteSegmentCompressor(nn.Module):
         self.lm_layers = nn.ModuleList(
             [
                 # _compiled(
-                    SlidingWindowMLATransformerBlock(
-                        dim=dim,
-                        num_heads=heads,
-                        window_size=self.lm_window,
-                        head_dim=head_dim,
-                        kv_comp_dim=kv_comp_dim,
-                        q_comp_dim=q_comp_dim,
-                        retr_dim=retr_dim,
-                        ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                        use_flex_attention=self.use_flex_attention,
-                    )
+                SlidingWindowMLATransformerBlock(
+                    dim=dim,
+                    num_heads=heads,
+                    window_size=self.lm_window,
+                    head_dim=head_dim,
+                    kv_comp_dim=kv_comp_dim,
+                    q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim,
+                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                    use_flex_attention=self.use_flex_attention,
+                )
                 # )
                 for _ in range(num_lm_encoder_layers)
             ]
@@ -166,11 +169,12 @@ class ByteSegmentCompressor(nn.Module):
         self.pooler = LearnedQueryAttention(
             embed_dim=dim,
             num_queries_per_segment=num_queries,
+            max_queries=output_length // max(1, num_queries),
             num_heads=heads,
-            use_flex_attention=False
+            use_flex_attention=True
         )
 
-        if vq_depth is not None: # and vq_depth >= 2:
+        if vq_depth is not None:  # and vq_depth >= 2:
             # Use residual multi-stage VQ with a shared compressed space
             d_c = vq_d_c if vq_d_c is not None else (kv_comp_dim if kv_comp_dim is not None else 64)
             self.vq = MultiStageResidualVQ(
@@ -182,13 +186,17 @@ class ByteSegmentCompressor(nn.Module):
                 reset_interval=vq_reset_interval,
             )
         else:
+            K = codebook_size
             self.vq = VectorQuantizer(
                 K=codebook_size,
                 D=dim,
                 beta=beta,
                 reset_interval=vq_reset_interval,
+                forbidden_ids=[K - 1, K - 2, K - 3, K - 4],
+                protected_ids=[K - 1, K - 2, K - 3, K - 4]
+
             )
-    # @torch.compile(dynamic=True)
+
     def forward(self, token_ids: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> CompressorOutput:
         """
         Processes input token IDs to produce compressed segment representations.
@@ -223,16 +231,12 @@ class ByteSegmentCompressor(nn.Module):
                 assert 0 <= tmin and tmax < V, f"OOB token id(s): [{tmin}..{tmax}] vs V={V}"
 
         x = self.embedding(token_ids)
-        # if torch.isnan(x).any():
-        #     print('nan')
         for layer in self.shared_layers:
             x = layer(x, key_padding_mask=key_padding_mask)
 
         # 2. Branch for next-token prediction
         lm_x = x
         for _idx, layer in enumerate(self.lm_layers):
-            # if torch.isnan(lm_x).any():
-            #     print('nan')
             lm_x = layer(lm_x, key_padding_mask=key_padding_mask)
         logits = self.logit_proj(self.lm_final_norm(lm_x))
 
@@ -272,40 +276,32 @@ class ByteSegmentCompressor(nn.Module):
 
         # ── 2b. Build queries & tensor mask ─────────────
         L = self.num_queries_per_segment
-        Q_max = (int(self.output_length) // max(1, L)) * max(1, L)  # Ensure output length multiple of L
-        queries, q_seg, valid_segments_mask = build_segment_queries_qseg(
-            seg_id,
-            self.pooler.query_template,
-            Q_max=Q_max,
-        )
 
-
-        # ── 3. Learned-Query Pooling (Segment-Restricted) ───────────────────
-        # Pool features from `hidden` states using the constructed `queries`.
-        # Attention is restricted by `seg_attn_mask` and `key_padding_mask`.
+        # (1) Pool segment-locally. The pooler builds queries internally.
         pooled_embeddings, _ = self.pooler(
-            x=hidden,  # (B,S,D)
-            queries=queries,  # (B,Q_max,D)
-            q_seg=q_seg,  # (B,Q_max) int; -1 for padded queries
-            seg_id=seg_id,  # (B,S)     int
-            key_padding_mask=key_padding_mask,  # (B,S) bool
-            attn_mask=None,  # ignored on flex path
+            x=hidden,
+            seg_id=seg_id,
+            key_padding_mask=key_padding_mask,
             return_attn=False,
-        )
+        )  # (B, Q_max, D)
 
-        # Zero-out invalid queries by snapping them to the padding code vector.
-        # Queries that are not assigned to any real segment (q_seg < 0) are invalid.
-        q_valid = (q_seg >= 0)  # (B, Q_max) bool
-
-        # Choose the pad vector once
-        vq_pad_vec = getattr(self.vq, "pad_vector", None)
-        if vq_pad_vec is not None:
-            pad_vec = vq_pad_vec.view(1, 1, -1).detach()
+        # (2) Build valid mask (B, Q_max) for downstream (next-level KPM & metrics).
+        #     Must be computed the same way pooler did it:
+        if key_padding_mask is not None:
+            seg_id_real = torch.where(key_padding_mask, seg_id.new_full((), -1), seg_id)
+            nseg = (seg_id_real.amax(dim=1).clamp(min=-1) + 1)  # (B,)
         else:
-            pad_vec = self.vq.codebook[self.vq.padding_token_id].detach().view(1, 1, -1)
+            nseg = (seg_id.amax(dim=1) + 1)
+        valid_segments_mask = (torch.arange(self.pooler.Q_max, device=hidden.device)[None, :]
+                               < (nseg * self.pooler.L)[:, None])  # (B, Q_max)
 
+        # (3) For unused query slots, snap to the VQ pad sentinel to avoid side effects.
+        vq_pad_vec = getattr(self.vq, "pad_vector", None)
+        pad_vec = (vq_pad_vec.view(1, 1, -1).detach()
+                   if vq_pad_vec is not None
+                   else self.vq.codebook[self.vq.padding_token_id].detach().view(1, 1, -1))
         pooled_embeddings = torch.where(
-            q_valid.unsqueeze(-1), pooled_embeddings, pad_vec.expand_as(pooled_embeddings)
+            valid_segments_mask.unsqueeze(-1), pooled_embeddings, pad_vec.expand_as(pooled_embeddings)
         )
 
         # ── 4. Vector-Quantize Pooled Embeddings ─────────────────────────────
