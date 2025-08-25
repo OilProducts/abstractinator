@@ -5,9 +5,8 @@ from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
 import torch
+from torch import nn, Tensor
 import torch._dynamo as dynamo
-import torch.nn as nn
-from torch import Tensor
 from torch.nn.attention.flex_attention import and_masks, create_block_mask, flex_attention
 
 from .rope import RoPECache, apply_rope
@@ -16,193 +15,387 @@ from .utils import safe_softmax
 
 class MultiheadLatentAttention(nn.Module):
     """
-    DeepSeek‑V3 style Multi‑Head Latent Attention with asymmetric compression
-    and optional FlexAttention acceleration + arbitrary masking.
-    -----------------------------------------------------------------------
-      latent  (K=128)  →  Q_big  (d_c' = 1536)
-                       →  Q_kv   (d_c  = 512)
-      K/V     (d_c)    →  retrieval K_r  (r = 64)
-      Q_big   (d_c')   →  retrieval Q_r  (r = 64)
-      scores  : <Q_r , K_r>  (√r scale baked into W_qr)
-      values  : V  =  K/V_compressed   (d_c)
+    DeepSeek‑style Multi‑Head Latent Attention with:
+      • Asymmetric compression (shared latent c and retrieval r)
+      • Optional FlexAttention acceleration + arbitrary masking
+      • Optional fused query/output paths for inference
+      • Streaming caches: cache both kv_c (latent) and k_r (RoPE'd keys)
+
+    Naming (this class  ⇄  MLA paper / prior discussion):
+      dim_q         ⇄  d_model
+      num_heads     ⇄  H
+      head_dim (K)  ⇄  d_head
+      kv_comp_dim   ⇄  c        (shared latent, cached once per token)
+      q_comp_dim    ⇄  d_c'     (query compression; not L‑scaled at decode)
+      retr_dim (r)  ⇄  d_rope   (retrieval/scoring space; RoPE is applied here)
+
+    Forward modes
+    -------------
+    • Training / block mode (default):
+        forward(hidden_q, kv_c, block_mask=None)
+      - No caches used, RoPE tables start from 0 for both Q and K (standard).
+
+    • Prefill/decode with caches (no recompute of old keys):
+        forward(hidden_q, kv_c_new, block_mask=None,
+                use_cache=True, pos_start=abs_pos_of_kv_c_new_start,
+                cache=(kv_c_cache, k_r_cache), return_cache=True)
+
+      Inputs:
+        - hidden_q:   [B, S, dim_q]  (S=1 typical for decode; can be >1)
+        - kv_c_new:   [B, L, c]      (the NEW tokens to append; L can be 0)
+        - pos_start:  int absolute position index of kv_c_new[*, 0]
+        - cache:      tuple of (kv_c_cache: [B, Ltot, c], k_r_cache: [B, H, Ltot, r])
+      Returns:
+        - out:        [B, S, dim_q]
+        - (kv_c_cache_updated, k_r_cache_updated) if return_cache=True
+
+    Notes
+    -----
+    • Fusions are disabled in training to preserve gradients and perf.
+    • Keys are RoPE‑rotated at WRITE‑time and stored rotated in cache.
+    • Queries are RoPE‑rotated at READ‑time with absolute positions.
+    • Keep r and c multiples of 16/64 for better kernels.
     """
 
     def __init__(
         self,
-        dim_q: int,  # full model width (7168)
-        num_heads: int = 128,
-        head_dim: int = 128,  # K
-        kv_comp_dim: int = 512,  # d_c
-        q_comp_dim: int = 1536,  # d_c'
-        retr_dim: int = 64,  # r
-        score_mod: Callable | None = None,  # Flex mask/bias callback
+        dim_q: int = 384,
+        num_heads: int = 8,
+        head_dim: int = 64,     # K
+        kv_comp_dim: int = 64,  # c
+        q_comp_dim: int = 16,   # d_c'
+        retr_dim: int = 64,     # r  (must be even for RoPE)
+        score_mod: Optional[Callable] = None,  # Flex mask/bias callback
         use_flex_attention: bool = True,
+        rope_max_seqlen: int = 2048,
     ):
         super().__init__()
+        assert retr_dim % 2 == 0, "retr_dim (r) must be even for RoPE."
+
         self.h = num_heads
         self.k = head_dim
         self.d_c = kv_comp_dim
         self.d_cq = q_comp_dim
         self.r = retr_dim
+        self.dim_q = dim_q
 
-        # latent → K‑space
+        # --------------- Projections & parameters -----------------------------
+        # latent → per‑head K space (standard q-proj)
         self.q_proj = nn.Linear(dim_q, self.h * self.k, bias=False)
 
-        # absorbed projections to compressed spaces
-        self.w_kc_q = nn.Parameter(torch.empty(self.h, self.k, self.d_cq))  # K→d_c'
-        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c))  # K→d_c
+        # absorbed projections to compressed/query spaces  (per head)
+        # shapes follow your original code
+        self.w_kc_q  = nn.Parameter(torch.empty(self.h, self.k, self.d_cq))  # K→d_c'
+        self.w_kc_kv = nn.Parameter(torch.empty(self.h, self.k, self.d_c))   # K→c   (value up-proj uses transpose)
 
-        # retrieval adapters
-        self.W_qr = nn.Parameter(torch.empty(self.h, self.d_cq, self.r))
-        self.W_kr = nn.Parameter(torch.empty(self.h, self.d_c, self.r))
+        # retrieval adapters (per head)
+        self.W_qr = nn.Parameter(torch.empty(self.h, self.d_cq, self.r))     # d_c'→r (√r baked in)
+        self.W_kr = nn.Parameter(torch.empty(self.h, self.d_c,  self.r))     # c→r
 
-        # output
+        # output projection: concat(H×K) → dim_q
         self.out_proj = nn.Linear(self.h * self.k, dim_q, bias=False)
 
         self._init_weights()
 
+        # ------------------- RoPE ---------------------------------------------
         # pick dtype/device from a real param so it follows .to() and AMP
         param = self.q_proj.weight
         self.rope = RoPECache(
-            max_seqlen=2048,
-            head_dim=self.r,  # <-- rotate in retrieval space
+            max_seqlen=rope_max_seqlen,
+            head_dim=self.r,  # rotate in retrieval space
             device=param.device,
             dtype=param.dtype,
         )
 
+        # ------------------- Attention kernels --------------------------------
         self.score_mod = score_mod or (lambda s, *_: s)  # identity if none
         self.use_flex_attention = use_flex_attention
-        if self.use_flex_attention:
-            self._attn = self._flex_attention
-        else:
-            self._attn = self._fallback_attention
+        self._attn = self._flex_attention if use_flex_attention else self._fallback_attention
 
-        self._pad_for_scores = None  # [B, S] bool or None
-        self._q_seg_for_scores = None  # [B, Q] int or None
-        self._seg_id_for_scores = None  # [B, S] int or None
+        # ------------------- Optional fusions (inference only) -----------------
+        self._use_fused_query = False
+        self._use_fused_output = False
+        self.register_buffer("_W_qr_fused", None, persistent=False)  # (H, K, r)
+        self.register_buffer("_U_fused",     None, persistent=False)  # (H, c, dim_q)
+
+        # ------------------- Score‑mod helpers (optional) ---------------------
+        self._pad_for_scores: Optional[Tensor] = None   # [B, S_keys] bool
+        self._q_seg_for_scores: Optional[Tensor] = None # [B, S_queries] int
+        self._seg_id_for_scores: Optional[Tensor] = None# [B, S_keys] int
 
     # ------------------------------------------------------------------ #
+    @torch.no_grad()
     def _init_weights(self):
         for p in (self.w_kc_q, self.w_kc_kv, self.W_qr, self.W_kr):
             nn.init.kaiming_uniform_(p, a=math.sqrt(5))
         # bake √r into W_qr  ⇒ no runtime scaling needed
-        with torch.no_grad():
-            self.W_qr.div_(math.sqrt(self.r))
+        self.W_qr.div_(math.sqrt(self.r))
 
-    # clear RoPE tables when dtype/device flip
-    def load_state_dict(self, *a, **kw):
-        ret = super().load_state_dict(*a, **kw)
-        # _RoPECache.clear()
-        return ret
+    # ======================= Public controls ================================ #
 
-    def _score_mod_with_pad(self, scores, b, h, q, k):
+    @torch.no_grad()
+    def enable_fused_query_path(self) -> None:
+        """Enable query-path fusion w_kc_q ∘ W_qr → W_qr_fused (inference)."""
+        self._ensure_fused_query_fresh()
+        self._use_fused_query = True
 
-        # user-provided score_mod first, if any
+    @torch.no_grad()
+    def enable_fused_output_path(self) -> None:
+        """Enable output-path fusion (w_kc_kv, out_proj) → U_fused (inference)."""
+        self._ensure_fused_output_fresh()
+        self._use_fused_output = True
+
+    @torch.no_grad()
+    def disable_fusions(self) -> None:
+        """Disable fused paths; training-safe."""
+        self._use_fused_query = False
+        self._use_fused_output = False
+
+    @torch.no_grad()
+    def enable_inference_fusions(self) -> None:
+        """Convenience: enable both fusions at once (call under eval())."""
+        self.enable_fused_query_path()
+        self.enable_fused_output_path()
+
+    # Optional helpers to drive padding/segment gating from the outside
+    def set_pad_for_scores(self, pad_mask: Optional[Tensor]) -> None:
+        """pad_mask: [B, S_keys] bool; True = pad (mask out)"""
+        self._pad_for_scores = pad_mask
+
+    def set_segment_gating(self, q_seg_ids: Optional[Tensor], k_seg_ids: Optional[Tensor]) -> None:
+        """q_seg_ids: [B, S_queries], k_seg_ids: [B, S_keys]; mismatched segs are masked."""
+        self._q_seg_for_scores = q_seg_ids
+        self._seg_id_for_scores = k_seg_ids
+
+    # ======================= Internal fusion builders ======================= #
+
+    @torch.no_grad()
+    def _ensure_fused_query_fresh(self):
+        """Build or refresh W_qr_fused on the right device/dtype."""
+        if self.training:
+            return  # don't build in training
+        want_dtype = self.q_proj.weight.dtype
+        want_dev = self.q_proj.weight.device
+        need = (
+            self._W_qr_fused is None
+            or self._W_qr_fused.dtype != want_dtype
+            or self._W_qr_fused.device != want_dev
+        )
+        if need:
+            W_qr_fused = torch.einsum("hkq,hqr->hkr", self.w_kc_q.to(want_dtype), self.W_qr.to(want_dtype))
+            self.register_buffer("_W_qr_fused", W_qr_fused.to(want_dev), persistent=False)
+
+    @torch.no_grad()
+    def _ensure_fused_output_fresh(self):
+        """Build or refresh U_fused: per‑head (c → dim_q)."""
+        if self.training:
+            return
+        want_dtype = self.q_proj.weight.dtype
+        want_dev = self.q_proj.weight.device
+        need = (
+            self._U_fused is None
+            or self._U_fused.dtype != want_dtype
+            or self._U_fused.device != want_dev
+        )
+        if need:
+            D, HK = self.out_proj.weight.shape  # (dim_q, H*K)
+            assert HK == self.h * self.k
+            # W_out_per_head: (H, K, D)
+            W_out = self.out_proj.weight.view(D, self.h, self.k).permute(1, 2, 0).to(want_dtype)
+            # w_kc_kv^T: (H, c, K)
+            W_kvT = self.w_kc_kv.transpose(1, 2).to(want_dtype)
+            # (H,K,D) x (H,c,K) -> (H,c,D)
+            U = torch.einsum("hkd,hck->hcd", W_out, W_kvT)
+            self.register_buffer("_U_fused", U.to(want_dev), persistent=False)
+
+    # ======================= RoPE helpers (offset‑aware) ==================== #
+
+    def _rope_slice_with_offset(self, start: int, length: int) -> Tuple[Tensor, Tensor]:
+        """
+        Return (cos, sin) for absolute positions [start .. start+length-1].
+        Falls back to composing from .slice() if the RoPE cache doesn't expose an offset API.
+        Shapes: (1,1,length,r/2)
+        """
+        # Prefer native methods if present
+        if hasattr(self.rope, "slice_with_offset"):
+            return self.rope.slice_with_offset(start, length)
+        if hasattr(self.rope, "at") and length == 1:
+            return self.rope.at(start)
+
+        # Fallback: get tables for [0..start+length-1] then slice off the prefix.
+        cos, sin = self.rope.slice(start + length)  # (1,1,start+length,r/2)
+        if start > 0:
+            cos = cos[..., start:, :]
+            sin = sin[..., start:, :]
+        return cos, sin
+
+    # ======================= Attention kernels ============================= #
+
+    def _score_mod_with_pad(self, scores: Tensor, b: int, h: int, q: int, k: int) -> Tensor:
+        # 1) external score_mod (if provided)
         if self.score_mod is not None and self.score_mod is not self._score_mod_with_pad:
             scores = self.score_mod(scores, b, h, q, k)
 
-        # 1) padding (what you already had)
+        # 2) padding
         if self._pad_for_scores is not None:
             scores = scores.masked_fill(self._pad_for_scores[b, k], float("-inf"))
 
-        # 2) segment gating (new)
+        # 3) segment gating
         if self._q_seg_for_scores is not None and self._seg_id_for_scores is not None:
-            # bad if key's seg != query's seg
             bad = self._seg_id_for_scores[b, k] != self._q_seg_for_scores[b, q]
             scores = scores.masked_fill(bad, float("-inf"))
 
         return scores
 
-    def _flex_attention(self, q_r, k_r, v_c, *, block_mask: torch.Tensor | None = None):
-        # NOTE: we now always pass score_mod, even when block_mask is present.
-        return flex_attention(
-            q_r,
-            k_r,
-            v_c,
-            score_mod=self._score_mod_with_pad,
-            block_mask=block_mask,
-        )
+    def _flex_attention(self, q_r: Tensor, k_r: Tensor, v_c: Tensor, *, block_mask: Optional[Tensor] = None) -> Tensor:
+        # Must pass score_mod hook even when block_mask is present.
+        return flex_attention(q_r, k_r, v_c, score_mod=self._score_mod_with_pad, block_mask=block_mask)
 
     def _fallback_attention(
         self,
-        q_r: torch.Tensor,  # [B, H, S, r]
-        k_r: torch.Tensor,  # [B, H, L, r]
-        v_c: torch.Tensor,  # [B, H, L, d_c]
+        q_r: Tensor,  # [B, H, S, r]
+        k_r: Tensor,  # [B, H, L, r]
+        v_c: Tensor,  # [B, H, L, c]
         *,
-        block_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        block_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """
-        Light‑weight dot‑product attention used when FlexAttention is unavailable.
+        Lightweight dot‑product attention used when FlexAttention is unavailable.
 
         Returns
         -------
-        ctx_c : torch.Tensor, shape [B, H, d_c]
+        ctx_c : torch.Tensor, shape [B, H, S, c]
             Per‑head context vectors in compressed space.
         """
-        # q_r: [B,H,S,r]   k_r: [B,H,L,r]  →  scores: [B,H,S,L]
         scores = torch.matmul(q_r, k_r.transpose(-2, -1))  # [B, H, S, L]
 
-        # -- 2. user‑supplied bias / mask operates on raw logits ---------------
-        scores = self.score_mod(scores)
+        # user‑supplied logits mod
+        scores = self._score_mod_with_pad(scores, b=0, h=0, q=0, k=0) if self._score_mod_with_pad else scores
 
         mask = torch.zeros_like(scores, dtype=torch.bool)
         if block_mask is not None:
-            if hasattr(block_mask, 'mask_mod'):
-                B, H, _, L = scores.shape
-                q_idx = torch.arange(L, device=scores.device)
-                k_idx = q_idx[:, None]
-                keep = block_mask.mask_mod(0, 0, q_idx[:, None], k_idx[:, None])
-                scores = scores.masked_fill(keep, -float('inf'))
+            if hasattr(block_mask, "mask_mod"):
+                B, H, S, L = scores.shape
+                q_idx = torch.arange(S, device=scores.device)
+                k_idx = torch.arange(L, device=scores.device)
+                keep = block_mask.mask_mod(0, 0, q_idx[:, None], k_idx[None, :])
+                scores = scores.masked_fill(keep, -float("inf"))
                 mask = mask | keep
             else:
-                scores = scores.masked_fill(block_mask, -float('inf'))
+                scores = scores.masked_fill(block_mask, -float("inf"))
                 mask = mask | block_mask
 
-        # -- 3. softmax & value aggregation ------------------------------------
         attn = safe_softmax(scores, mask, dim=-1)  # [B, H, S, L]
+        return torch.matmul(attn, v_c)             # [B, H, S, c]
 
-        # fused gemm: (B·H·S)×L @ L×d_c  →  (B·H·S)×d_c
-        return torch.matmul(attn, v_c)  # [B, H, S, d_c]
+    # ======================= Main forward ================================== #
 
-    def forward(self, hidden_q: torch.Tensor, kv_c: torch.Tensor, block_mask=None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_q: Tensor,              # [B, S, dim_q]
+        kv_c: Tensor,                  # [B, L, c]  (block for training; "new block" for cache mode)
+        block_mask: Optional[Tensor] = None,
+        *,
+        use_cache: bool = False,
+        pos_start: int = 0,
+        cache: Optional[Tuple[Tensor, Tensor]] = None,  # (kv_c_cache: [B,Ltot,c], k_r_cache: [B,H,Ltot,r])
+        return_cache: bool = False,
+    ):
+        """
+        If use_cache=False (default): standard block attention over kv_c (training).
+        If use_cache=True: treat kv_c as the NEW block to append at absolute pos_start, use 'cache' as past.
+        """
         B, S, _ = hidden_q.shape
-        _, L, _d = kv_c.shape
-        dev, dt = kv_c.device, kv_c.dtype
+        _, L, _ = kv_c.shape
+        dev, dt = hidden_q.device, hidden_q.dtype
 
+        # Decide fusion usage: NEVER in training (keeps perf & grads intact).
+        use_fused_query = (not self.training) and self._use_fused_query
+        use_fused_output = (not self.training) and self._use_fused_output
+
+        if use_fused_query:
+            self._ensure_fused_query_fresh()
+        if use_fused_output:
+            self._ensure_fused_output_fresh()
+
+        # --------- 1) Q path: hidden → per‑head K → retrieval r ---------------
         q_hk = self.q_proj(hidden_q).view(B, S, self.h, self.k)  # [B,S,H,K]
-        q_big = torch.einsum('bshk,hkq->bshq', q_hk, self.w_kc_q)  # [B,S,H,d_c′]
+        if use_fused_query and self._W_qr_fused is not None:
+            # (B,S,H,K) × (H,K,r) → (B,S,H,r)
+            q_r = torch.einsum("bshk,hkr->bshr", q_hk, self._W_qr_fused)
+        else:
+            # two‑step (training/default): K→d_c'→r
+            q_big = torch.einsum("bshk,hkq->bshq", q_hk, self.w_kc_q)    # [B,S,H,d_c′]
+            q_r   = torch.einsum("bshq,hqr->bshr", q_big, self.W_qr)    # [B,S,H,r]
+        q_r = q_r.permute(0, 2, 1, 3).contiguous()  # [B,H,S,r]
 
-        # Project into the actual scoring space r
-        q_r = torch.einsum('bshq,hqr->bshr', q_big, self.W_qr)  # [B,S,H,r]
-        q_r = q_r.permute(0, 2, 1, 3)  # [B,H,S,r]
+        # --------- 2) K path: build k_r for keys (new block OR full block) ---
+        if use_cache:
+            # Build for NEW tokens only and rotate with absolute positions [pos_start..pos_start+L-1]
+            k_r_block = torch.einsum("bld,hdr->bhlr", kv_c, self.W_kr)  # [B,H,L,r]
+            cos_k, sin_k = self._rope_slice_with_offset(pos_start, L)
+            k_r_block = apply_rope(k_r_block, cos_k, sin_k)
 
-        k_r = torch.einsum('bld,hdr->bhlr', kv_c, self.W_kr)  # [B,H,L,r]
+            # Extend caches (or start fresh if none provided)
+            if cache is None:
+                kv_c_cache = kv_c
+                k_r_cache  = k_r_block
+            else:
+                kv_c_cache, k_r_cache = cache
+                kv_c_cache = torch.cat([kv_c_cache, kv_c], dim=1)  # [B,Ltot+L,c]
+                k_r_cache  = torch.cat([k_r_cache,  k_r_block], dim=2)  # [B,H,Ltot+L,r]
+        else:
+            # Training/block mode: build full k_r for provided kv_c
+            k_r_cache = torch.einsum("bld,hdr->bhlr", kv_c, self.W_kr)  # [B,H,L,r]
+            cos_k, sin_k = self._rope_slice_with_offset(0, L)
+            k_r_cache = apply_rope(k_r_cache, cos_k, sin_k)
+            kv_c_cache = kv_c
 
-        # --- RoPE in retrieval space (the dot-product space) ---
-        cos_S, sin_S = self.rope.slice(S)  # (1,1,S,r/2)
-        q_r = apply_rope(q_r, cos_S, sin_S)  # [B,H,S,r]
+        # --------- 3) RoPE for queries at READ‑time (absolute positions) -----
+        # If you're decoding S=1 at absolute position p, pass pos_start=p for q as well.
+        cos_q, sin_q = self._rope_slice_with_offset(pos_start, S) if use_cache else self._rope_slice_with_offset(0, S)
+        q_r = apply_rope(q_r, cos_q, sin_q)  # [B,H,S,r]
 
-        cos_L, sin_L = self.rope.slice(L)  # (1,1,L,r/2)
-        k_r = apply_rope(k_r, cos_L, sin_L)  # [B,H,L,r]
+        # --------- 4) Values: broadcast kv_c_cache across heads --------------
+        v_c = kv_c_cache.unsqueeze(1).expand(-1, self.h, -1, -1).contiguous()  # [B,H,Ltot,c] or [B,H,L,c]
 
-        v_c = kv_c.unsqueeze(1).expand(-1, self.h, -1, -1)  # [B,H,L,d_c]
+        # --------- 5) Attention in compressed space --------------------------
+        ctx_c = self._attn(q_r, k_r_cache, v_c, block_mask=block_mask)  # [B,H,S,c]
 
-        # 5) attention
-        ctx_c = self._attn(q_r, k_r, v_c, block_mask=block_mask)  # [B,H,d_c]
+        # --------- 6) Output path: compressed → model dimension --------------
+        if use_fused_output and self._U_fused is not None:
+            # (B,H,S,c) × (H,c,dim_q) → (B,S,dim_q)
+            out = torch.einsum("bhsd,h dD->bsD", ctx_c, self._U_fused)
+        else:
+            # two‑step (training/default): c→K (per head), concat heads, proj to dim_q
+            ctx_lat = torch.einsum("bhsd,hdK->bhsK", ctx_c, self.w_kc_kv.transpose(1, 2))  # [B,H,S,K]
+            out = self.out_proj(ctx_lat.permute(0, 2, 1, 3).reshape(B, S, -1))            # [B,S,dim_q]
 
-        # 6) compressed → latent
-        ctx_lat = torch.einsum('bhsd,hdK->bhsK', ctx_c, self.w_kc_kv.transpose(1, 2))  # [B,H,S,K]
-        ctx_lat = ctx_lat.permute(0, 2, 1, 3).reshape(B, S, -1)  # [B,S,H*K]
+        if use_cache and return_cache:
+            return out, (kv_c_cache, k_r_cache)
+        return out
 
-        # 7) output
-        return self.out_proj(ctx_lat)  # [B,D]
+    # ======================= Misc / Compatibility =========================== #
+
+    def load_state_dict(self, *a, **kw):
+        """
+        Standard load; clear any derived fused buffers on load so they rebuild
+        on demand with the correct dtype/device.
+        """
+        ret = super().load_state_dict(*a, **kw)
+        # Invalidate fused buffers (they'll rebuild lazily in eval)
+        self.register_buffer("_W_qr_fused", None, persistent=False)
+        self.register_buffer("_U_fused",     None, persistent=False)
+        return ret
+
+
 
 
 def _build_time_keep_fn(window: int):
     return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
 
 
-# @lru_cache(maxsize=64)
+@lru_cache(maxsize=64)
 def _cached_flex_sliding_mask(seq_len: int, window: int, device):
     keep = _build_time_keep_fn(window)
     return create_block_mask(keep, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, BLOCK_SIZE=128, device=device)
@@ -268,19 +461,9 @@ class SlidingWindowMLA(nn.Module):
         Returns (flex_mask, dense_mask). Flex path uses a cached time-only mask.
         Padding is handled in score_mod, not in the BlockMask.
         """
-        # if use_flex:
         # time-window only; cached (no closure over pad)
         flex_mask = _cached_flex_sliding_mask(seq_len, window, device)
         return flex_mask, None
-
-        # ---------- dense mask path (fallback) ----------
-        q_idx = torch.arange(seq_len, device=device)[:, None]
-        k_idx = torch.arange(seq_len, device=device)[None, :]
-        dense = (k_idx > q_idx) | (k_idx < q_idx - window)  # outside window
-        dense = dense.unsqueeze(0).unsqueeze(0)  # [1,1,S,S]
-        if pad is not None:
-            dense = dense | pad[:, None, None, :]
-        return None, dense
 
     def forward(self, x, key_padding_mask: Optional[torch.Tensor] = None):
         B, S, _ = x.shape
@@ -300,7 +483,7 @@ class SlidingWindowMLA(nn.Module):
         )
         block_mask = flex_mask if flex_mask is not None else dense_mask
 
-        # NEW: hand pad to MLA to be applied in score_mod inside the kernel
+        # hand pad to MLA to be applied in score_mod inside the kernel
         self.mla._pad_for_scores = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
 
         ctx = self.mla(x, kv_c, block_mask=block_mask)
@@ -310,7 +493,6 @@ class SlidingWindowMLA(nn.Module):
         return ctx
 
 
-# @torch.compile
 class SlidingWindowMLATransformerBlock(nn.Module):
     """
     A single Transformer block that uses the Sliding‑Window Multi‑Head Latent
@@ -396,20 +578,13 @@ class SlidingWindowMLATransformerBlock(nn.Module):
             Output of the Transformer block.
         """
         # Attention (Pre‑LN)
-        # if torch.isnan(x).any():
-        #     print('nan')
         x = self.norm1(x)  # [B, S, D]
-        # if torch.isnan(x).any():
-        #     print('nan')
         x = x + self.attn(x, key_padding_mask=key_padding_mask)  # [B, S, D]
-
-        # x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
-
         # Feed‑forward (Pre‑LN)
         x = x + self.ffn(self.norm2(x))
         return x
 
-
+@torch._dynamo.disable()
 @lru_cache(maxsize=64)
 def _cached_causal_mask(seq_len: int, device: torch.device):
     """
@@ -493,9 +668,6 @@ class CausalMLA(nn.Module):
 # ----------------------------------------------------------------------------- #
 # Transformer Block
 # ----------------------------------------------------------------------------- #
-
-
-# @torch.compile
 class CausalMLATransformerBlock(nn.Module):
     """
     Standard Pre‑LN causal Transformer block powered by MLA.
