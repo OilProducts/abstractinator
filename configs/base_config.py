@@ -30,6 +30,7 @@ def _check_flex_attention() -> bool:
         flex_attention(q, q, q)
         return True
     except Exception:
+        print('Disabling flex_attention: it cannot run on this system.')
         return False
 
 
@@ -77,7 +78,7 @@ class AbstractinatorConfig:
     # Shared / tokens
     #
     vocab_size: int = 260                     # byte-level at L0; for higher levels set to K_eff(prev)
-    D: int = 128                              # model dim for both compressor/expander
+    D: int = 384                              # model dim for both compressor/expander
     eos_id: int = 257
     eop_id: int = 259
     bos_id: int = 256
@@ -86,8 +87,14 @@ class AbstractinatorConfig:
     #
     # Compressor (encoder) hyperparams
     #
-    c_heads: int = 8
+    c_heads: int = 6
     c_window: int = 128
+
+    c_head_dim: Optional[int] = 64  # if None, inferred as D / c_heads
+    c_kv_comp_dim: Optional[int] = 48  # d_c; if None, inferred as D / 2
+    c_q_comp_dim: Optional[int] = 96  # d_c`; if None, inferred as D * 3 / 4
+    c_retr_dim: Optional[int] = 16  # r; if None, inferred as D / 4
+
     c_num_encoder_layers: int = 3
     c_num_shared_encoder_layers: int = 0
     c_num_lm_encoder_layers: Optional[int] = 14
@@ -105,12 +112,12 @@ class AbstractinatorConfig:
     #
     # Expander (decoder) hyperparams
     #
-    d_layers: int = 4                         # N_dec
+    d_layers: int = 9                         # N_dec
     d_heads: int = 8
     d_cross_window: int = 1
     d_residual_conditioning: bool = True
     d_use_sqdist_logits: bool = False
-    d_predict_specials: bool = True
+    d_predict_specials: bool = False
     d_max_len: int = 2048
     d_lo_d_c: int = 64                        # only used if bottom level w/ LearnedCodebookAdapter; we use MS-RVQ so ignored
 
@@ -120,7 +127,7 @@ class AbstractinatorConfig:
     w_code_ce: float = 1.0                    # stage-wise CE on digits
     w_special_ce: float = 1.0                 # CE on special head (only where specials)
     w_byte_lm_ce: float = 1.0                 # LM CE on compressor byte branch (for entropy modeling)
-    w_vq: float = 0.1                         # VQ loss weight
+    w_vq: float = 1.0                         # VQ loss weight
 
     #
     # Misc
@@ -128,87 +135,35 @@ class AbstractinatorConfig:
     device: Optional[torch.device] = None
 
 
-
-# @dataclass
-# class CompressorLevelConfig:
-#     dim: int = 128
-#     heads: int = 8
-#     window: int = 64
-#     head_dim: Optional[int] = 16  # K
-#     kv_comp_dim: Optional[int] = 32  # d_c
-#     q_comp_dim: Optional[int] = 48  # d_c`
-#     retr_dim: Optional[int] = 32  # r
-#     lm_window: Optional[int] = 64
-#     compression_window: Optional[int] = 8
-#     num_encoder_layers: int = 0
-#     num_shared_encoder_layers: int = 0
-#     num_lm_encoder_layers: Optional[int] = 14
-#     num_compression_encoder_layers: Optional[int] = 4
-#     encoder_ffn_dim_multiplier: int = 2
-#     num_queries: int = 1
-#     codebook_size: int = 8192
-#     beta: float = 1.0
-#     vq_reset_interval: int = 250
-#     vq_depth: int = 1
-#     entropy_delta: float = 0.2
-#     entropy_abs_threshold: Optional[float] = None
-#     target_compression_ratio: Optional[List[float]] = None
-#     compression_loss_weight: float = 1.0
-#     output_length: int = 512
-#
-#     def __post_init__(self) -> None:
-#         if self.lm_window is None:
-#             self.lm_window = self.window
-#         if self.compression_window is None:
-#             self.compression_window = self.window
-
-
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 128
-    dim: int = 256
-    num_layers: int = 24
-    num_heads: int = 16
+    embed_dim: int = 384
+    dim: int = 512
+    num_layers: int = 16
+    num_heads: int = 8
     ffn_dim_multiplier: int = 4
-    continuous: bool = True  # When False, the top LM predicts discrete codes using cross-entropy
+    continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
-    ce_weight: float = 1.0  # Weight for the cross-entropy component of the top LM loss
+    ce_weight: float = 1 # Weight for the cross-entropy component of the top LM loss
     head_dim: Optional[int] = 32  # K
     kv_comp_dim: Optional[int] = 64  # d_c
     q_comp_dim: Optional[int] = 96  # d_c`
-    retr_dim: Optional[int] = 32  # r
+    retr_dim: Optional[int] = 64  # r
     lm_window: Optional[int] = 128
-    lm_fixed_length: Optional[int] = 512  # Fixed length for the top LM input, will be padded if necessary
+    lm_fixed_length: Optional[int] = 1024  # Fixed length for the top LM input, will be padded if necessary
     lm_pad_id: int = 258
-
-
-# @dataclass
-# class ExpanderConfig:
-#     dim_scale: float = 1.0
-#     num_enc_layers: int = 2
-#     num_dec_layers: int = 4
-#     heads_scale: float = 1.0
-#     eos_id: int = 1
-#     max_len: int = 8192
-#     use_decoder_only: bool = True
-#     use_continuous_inputs: bool = True
-#     cross_window: Optional[int] = 128  # If None, use the same window as the compressor level
-#     hi_dim: int = 128  # Dimension of the high-level representation
-#     lo_dim: int = 128  # Dimension of the low-level representation
-#
-
 
 @dataclass
 class PyramidConfig:
     levels: List[AbstractinatorConfig] = field(default_factory=lambda: [AbstractinatorConfig()])
-    w_vq: float = 0.1
+    w_vq: float = 1.0
     w_byte_lm: float = 1.0
-    use_top_code_lm: bool = False
+    use_top_code_lm: bool = True
 
 @dataclass
 class ExpConfig:
-    run_name: str = "HierarchicalAE_Default"
-    project_name: str = "TemporalAutoencodedLanguageModelling"
+    run_name: str = "AbstractinatorBaseConfig"
+    project_name: str = "Abstractinator"
     device: str = DEVICE
     flex_attention: bool = FLEX_ATTENTION
     num_levels: int = 1
@@ -239,7 +194,7 @@ class ExpConfig:
     text_column_name: str = "text"
     generation_interval: int = 100
     sample_prompt_for_generation: str = "In a land far away, "
-    generation_max_len_override: int = 16
+    generation_max_len_override: int = 32
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"
     resume_from_checkpoint: Optional[str] = None
