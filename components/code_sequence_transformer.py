@@ -5,26 +5,41 @@ import torch.nn as nn
 
 from .mla import CausalMLATransformerBlock
 from .vector_quantizer import VectorQuantizer
+try:
+    # Optional import for type hints
+    from configs import TopTransformerConfig  # type: ignore
+except Exception:  # pragma: no cover - keep import lightweight in minimal envs
+    TopTransformerConfig = None  # type: ignore
 
 
 class CodeSequenceTransformer(nn.Module):
-    """Causal Transformer that predicts continuous embeddings."""
+    """Causal Transformer that predicts continuous embeddings.
+
+    Construct with a configuration object to keep the API simple.
+    """
 
     def __init__(
-            self,
-            embed_dim: int,
-            dim: int,
-            num_layers: int,
-            num_heads: int,
-            ffn_dim_multiplier: int = 4,
-            head_dim: int | None = 32,  # K
-            kv_comp_dim: int | None = 64,  # d_c
-            q_comp_dim: int | None = 96,  # d_c`
-            retr_dim: int | None = 32,  # r
-            vq: VectorQuantizer | None = None,
-            use_flex_attention: bool = True,
+        self,
+        cfg: "TopTransformerConfig",
+        *,
+        vq: VectorQuantizer | None = None,
+        use_flex_attention: bool = True,
     ) -> None:
         super().__init__()
+
+        # if cfg is None:
+        #     raise ValueError("cfg must be a valid TopTransformerConfig")
+
+        embed_dim = int(getattr(cfg, "embed_dim"))
+        dim = int(getattr(cfg, "dim"))
+        num_layers = int(getattr(cfg, "num_layers"))
+        num_heads = int(getattr(cfg, "num_heads"))
+        ffn_dim_multiplier = int(getattr(cfg, "ffn_dim_multiplier", 4))
+        head_dim = getattr(cfg, "head_dim", None)
+        kv_comp_dim = getattr(cfg, "kv_comp_dim", None)
+        q_comp_dim = getattr(cfg, "q_comp_dim", None)
+        retr_dim = getattr(cfg, "retr_dim", None)
+
         self.embed_dim = embed_dim
         self.dim = dim
         self.vq = vq

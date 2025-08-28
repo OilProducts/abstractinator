@@ -4,7 +4,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 
 import mlflow  # Logging with MLflow
@@ -132,16 +132,11 @@ def initialize_model(
         except Exception:
             embed_dim = int(getattr(tcfg, "embed_dim", 128))
 
+        # Keep original config intact; construct a local copy with matched embed_dim
+        tcfg_local = replace(tcfg, embed_dim=embed_dim)
+
         top_lm = CodeSequenceTransformer(
-            embed_dim=embed_dim,
-            dim=int(getattr(tcfg, "dim", max(128, embed_dim))),
-            num_layers=int(getattr(tcfg, "num_layers", 12)),
-            num_heads=int(getattr(tcfg, "num_heads", 8)),
-            ffn_dim_multiplier=int(getattr(tcfg, "ffn_dim_multiplier", 4)),
-            head_dim=getattr(tcfg, "head_dim", 32),
-            kv_comp_dim=getattr(tcfg, "kv_comp_dim", 64),
-            q_comp_dim=getattr(tcfg, "q_comp_dim", 96),
-            retr_dim=getattr(tcfg, "retr_dim", 32),
+            tcfg_local,
             vq=None,  # wired after model is constructed
             use_flex_attention=bool(getattr(exp_config, "flex_attention", True)),
         )
@@ -198,10 +193,6 @@ def initialize_model(
         except Exception:
             pass
 
-    # Backward-compat: some older models exposed a code_sequence_transformer
-    if getattr(model, "code_sequence_transformer", None) is not None:
-        cst_params = _count_params(model.code_sequence_transformer)
-        logger.info("  CodeSequenceTransformer: %s parameters", short_num(cst_params))
 
     # Per-level breakdown with a finer split for compressor/expander internals
     if hasattr(model, "levels"):
@@ -524,7 +515,7 @@ def train_loop(
     time_of_last_optimizer_step_event = training_start_time
     total_minibatches_in_epoch = len(train_dataloader)
     model = torch.compile(model)
-
+    #
     # from torch.profiler import profile, record_function, ProfilerActivity
     #
     # with profile(
@@ -534,7 +525,7 @@ def train_loop(
     #         profile_memory=True,
     #         # with_modules=True,
     # ) as prof:
-    #     for _ in range(500):  # run ~50 optimizer steps
+    #     for _ in range(50):  # run ~50 optimizer steps
     #         batch = next(iter(train_dataloader))
     #         tokens = batch["input_ids"].to(device, non_blocking=True)
     #         key_padding_mask = batch["key_padding_mask"].to(device, non_blocking=True)
