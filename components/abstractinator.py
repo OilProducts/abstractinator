@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from configs import AbstractinatorConfig
-from .byte_segment_compressor import ByteSegmentCompressor, CompressorOutput
+from .segment_compressor import SegmentCompressor, CompressorOutput
 from .vector_quantizer import MultiStageResidualVQ, ComposedIndexCodec
 from .expander import DecoderOnlyExpanderRVQ
 
@@ -14,7 +14,7 @@ from .expander import DecoderOnlyExpanderRVQ
 class Abstractinator(nn.Module):
     """
     One-level unit that:
-      1) Compresses a token stream into segment codes via ByteSegmentCompressor (with MS-RVQ)
+      1) Compresses a token stream into segment codes via SegmentCompressor (with MS-RVQ)
       2) Models those codes autoregressively conditioned on "memory" using DecoderOnlyExpanderRVQ,
          reusing the *same* MS-RVQ codebooks (no giant D×K_eff embeddings).
     """
@@ -26,8 +26,13 @@ class Abstractinator(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        # ---- Shared embedding table (moved from SegmentCompressor)
+        # Construct the token embedding at the Abstractinator level so it can be
+        # owned/shared externally and referenced by the compressor.
+        self.embedding = nn.Embedding(cfg.vocab_size, cfg.D)
+
         # ---- 1) Compressor (produces vq_embeddings, vq_indices, seg_id, masks, etc.)
-        self.compressor = ByteSegmentCompressor(
+        self.compressor = SegmentCompressor(
             vocab_size=cfg.vocab_size,
             dim=cfg.D,
             heads=cfg.c_heads,
@@ -43,23 +48,15 @@ class Abstractinator(nn.Module):
             num_lm_encoder_layers=cfg.c_num_lm_encoder_layers,
             num_compression_encoder_layers=cfg.c_num_compression_encoder_layers,
             num_queries=cfg.c_num_queries,
-            codebook_size=cfg.c_vq_K,
-            vq_depth=cfg.c_vq_depth,
-            vq_d_c=cfg.c_vq_d_c,
-            beta=cfg.c_vq_beta,
-            vq_reset_interval=cfg.c_vq_reset_interval,
             entropy_delta=cfg.c_entropy_delta,
             entropy_abs_threshold=cfg.c_entropy_abs_threshold,
             output_length=cfg.c_output_length,
         )
+        # Embedding is owned here; SegmentCompressor consumes precomputed embeddings.
 
         # ---- 2) Expander
         self.lo_vq: Optional[MultiStageResidualVQ] = lo_vq
-        self.hi_vq: MultiStageResidualVQ = self.compressor.vq
 
-        # low side:
-        #   - bottom (L0): bytes => lo_vq=None, K_lo=cfg.vocab_size (e.g., 260)
-        #   - upper (L>0): child level codes => lo_vq=<prev_level.vq>
         if lo_vq is None:
             K_lo = cfg.vocab_size
             eos_id = cfg.eos_id
@@ -71,7 +68,7 @@ class Abstractinator(nn.Module):
 
         self.expander = DecoderOnlyExpanderRVQ(
             lo_vq=self.lo_vq,
-            hi_vq=self.hi_vq,  # None at bottom level; non-None for upper levels
+            hi_vq=None, #self.hi_vq,  # None at bottom level; non-None for upper levels
             K_lo=K_lo,
             D=cfg.D,
             N_dec=cfg.d_layers,
@@ -105,12 +102,23 @@ class Abstractinator(nn.Module):
     # Public API
     # ---------------------------
 
+    @torch.no_grad()
+    def segment_only(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convenience wrapper: entropy-based segmentation using the compressor's LM branch,
+        with embeddings computed at this level.
+        Returns (seg_id, patch_end_mask), both (B, S).
+        """
+        x = self.embedding(token_ids)
+        return self.compressor.segment_only(x, key_padding_mask=key_padding_mask)
+
     def compress(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> CompressorOutput:
         """
         Just run the compressor.
         Returns the original CompressorOutput with segment codes/embeddings.
         """
-        return self.compressor(token_ids, key_padding_mask=key_padding_mask)
+        x = self.embedding(token_ids)
+        return self.compressor(x, key_padding_mask=key_padding_mask, token_ids=token_ids)
 
     def uncompress(
             self,
@@ -213,11 +221,13 @@ class Abstractinator(nn.Module):
         B = token_ids.size(0)
         dev = token_ids.device
 
+        embeddings = self.embedding(token_ids)  # (B, S_in, D)
+
         # ---- 1) Compress ----
-        comp: CompressorOutput = self.compressor(token_ids, key_padding_mask=key_padding_mask)
+        comp: CompressorOutput = self.compressor(embeddings, key_padding_mask=key_padding_mask, token_ids=token_ids)
 
         # hi memory for decoder (continuous)
-        memory = comp.vq_embeddings  # (B, Ŝ*L, D) when num_queries>1; (B,Ŝ,D) when L==1
+        memory = comp.pre_vq_embeddings  # (B, Ŝ*L, D) when num_queries>1; (B,Ŝ,D) when L==1
         # src KPM (True==pad) over memory rows
         if comp.valid_mask is not None:
             if self.compressor.num_queries_per_segment == 1:
@@ -256,36 +266,13 @@ class Abstractinator(nn.Module):
         stage_logits: List[torch.Tensor] = logits["stage_logits"]  # len=depth, each (B,L,K)
         special_logits: Optional[torch.Tensor] = logits.get("special_logits")
 
-        # ---- 4) Losses ----
-        ce = _factorized_code_ce(
-            stage_logits=stage_logits,
-            special_logits=special_logits,
-            targets=tgt,
-            codec=self.lo_codec,
-            tgt_kpm=tgt_kpm,
-        )
-        digit_ce = ce["digit_ce"]
-        # special_ce = ce["special_ce"]
-
-        # byte-LM CE (entropy branch)
-        byte_lm_ce = torch.zeros((), device=dev)
-        if cfg.w_byte_lm_ce > 0.0 and comp.entropy_model_logits.size(1) >= 2:
-            lm_logits = comp.entropy_model_logits[:, :-1, :]  # predict next low token
-            lm_target = comp.input_sequence[:, 1:]
-            lm_kpm = comp.input_padding_mask[:, 1:] if comp.input_padding_mask is not None else None
-            per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
-            if lm_kpm is not None:
-                m = ~lm_kpm
-                byte_lm_ce = (per_tok * m).sum() / m.sum().clamp(min=1)
-            else:
-                byte_lm_ce = per_tok.mean()
-
-        vq_loss = comp.vq_loss
+        # standard CE on logits
+        ce = F.cross_entropy(stage_logits[0].transpose(1, 2), tgt)
 
         total = (
-                cfg.w_code_ce * digit_ce
-                + cfg.w_byte_lm_ce * byte_lm_ce
-                + cfg.w_vq * vq_loss
+                cfg.w_code_ce * ce
+                + cfg.w_byte_lm_ce * comp.entropy_loss
+                # + cfg.w_vq * vq_loss
         )
 
         # ---- 5) Metrics (compression) ----
@@ -294,11 +281,8 @@ class Abstractinator(nn.Module):
         out: Dict[str, torch.Tensor] = {
             "comp_out": comp,
             "loss_total": total,
-            "loss_digit_ce": digit_ce.detach(),
-            # "loss_special_ce": special_ce.detach(),
-            "loss_byte_lm_ce": byte_lm_ce.detach(),
-            "loss_vq": vq_loss.detach(),
-            "ppl_vq": comp.vq_perplexity.detach(),
+            "loss_digit_ce": ce.detach(),
+            "loss_byte_lm_ce": comp.entropy_loss.detach(),
             **stats,
         }
         if return_logits:
@@ -354,7 +338,7 @@ def _compression_stats(comp: CompressorOutput, input_kpm: Optional[torch.Tensor]
     Report batch-mean compression ratio and a few simple stats.
     ratio = (valid_segments * num_queries) / real_input_tokens
     """
-    dev = comp.vq_indices.device
+    dev = comp.pre_vq_embeddings.device
     if input_kpm is not None:
         in_len = (~input_kpm).sum(dim=1).float()  # (B,)
     else:
