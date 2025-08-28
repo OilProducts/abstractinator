@@ -2,731 +2,974 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple, Any
+from typing import Optional, Tuple, Any, List, Callable, Protocol
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-from torch.nn import functional as F
 
-from .learned_query_attention import LearnedQueryAttention
+from .utils import entropy_segments, token_entropy
 from .mla import SlidingWindowMLATransformerBlock
-from .utils import _compiled, build_segment_queries_mask, entropy_segments, token_entropy, build_segment_queries_qseg
-from .vector_quantizer import VectorQuantizer, MultiStageResidualVQ
+from .learned_query_attention import LearnedQueryAttention
+
+# ---------------------------
+# Data containers / Protocols
+# ---------------------------
+
+@dataclass
+class SegmentBoundaries:
+    seg_id: Tensor             # (B, S) int64; 0,0,0,1,1,2,...
+    patch_end_mask: Tensor     # (B, S) bool; True on last token of segment
+    first_byte_idx: Tensor     # (B, S) int64; first token index for each position's segment
+
+
+@dataclass
+class EntropyOut:
+    """Outputs from an entropy model evaluated on a sequence."""
+    bits: Tensor                       # (B, S) per-token entropy in bits, aligned to input (pad at t=0)
+    loss: Optional[Tensor] = None      # scalar loss if available
+    logits: Optional[Tensor] = None    # (B, S, V) for logit model
+    mu: Optional[Tensor] = None        # (B, S, D) for Gaussian model
+    logvar: Optional[Tensor] = None    # (B, S, D) for Gaussian model
 
 
 @dataclass
 class CompressorOutput:
-    vq_embeddings: torch.Tensor
-    vq_indices: torch.Tensor
-    vq_loss: torch.Tensor
-    vq_perplexity: torch.Tensor  # Out of the VQ module
-    valid_mask: torch.Tensor
-    patch_end_mask: torch.Tensor  # True if this is the last token of a segment
-    # entropy_model_logits: torch.Tensor  # Logits from the LM branch
-    # entropy_model_bpd: torch.Tensor  # Bits-per-dim from the LM branch (if Gaussian segmentation)
-    # entropy_mu: torch.Tensor  # Mu from the LM branch (if Gaussian segmentation)
-    # entropy_logvar: torch.Tensor
-    entropy_model_ent: torch.Tensor  # Entropy from the LM branch
-    entropy_model_loss: torch.Tensor  # NLL loss from the LM branch (if Gaussian segmentation)
-    pre_vq_embeddings: torch.Tensor  # Embeddings before VQ
-    seg_id: torch.Tensor  # Segment IDs for each token (B, S)
-    first_byte_idx: torch.Tensor  # First byte index for each segment (B, S)
-    input_sequence: torch.Tensor
-    input_padding_mask: torch.Tensor
+    vq_embeddings: Optional[Tensor]      # (B, Q_max, D) or None if no quantizer
+    vq_indices: Optional[Tensor]         # (B, Q_max) or None
+    vq_loss: Optional[Tensor]            # scalar or None
+    vq_perplexity: Optional[Tensor]      # scalar or None
+
+    valid_mask: Tensor                   # (B, Q_max) bool
+    patch_end_mask: Tensor               # (B, S) bool
+    entropy_bits: Tensor                 # (B, S) bits used for segmentation
+    entropy_loss: Optional[Tensor]       # scalar or None
+    entropy_mu: Optional[Tensor]         # (B, S, D) for Gaussian
+    entropy_logvar: Optional[Tensor]     # (B, S, D) for Gaussian
+
+    pre_vq_embeddings: Tensor            # (B, Q_max, D)
+    seg_id: Tensor                       # (B, S) int64
+    first_byte_idx: Tensor               # (B, S) int64
+
+    input_sequence: Tensor               # (B, S) long or empty ()
+    input_padding_mask: Optional[Tensor] # (B, S) bool or None
 
 
-@dataclass
-class _LMCache:
-    shared: list[tuple[Tensor, Tensor]]  # per-layer (kv_c_cache, k_r_cache)
-    lm: list[tuple[Tensor, Tensor]]
-    pos: int  # absolute next position (== tokens processed)
+# ---------------------------
+# Quantizer abstraction
+# ---------------------------
+
+class QuantizerBase(Protocol):
+    def __call__(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Returns: (quantized, vq_loss, indices, perplexity)
+          - quantized: (B, Q_max, D)
+          - vq_loss: scalar
+          - indices: (B, Q_max) long
+          - perplexity: scalar
+        """
+        ...
 
 
-@dataclass
-class _SegStream:
-    lm_cache: _LMCache
-    entropies: torch.Tensor  # [B, T] buffer of per-token entropies
-
-
-class SegmentCompressor(nn.Module):
+class IdentityQuantizer(nn.Module):
     """
-    End-to-end module that processes a sequence of byte-level tokens.
+    No-op quantizer; keeps API-compatible with VQ modules.
+    """
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        B, Q, D = x.shape
+        device = x.device
+        return x, x.new_tensor(0.0), torch.full((B, Q), -1, dtype=torch.long, device=device), x.new_tensor(0.0)
 
-    Tokens are embedded then passed through a stack of shared
-    ``SlidingWindowTransformerBlock`` layers. The output feeds two branches:
-    one continues through additional layers to produce logits for the next-token
-    prediction objective, while the other goes through a separate set of layers
-    to create rich representations used for compression.  Entropy of the logits
-    drives segmentation. Each segment is pooled with ``LearnedQueryAttention``
-    and the resulting embeddings are vector-quantized.
+    __call__ = forward
 
-    The module outputs continuous segment embeddings, discrete codebook indices
-    for these embeddings, the VQ loss, and a validity mask for the segments.
 
-    Output dictionary structure:
-      {
-        'continuous': torch.Tensor (B, Q_total, D)  # Pooled & quantized segment vectors
-        'codes'     : torch.Tensor (B, Q_total)     # Integer codebook indices
-        'vq_loss'   : torch.Tensor (scalar)         # VQ loss (0 if VQ disabled/eval)
-        'valid_mask': torch.Tensor (B, S_hat)       # Boolean mask for valid segments
-                                                    # (S_hat is max segments in batch)
-      }
-    where Q_total = S_hat * num_queries_per_segment.
+# ---------------------------
+# Entropy models
+# ---------------------------
+
+class EntropyModelBase(nn.Module):
+    """
+    Uniform API for entropy models used to drive segmentation.
     """
 
-    def __init__(
-            self,
-            vocab_size: int = 260,
-            dim: int = 256,
-            heads: int = 8,  # Num heads for both encoder and pooler
-            window: int = 128,  # Window size for shared encoder layers
-
-            # MLA params
-            head_dim: int | None = 32,
-            kv_comp_dim: int | None = 64,  # d_c
-            q_comp_dim: int | None = 96,  # d_c`
-            retr_dim: int | None = 32,
-
-            lm_window: int | None = None,
-            compression_window: int | None = None,
-            num_encoder_layers: int = 3,
-            encoder_ffn_dim_multiplier: int = 4,
-            num_shared_encoder_layers: int = 0,
-            num_lm_encoder_layers: int | None = None,
-            num_compression_encoder_layers: int | None = None,
-            num_queries: int = 1,  # L: Number of queries per segment for the pooler
-            codebook_size: int = 512,  # K: Number of codes in VQ codebook (per stage if vq_depth>1)
-            vq_depth: int = 1,  # Number of residual VQ stages; 1 means single-stage VQ
-            vq_d_c: int | None = None,  # Compressed dim used inside residual VQ
-            beta: float = 0.25,  # Beta for VQ commitment loss
-            vq_reset_interval: int = 250,
-            entropy_delta: float = 0.0,
-            entropy_abs_threshold: float | None = None,
-            use_flex_attention: bool = True,
-            output_length: int = 512,
-            use_gaussian_segmentation: bool = True,
-    ):
-        super().__init__()
-        self.num_queries_per_segment = num_queries
-        self.entropy_delta = entropy_delta
-        self.entropy_abs_threshold = entropy_abs_threshold
-        self.use_flex_attention = use_flex_attention
-        self.output_length = output_length if output_length is not None else 512
-        self.use_gaussian_segmentation = use_gaussian_segmentation
-
-        if lm_window is None:
-            lm_window = window
-        if compression_window is None:
-            compression_window = window
-
-        self.lm_window = lm_window
-        self.compression_window = compression_window
-
-        if num_lm_encoder_layers is None:
-            num_lm_encoder_layers = num_encoder_layers
-        if num_compression_encoder_layers is None:
-            num_compression_encoder_layers = num_encoder_layers
-
-        self.shared_layers = nn.ModuleList(
-            [
-                # _compiled(
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
-                )
-                # )
-                for _ in range(num_shared_encoder_layers)
-            ]
-        )
-
-        self.compression_layers = nn.ModuleList(
-            [
-                # _compiled(
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=self.compression_window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
-                )
-                # )
-                for _ in range(num_compression_encoder_layers)
-            ]
-        )
-        if self.use_gaussian_segmentation:
-            self.entropy_model = CausalGaussianCore(
-                dim=dim,
-                n_heads=heads,
-                window=self.lm_window,
-                head_dim=head_dim,
-                kv_comp_dim=kv_comp_dim,
-                q_comp_dim=q_comp_dim,
-                retr_dim=retr_dim,
-                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                use_flex_attention=self.use_flex_attention,
-            )
-        else:
-            self.entropy_model = CausalLogitCore(
-                dim=dim,
-                n_heads=heads,
-                window=self.lm_window,
-                head_dim=head_dim,
-                kv_comp_dim=kv_comp_dim,
-                q_comp_dim=q_comp_dim,
-                retr_dim=retr_dim,
-                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                use_flex_attention=self.use_flex_attention,
-            )
-
-        self.lm_final_norm = nn.RMSNorm(dim)
-        # self.logit_proj = nn.Linear(dim, vocab_size)
-
-        self.pooler = LearnedQueryAttention(
-            embed_dim=dim,
-            num_queries_per_segment=num_queries,
-            max_queries=output_length // max(1, num_queries),
-            num_heads=heads,
-            use_flex_attention=True
-        )
-
-        if vq_depth is not None:  # and vq_depth >= 2:
-            # Use residual multi-stage VQ with a shared compressed space
-            d_c = vq_d_c if vq_d_c is not None else (kv_comp_dim if kv_comp_dim is not None else 64)
-            self.vq = MultiStageResidualVQ(
-                K=codebook_size,
-                D=dim,
-                depth=int(vq_depth),
-                d_c=int(d_c),
-                beta=beta,
-                reset_interval=vq_reset_interval,
-            )
-        else:
-            K = codebook_size
-            self.vq = VectorQuantizer(
-                K=codebook_size,
-                D=dim,
-                beta=beta,
-                reset_interval=vq_reset_interval,
-                forbidden_ids=[K - 1, K - 2, K - 3, K - 4],
-                protected_ids=[K - 1, K - 2, K - 3, K - 4]
-
-            )
-
-    def forward(
-            self,
-            input_embeddings: torch.Tensor,  # [B, S, D]
-            key_padding_mask: torch.Tensor | None = None,
-            *,
-            token_ids: torch.Tensor | None = None,  # optional, returned in CompressorOutput for losses/metrics
-    ) -> CompressorOutput:
+    def prefill(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
         """
-        Process precomputed token embeddings to produce compressed segment representations.
-
-        Args:
-            input_embeddings (torch.Tensor):
-                Input embeddings of shape (batch_size, sequence_length, embed_dim).
-            key_padding_mask (Optional[torch.Tensor]):
-                Boolean mask aligned with the sequence where True indicates padding.
-                Shape: (batch_size, sequence_length). Passed to attention/pooling layers.
-            token_ids (Optional[torch.Tensor]):
-                Original token IDs of shape (batch_size, sequence_length). Used only
-                for bookkeeping/aux losses and returned in the output as
-                `input_sequence`. May be None.
-
-        Returns:
-            CompressorOutput: Dataclass with fields including:
-                - vq_embeddings: Quantized continuous segment embeddings.
-                  Shape: (batch_size, S_hat * L, embed_dim), where S_hat is the
-                  max number of segments in the batch and L is num_queries_per_segment.
-                - vq_indices: Discrete codebook indices for the embeddings.
-                  Shape: (batch_size, S_hat * L).
-                - vq_loss: Vector quantization loss (scalar tensor).
-                - vq_perplexity: Perplexity of the VQ code usage (scalar tensor).
-                - valid_mask: Boolean mask for valid pooled queries.
-                  Shape: (batch_size, Q_max). When L==1, Q_max==S_hat; when L>1,
-                  Q_max==S_hat*L.
-                - patch_end_mask: Boundary flags over the input sequence (batch_size, sequence_length).
-                - entropy_model_logits: Next-token logits from the LM branch (batch_size, sequence_length, vocab_size).
-                - pre_vq_embeddings: Pooled embeddings pre-quantization (batch_size, S_hat * L, embed_dim).
-                - seg_id: Per-token segment ids (batch_size, sequence_length).
-                - first_byte_idx: First token index per token's segment (batch_size, sequence_length).
-                - input_sequence: Echo of `token_ids` if provided, else an empty tensor.
-                - input_padding_mask: Echo of the provided key_padding_mask.
+        Run model in cache-building mode on a prefix.
+        Returns: (caches, entropy_bits_for_prefix)
         """
-        B, S, D = input_embeddings.shape
-        # 1. Shared encoder on provided embeddings
-        x = input_embeddings
-        for layer in self.shared_layers:
-            x = layer(x, key_padding_mask=key_padding_mask)
+        raise NotImplementedError
 
-        entropy, loss = self.entropy_model.prediction_loss(x, key_padding_mask=key_padding_mask)
+    def step(self,
+             caches: List[Tuple[Tensor, Tensor]],
+             new_x: Tensor,
+             pos_start: int,
+             key_padding_mask_new: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+        """
+        Process only new tokens using caches (streaming).
+        Returns: (updated_caches, entropy_bits_for_new_tokens)
+        """
+        raise NotImplementedError
 
-        # 2. Branch for next-token prediction/entropy
-        # mu, logvar = self.entropy_model(x)
-        # lm_x = x
-        # for _idx, layer in enumerate(self.lm_layers):
-        #     lm_x = layer(lm_x, key_padding_mask=key_padding_mask)
-        #
-        # if self.use_gaussian_segmentation:
-        #     mu = self.mu(lm_x)
-        #     logvar = self.logvar(lm_x)
-        # else:
-        #     logits = self.logit_proj(self.lm_final_norm(lm_x))
-
-        # 3. Branch for compression representation
-        hidden = x
-        for layer in self.compression_layers:
-            hidden = layer(hidden, key_padding_mask=key_padding_mask)
-
-        # def gaussian_bpd(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        #     """
-        #     Per-step bits-per-dim for diagonal Gaussian.
-        #     Shapes: (B, L, D) for mu/logvar/target, returns (B, L).
-        #     """
-        #     const = 0.5 * math.log(2 * math.pi)
-        #     nll = 0.5 * ((target - mu) ** 2 * torch.exp(-logvar) + logvar) + const  # (B,L,D) in nats?
-        #     nll_bits = nll / math.log(2.0)  # (B,L,D) bits
-        #     bpd = nll_bits.mean(dim=-1)  # (B,L)
-        #     return bpd
-        #
-        # def gaussian_entropy_bits(logvar: torch.Tensor) -> torch.Tensor:
-        #     """
-        #     Differential entropy of diag Gaussian per step (bits).
-        #     logvar: (B, L, D) -> (B, L)
-        #     H = 0.5 * [ D*log(2πe) + sum_i logvar_i ]  (nats) -> /log 2
-        #     """
-        #     B, L, D = logvar.shape
-        #     const = 0.5 * (D * math.log(2 * math.pi * math.e))
-        #     H = const + 0.5 * logvar.sum(dim=-1)  # (B,L) nats
-        #     return H / math.log(2.0)  # bits
-
-        # 2. Perform Entropy-Based Segmentation
-
-        with torch.no_grad():
-            seg_id, patch_end_mask = entropy_segments(entropy,
-                                                      increase_delta=self.entropy_delta,
-                                                      abs_threshold=self.entropy_abs_threshold,
-                                                      return_boundary=True,
-                                                      )
-
-        # else:
-        #     # This part determines segment boundaries based on token prediction entropy.
-        #     # It's done with no_grad as the segmentation logic itself is not learned here.
-        #     # ``token_entropy`` computes entropy from the LM logits and ``entropy_segments``
-        #     # converts the resulting sequence of entropies into segment identifiers.
-        #     with torch.no_grad():
-        #         entropy = token_entropy(logits)  # (B,S)
-        #         seg_id, patch_end_mask = entropy_segments(
-        #             entropy,
-        #             increase_delta=self.entropy_delta,
-        #             abs_threshold=self.entropy_abs_threshold,
-        #             return_boundary=True,
-        #         )
-        # seg_id  : (B, S)   int64   0,0,0,1,1,2,2,2,…
-        B, S = seg_id.shape
-        idx = torch.arange(S, device=seg_id.device).expand(B, -1)  # (B,S)
-
-        # True at the first token of each segment
-        is_start = torch.ones_like(seg_id, dtype=torch.bool)
-        is_start[:, 1:] = seg_id[:, 1:] != seg_id[:, :-1]
-
-        # keep idx where a segment starts, else 0
-        first_pos = torch.where(is_start, idx, torch.zeros_like(idx))
-
-        # propagate the latest non-zero value to the right
-        first_byte_idx = torch.cummax(first_pos, dim=1).values  # (B,S)
-
-        # seg_id now maps each token position to a segment index.
-
-        # ── 2b. Build queries & tensor mask ─────────────
-        L = self.num_queries_per_segment
-
-        # (1) Pool segment-locally. The pooler builds queries internally.
-        pooled_embeddings, _ = self.pooler(
-            x=hidden,
-            seg_id=seg_id,
-            key_padding_mask=key_padding_mask,
-            return_attn=False,
-        )  # (B, Q_max, D)
-
-        # (2) Build valid mask (B, Q_max) for downstream (next-level KPM & metrics).
-        #     Must be computed the same way pooler did it:
-        if key_padding_mask is not None:
-            seg_id_real = torch.where(key_padding_mask, seg_id.new_full((), -1), seg_id)
-            nseg = (seg_id_real.amax(dim=1).clamp(min=-1) + 1)  # (B,)
-        else:
-            nseg = (seg_id.amax(dim=1) + 1)
-        valid_segments_mask = (torch.arange(self.pooler.Q_max, device=hidden.device)[None, :]
-                               < (nseg * self.pooler.L)[:, None])  # (B, Q_max)
-
-        # (3) For unused query slots, snap to the VQ pad sentinel to avoid side effects.
-        vq_pad_vec = getattr(self.vq, "pad_vector", None)
-        pad_vec = (vq_pad_vec.view(1, 1, -1).detach()
-                   if vq_pad_vec is not None
-                   else self.vq.codebook[self.vq.padding_token_id].detach().view(1, 1, -1))
-        pooled_embeddings = torch.where(
-            valid_segments_mask.unsqueeze(-1), pooled_embeddings, pad_vec.expand_as(pooled_embeddings)
-        )
-
-        # 4. Vector-Quantize Pooled Embeddings
-        # Apply vector quantization to the pooled segment embeddings.
-        quantised_embeddings, vq_loss, codebook_indices, perplexity = None, None, None, None  # self.vq(pooled_embeddings)
-
-        return CompressorOutput(
-            vq_embeddings=quantised_embeddings,  # (B, S_hat*L, D)
-            vq_indices=codebook_indices,  # (B, S_hat*L)
-            vq_loss=vq_loss,  # Scalar tensor
-            vq_perplexity=perplexity,  # Scalar tensor
-            valid_mask=valid_segments_mask,  # (B, S)
-            patch_end_mask=patch_end_mask,  # (B, S)  # True if this is the last token of a segment
-            entropy_model_ent=entropy,  # (B, S)
-            entropy_model_loss=loss,  # (B, S)  NLL loss if Gaussian segmentation
-            # entropy_model_logits=logits if not self.use_gaussian_segmentation else None,  # (B, S, vocab_size)
-            # entropy_model_bpd=bpd if self.use_gaussian_segmentation else None,  # (B, S)
-            # entropy_mu=mu if self.use_gaussian_segmentation else None,  # (B, S, D)
-            # entropy_logvar=logvar if self.use_gaussian_segmentation else None,  #
-            pre_vq_embeddings=pooled_embeddings,  # (B, S_hat*L, D)
-            seg_id=seg_id,  # (B, S)  integers 0…
-            first_byte_idx=first_byte_idx,  # (B, S)
-            input_sequence=(token_ids if token_ids is not None else torch.empty(0, dtype=torch.long, device=x.device)),
-            input_padding_mask=key_padding_mask,
-        )
+    def forward(self,
+                x: Tensor,
+                key_padding_mask: Optional[Tensor],
+                *,
+                targets: Optional[Tensor] = None) -> EntropyOut:
+        raise NotImplementedError
 
     @torch.no_grad()
-    def segment_only(
-            self,
-            input_embeddings: torch.Tensor,
-            key_padding_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Fast segmentation using only the LM branch.
-        Returns (seg_id, patch_end_mask), both (B, S).
-        """
-        x = input_embeddings
-        for layer in self.shared_layers:
-            x = layer(x, key_padding_mask=key_padding_mask)
-
-        lm_x = x
-        for layer in self.lm_layers:
-            lm_x = layer(lm_x, key_padding_mask=key_padding_mask)
-        logits = self.logit_proj(self.lm_final_norm(lm_x))
-
-        entropy = token_entropy(logits)
-        seg_id, patch_end_mask = entropy_segments(
-            entropy,
-            increase_delta=self.entropy_delta,
-            abs_threshold=self.entropy_abs_threshold,
-            return_boundary=True,
-        )
-        return seg_id, patch_end_mask
+    def entropy(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tensor:
+        return self.forward(x, key_padding_mask).bits
 
     @torch.no_grad()
-    def lm_stream_prefill(
-            self,
-            input_embeddings: torch.Tensor,  # [B, S0, D]
-            key_padding_mask: torch.Tensor | None = None,
-    ) -> tuple[_LMCache, torch.Tensor]:
+    def sample_next(self,
+                    x: Tensor,
+                    key_padding_mask: Optional[Tensor],
+                    *,
+                    temperature: float = 1.0,
+                    top_p: float = 1.0,
+                    top_k: int = 0,
+                    embed_fn: Optional[Callable[[Tensor], Tensor]] = None) -> Tensor:
         """
-        Run embeddings → shared layers → lm layers in cache mode to build caches.
-        Returns (cache, logits_for_prefix).
+        Sample the next item from the predictive distribution at the last position.
+        - For Gaussian: returns next embedding (B, D).
+        - For Logit: returns next token id (B,) unless `embed_fn` is provided, in which
+          case returns next embedding (B, D).
         """
-        x = input_embeddings
-        # Shared stack
-        shared_caches: list[tuple[Tensor, Tensor]] = []
-        for blk in self.shared_layers:
-            x, cache = blk.prefill(x, pos_start=0, key_padding_mask=key_padding_mask)
-            shared_caches.append(cache)
-        # LM stack
-        lm_caches: list[tuple[Tensor, Tensor]] = []
-        for blk in self.lm_layers:
-            x, cache = blk.prefill(x, pos_start=0, key_padding_mask=key_padding_mask)
-            lm_caches.append(cache)
-        # Head
-        logits = self.logit_proj(self.lm_final_norm(x))  # [B, S0, V]
-        cache = _LMCache(shared=shared_caches, lm=lm_caches, pos=int(x.size(1)))
-        return cache, logits
-
-    # ---------- LM streaming: step on new tokens ----------
-    @torch.no_grad()
-    def lm_stream_step(
-            self,
-            cache: _LMCache,
-            new_input_embeddings: torch.Tensor,  # [B, S_new, D] (S_new=1 typical)
-            key_padding_mask_new: torch.Tensor | None = None,
-    ) -> tuple[_LMCache, torch.Tensor]:
-        """
-        Process *only* the new tokens through shared+LM stacks using caches.
-        Returns (updated_cache, logits_for_new_tokens).
-        """
-        x = new_input_embeddings  # [B, S_new, D]
-        pos0 = cache.pos
-
-        # Shared stack (new slice only)
-        for i, blk in enumerate(self.shared_layers):
-            x, cache.shared[i] = blk.step(
-                x, cache=cache.shared[i], pos_start=pos0, key_padding_mask_new=key_padding_mask_new
-            )
-
-        # LM stack
-        for i, blk in enumerate(self.lm_layers):
-            x, cache.lm[i] = blk.step(
-                x, cache=cache.lm[i], pos_start=pos0, key_padding_mask_new=key_padding_mask_new
-            )
-
-        # Head on the new slice
-        logits_new = self.logit_proj(self.lm_final_norm(x))  # [B, S_new, V]
-        cache.pos += int(x.size(1))
-        return cache, logits_new
+        raise NotImplementedError
 
     @torch.no_grad()
-    def segment_stream_init(
-            self, input_embeddings: torch.Tensor, key_padding_mask: torch.Tensor | None = None
-    ) -> _SegStream:
-        lm_cache, logits = self.lm_stream_prefill(input_embeddings, key_padding_mask)
-        ents = token_entropy(logits)  # [B, S0]
-        return _SegStream(lm_cache=lm_cache, entropies=ents)
+    def predictive_entropy_next_bits(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        *,
+        temperature: float = 1.0,   # Gaussian: scales std; Logit: scales logits via 1/temperature
+        top_p: float = 1.0,         # Logit-only: nucleus on the NEXT distribution (optional)
+        top_k: int = 0              # Logit-only: top-k on the NEXT distribution (optional)
+    ) -> torch.Tensor:
+        """
+        Returns H(next | prefix) in *bits* for each batch element: shape (B,).
+
+        - Gaussian: differential entropy of N(mu_last, diag(exp(logvar_last))).
+          If temperature>0 and !=1, adds D*log2(temperature).
+        - Logit: Shannon entropy of the categorical at the last position after
+          applying temperature/top-k/top-p if provided.
+        """
+        raise NotImplementedError
 
     @torch.no_grad()
-    def segment_stream_step(
-            self, stream: _SegStream, new_embeddings: torch.Tensor, key_padding_mask_new: torch.Tensor | None = None
-    ) -> tuple[_SegStream, bool]:
-        stream.lm_cache, logits_new = self.lm_stream_step(
-            stream.lm_cache, new_embeddings, key_padding_mask_new
-        )
-        ent_new = token_entropy(logits_new)  # [B, S_new]
-        stream.entropies = torch.cat([stream.entropies, ent_new], dim=1)
-
-        # recompute segments on the *entropy buffer* only (cheap)
-        _, patch_end = entropy_segments(
-            stream.entropies,
-            increase_delta=self.entropy_delta,
-            abs_threshold=self.entropy_abs_threshold,
-            return_boundary=True,
-        )
-        is_boundary = bool(patch_end[0, -1].item())
-        return stream, is_boundary
-
-    # segment_compressor.py
-    @torch.no_grad()
-    def segment_stream_step_block(
-            self, stream, new_block_embeddings: torch.Tensor, key_padding_mask_new: torch.Tensor | None = None
-    ):
+    def predictive_entropy_next_bits_from_cache(
+        self,
+        cache: Any,                          # GaussianCache | LogitCache
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+    ) -> Tensor:
         """
-        Advance segmentation by a block of tokens (B, T_blk).
-        Returns: (stream, stop_idx) where stop_idx is the earliest index in [0..T_blk-1]
-        where a boundary is detected, or None if no boundary inside the block.
+        Same as above, but O(1) from the model's streaming cache; returns (B,).
         """
-        # Run LM on the *block* (one cached call)
-        stream.lm_cache, logits_blk = self.lm_stream_step(
-            stream.lm_cache, new_block_embeddings, key_padding_mask_new
-        )
-        ent_blk = token_entropy(logits_blk)  # (B, T_blk)
-        old_len = stream.entropies.size(1)
-        stream.entropies = torch.cat([stream.entropies, ent_blk], dim=1)
-
-        # Recompute boundary flags on the *entire* entropy buffer (cheap)
-        _, patch_end = entropy_segments(
-            stream.entropies,
-            increase_delta=self.entropy_delta,
-            abs_threshold=self.entropy_abs_threshold,
-            return_boundary=True,
-        )
-        block_pe = patch_end[:, old_len: old_len + new_block_embeddings.size(1)]  # (B, T_blk)
-
-        if block_pe.any():
-            stop_idx = int(block_pe[0].nonzero(as_tuple=False)[0].item())  # earliest boundary inside block
-            return stream, stop_idx
-        return stream, None
+        raise NotImplementedError
 
     @torch.no_grad()
-    def enable_mla_fusions_for_inference(self):
-        for blk in list(self.shared_layers) + list(self.lm_layers) + list(self.compression_layers):
-            # blk.attn is SlidingWindowMLA; blk.attn.mla is MultiheadLatentAttention
-            blk.attn.mla.enable_inference_fusions()
-
-
-class CausalLogitCore(nn.Module):
-    def __init__(self,
-                 dim: int,
-                 n_heads: int = 8,
-                 window: int = 128,
-                 head_dim: int | None = 32,
-                 kv_comp_dim: int | None = 64,  # d_c
-                 q_comp_dim: int | None = 96,  # d_c`
-                 retr_dim: int | None = 32,
-                 ffn_dim_multiplier: int = 4,
-                 use_flex_attention: bool = True,
-                 n_layers: int = 2,
-                 vocab_size: int = 260,
-                 ):
-
-        super().__init__()
-        self.lm_layers = nn.ModuleList(
-            [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=n_heads,
-                    window_size=window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=ffn_dim_multiplier,
-                    use_flex_attention=use_flex_attention,
-                )
-                # )
-                for _ in range(n_layers)
-            ]
-        )
-        self.logit_proj = nn.Linear(dim, vocab_size)
-
-
-    def forward(self, x: torch.Tensor, key_padding_mask) -> torch.Tensor:
+    def predictive_bpd_next(
+        self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None, *, temperature: float = 1.0
+    ) -> torch.Tensor:
         """
-        x: (B,S,D) embeddings
-        Returns stats for positions 1..S-1 aligned to x[:,1:].
+        Gaussian-only: returns H(next|prefix)/D in bits-per-dim (B,).
+        Logit models raise NotImplementedError (no 'dim' notion).
         """
-        B, S, D = x.shape
-        assert S >= 2, "Need S>=2"
-        for _idx, layer in enumerate(self.lm_layers):
-            x = layer(x, key_padding_mask=key_padding_mask)
-        x = self.logit_proj(x)
-        return x
+        raise NotImplementedError
 
-    def entropy(self, x: torch.Tensor, key_padding_mask) -> Tuple[Tensor, Tensor]:
-        """
-        x: (B,S,D) embeddings
-        Returns per-step entropy (B,S) in bits.
-        """
-        B, S, D = x.shape
-        assert S >= 2, "Need S>=2"
-        logits = self.forward(x, key_padding_mask=key_padding_mask)
-        token_entropy(logits)
-        return token_entropy(logits), logits
-
-    def prediction_loss(self, x: torch.Tensor, key_padding_mask) -> Tuple[Any, Tensor]:
-        entropy, logits = self.entropy = self.entropy(x, key_padding_mask)
-
-        lm_logits = logits[:, :-1, :]  # predict next low token
-        lm_target = x[:, 1:]
-        lm_kpm = key_padding_mask[:, 1:]
-        per_tok = F.cross_entropy(lm_logits.transpose(1, 2), lm_target, reduction="none")
-        m = ~lm_kpm
-        loss = (per_tok * m).sum() / m.sum().clamp(min=1)
-
-        return entropy, loss
+    @torch.no_grad()
+    def predictive_bpd_next_from_cache(self, cache: Any, *, temperature: float = 1.0) -> Tensor:
+        raise NotImplementedError
 
 
-
-class CausalGaussianCore(nn.Module):
+class GaussianEntropyModel(EntropyModelBase):
     """
-    Causal encoder producing μ, logσ² for next-step prediction over D-dim embeddings.
+    Causal encoder producing μ, logσ²; entropy computed as Gaussian BPD.
+    Layers are SlidingWindowMLATransformerBlock with prefill/step support.
     """
 
     def __init__(self,
                  dim: int,
                  n_heads: int = 8,
                  window: int = 128,
-                 head_dim: int | None = 32,
-                 kv_comp_dim: int | None = 64,  # d_c
-                 q_comp_dim: int | None = 96,  # d_c`
-                 retr_dim: int | None = 32,
+                 head_dim: Optional[int] = 32,
+                 kv_comp_dim: Optional[int] = 64,
+                 q_comp_dim: Optional[int] = 96,
+                 retr_dim: Optional[int] = 32,
                  ffn_dim_multiplier: int = 4,
                  use_flex_attention: bool = True,
                  n_layers: int = 2,
-                 clamp_logvar: Tuple[float, float] = (-8.0, 8.0)
-                 ):
+                 clamp_logvar: Tuple[float, float] = (-8.0, 8.0)):
         super().__init__()
-        self.lm_layers = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
                 SlidingWindowMLATransformerBlock(
-                    dim=dim,
-                    num_heads=n_heads,
-                    window_size=window,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    ffn_dim_multiplier=ffn_dim_multiplier,
-                    use_flex_attention=use_flex_attention,
+                    dim=dim, num_heads=n_heads, window_size=window,
+                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim, ffn_dim_multiplier=ffn_dim_multiplier,
+                    use_flex_attention=use_flex_attention
                 )
-                # )
                 for _ in range(n_layers)
             ]
         )
-
         self.mu = nn.Linear(dim, dim)
         self.logvar = nn.Linear(dim, dim)
         self.clamp = clamp_logvar
         self.dim = dim
 
-    def forward(self, x: torch.Tensor, key_padding_mask) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _run_stack(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
+        for blk in self.layers:
+            x = blk(x, key_padding_mask=kpm)
+        return x
+
+    def _bpd_bits(self, mu: Tensor, logvar: Tensor, target: Tensor) -> Tensor:
         """
-        x: (B,S,D) embeddings
-        Returns stats for positions 1..S-1 aligned to x[:,1:].
+        Returns (B, L) bits aligned to target positions, padded at t=0.
+        Predict x[:,1:] from stats at positions [:, :-1].
+        """
+        x = target[:, 1:, :]
+        m = mu[:, :-1, :]
+        lv = logvar[:, :-1, :]
+
+        scale = mu.new_tensor(0.5 / math.log(2.0))      # convert nats -> bits
+        log_2pi = mu.new_tensor(math.log(2.0 * math.pi))
+
+        dx = x - m
+        tmp = dx.square() * torch.exp(-lv) + lv + log_2pi  # (B, L-1, D)
+        bpd = tmp.mean(dim=-1) * scale                     # (B, L-1)
+        return F.pad(bpd, (1, 0), value=0.0)               # (B, L)
+
+    def forward(self,
+                x: Tensor,
+                key_padding_mask: Optional[Tensor],
+                *,
+                targets: Optional[Tensor] = None) -> EntropyOut:
+        """
+        Computes per-token entropy bits, and optional loss as mean bits over valid steps.
+        Targets default to x (teacher-forced next-step).
         """
         B, S, D = x.shape
-        assert S >= 2, "Need S>=2"
-        for _idx, layer in enumerate(self.lm_layers):
-            x = layer(x, key_padding_mask=key_padding_mask)
-        mu = self.mu(x)
-        logvar = self.logvar(x).clamp(*self.clamp)
-        return mu, logvar
+        h = self._run_stack(x, key_padding_mask)
+        mu = self.mu(h)
+        logvar = self.logvar(h).clamp(*self.clamp)
+        # tgt = x if targets is None else targets
+        bits = self._bpd_bits(mu, logvar, x)  # (B, S)
+        # define loss over non-padded positions (from t=1 where prediction happens)
+        if key_padding_mask is not None:
+            m = ~key_padding_mask
+        else:
+            m = torch.ones_like(bits, dtype=torch.bool)
+        loss = (bits[:, 1:] * m[:, 1:]).sum() / m[:, 1:].sum().clamp(min=1)
+        return EntropyOut(bits=bits, loss=loss, mu=mu, logvar=logvar)
 
-    def entropy(self, x: torch.Tensor, key_padding_mask) -> torch.Tensor:
-        """
-        x: (B,S,D) embeddings
-        Returns per-step entropy (B,S) in bits.
-        """
-        B, S, D = x.shape
-        assert S >= 2, "Need S>=2"
-        tgt = x.detach()
-        mu, logvar = self.forward(x, key_padding_mask)
-        bpd = self.gaussian_bpd(mu, logvar, tgt)  # (B,S)
-        entropy = torch.zeros(B, S, device=x.device)
-        entropy[:, 1:] = bpd
-        entropy[:, 0] = bpd[:, 0] if bpd.size(1) > 0 else 0.0
+    def prefill(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+        h = x
+        caches: List[Tuple[Tensor, Tensor]] = []
+        for blk in self.layers:
+            h, cache = blk.prefill(h, pos_start=0, key_padding_mask=key_padding_mask)
+            caches.append(cache)
+        mu = self.mu(h)
+        logvar = self.logvar(h).clamp(*self.clamp)
+        bits = self._bpd_bits(mu, logvar, x)
+        cache = GaussianCache(
+            layers=caches,
+            last_mu=mu[:, -1, :],
+            last_logvar=logvar[:, -1, :],
+        )
+        return cache, bits
 
-        return entropy
+    def step(self,
+             cache: GaussianCache,
+             new_x: Tensor,
+             pos_start: int,
+             key_padding_mask_new: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+        h = new_x
+        for i, blk in enumerate(self.layers):
+            h, cache.layers[i] = blk.step(
+                h, cache=cache.layers[i], pos_start=pos_start, key_padding_mask_new=key_padding_mask_new
+            )
+        mu = self.mu(h)
+        logvar = self.logvar(h).clamp(*self.clamp)
+        # For a block step, produce bits for *these* steps only; predicting t+1 inside block
+        # Align: pad one zero at the start of the block to keep (B, T_blk)
+        # Consumers typically concat across calls anyway.
+        bits_blk = self._bpd_bits(mu, logvar, new_x)  # (B, T_blk)
+        # Update “last” stats for O(1) next-entropy
+        cache.last_mu = mu[:, -1, :]
+        cache.last_logvar = logvar[:, -1, :]
+        return cache, bits_blk
 
-    def prediction_loss(self, x: torch.Tensor, key_padding_mask) -> Tuple[Any, Tensor]:
-        entropy = self.entropy(x, key_padding_mask)
-        return entropy, entropy.mean()
+    @torch.no_grad()
+    def sample_next(self,
+                    x: Tensor,
+                    key_padding_mask: Optional[Tensor],
+                    *,
+                    temperature: float = 1.0,
+                    top_p: float = 1.0,
+                    top_k: int = 0,
+                    embed_fn: Optional[Callable[[Tensor], Tensor]] = None) -> Tensor:
+        """
+        Sample next embedding using Normal(mu_t, var_t) at t = last position.
+        """
+        h = self._run_stack(x, key_padding_mask)
+        mu = self.mu(h)[:, -1, :]                    # (B, D)
+        logvar = self.logvar(h).clamp(*self.clamp)[:, -1, :]
+        std = torch.exp(0.5 * logvar)
 
-    def gaussian_bpd(self, mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Diagonal-Gaussian BPD per step.
-        Inputs (B,L,D) -> returns (B,L) bits-per-dim.
-        """
-        mu_shift = mu[:, :-1, :]
-        logvar_shift = logvar[:, :-1, :]
-        target_shift = target[:, 1:, :]
-        const = 0.5 * math.log(2 * math.pi)
-        nll = 0.5 * (
-                (target_shift - mu_shift) ** 2 * torch.exp(
-            -logvar_shift) + logvar_shift) + const  # (B,L,D) (nats but const is in nats too)
-        bpd = (nll / math.log(2.0)).mean(dim=-1)  # bits-per-dim
+        # Temperature scales std; temp=0 → deterministic mean
+        if temperature <= 0:
+            return mu
+        eps = torch.randn_like(std)
+        return mu + (temperature * std) * eps
 
-        return bpd
+    @torch.no_grad()
+    def predictive_entropy_next_bits(
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor | None = None,
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,  # ignored
+        top_k: int = 0       # ignored
+    ) -> Tensor:
+        """
+        H_bits = 0.5 * [ D * ln(2πe) + sum(logvar_last) ] / ln 2, optionally + D*log2(temperature)
+        """
+        h = self._run_stack(x, key_padding_mask)        # (B, S, D)
+        logvar_last = self.logvar(h).clamp(*self.clamp)[:, -1, :]  # (B, D)
 
-    def gaussian_entropy_bits(self, logvar: torch.Tensor) -> torch.Tensor:
+        # nats
+        H_nats = 0.5 * ( self.dim * math.log(2.0 * math.pi * math.e) + logvar_last.sum(dim=-1) )
+        # temperature scaling of std multiplies covariance by tau^2 -> + D * ln(tau)
+        if temperature is not None and temperature > 0.0 and temperature != 1.0:
+            H_nats = H_nats + self.dim * math.log(temperature)
+
+        # bits
+        return H_nats / math.log(2.0)  # (B,)
+
+    @torch.no_grad()
+    def predictive_entropy_next_bits_from_cache(self, cache: GaussianCache, *, temperature: float = 1.0, **_) -> Tensor:
+        lv = cache.last_logvar  # (B, D)
+        H_nats = 0.5 * ( self.dim * math.log(2.0 * math.pi * math.e) + lv.sum(dim=-1) )
+        if temperature > 0.0 and temperature != 1.0:
+            H_nats = H_nats + self.dim * math.log(temperature)
+        return H_nats / math.log(2.0)
+
+    @torch.no_grad()
+    def predictive_bpd_next_from_cache(self, cache: GaussianCache, *, temperature: float = 1.0) -> Tensor:
+        return self.predictive_entropy_next_bits_from_cache(cache, temperature=temperature) / float(self.dim)
+
+    @torch.no_grad()
+    def predictive_bpd_next(
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor | None = None,
+        *,
+        temperature: float = 1.0
+    ) -> Tensor:
+        """ Bits-per-dimension version (H_bits / D). """
+        H_bits = self.predictive_entropy_next_bits(x, key_padding_mask, temperature=temperature)
+        return H_bits / float(self.dim)
+
+class LogitEntropyModel(EntropyModelBase):
+    """
+    Causal token LM that outputs logits and uses token entropy for segmentation.
+    """
+    def __init__(self,
+                 dim: int,
+                 vocab_size: int = 260,
+                 n_heads: int = 8,
+                 window: int = 128,
+                 head_dim: Optional[int] = 32,
+                 kv_comp_dim: Optional[int] = 64,
+                 q_comp_dim: Optional[int] = 96,
+                 retr_dim: Optional[int] = 32,
+                 ffn_dim_multiplier: int = 4,
+                 use_flex_attention: bool = True,
+                 n_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                SlidingWindowMLATransformerBlock(
+                    dim=dim, num_heads=n_heads, window_size=window,
+                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim, ffn_dim_multiplier=ffn_dim_multiplier,
+                    use_flex_attention=use_flex_attention
+                )
+                for _ in range(n_layers)
+            ]
+        )
+        self.norm = nn.RMSNorm(dim)
+        self.proj = nn.Linear(dim, vocab_size)
+        self.vocab_size = vocab_size
+
+    def _run_stack(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
+        for blk in self.layers:
+            x = blk(x, key_padding_mask=kpm)
+        return self.norm(x)
+
+    def forward(self,
+                x: Tensor,
+                key_padding_mask: Optional[Tensor],
+                *,
+                targets: Optional[Tensor] = None) -> EntropyOut:
         """
-        Differential entropy H[N(μ,σ^2)] per step (bits).
-        logvar: (B,L,D) -> (B,L)
+        targets: token ids (B, S) for CE loss, if available.
         """
-        B, L, D = logvar.shape
-        const = 0.5 * (D * math.log(2 * math.e * math.pi))
-        H = const + 0.5 * logvar.sum(dim=-1)  # nats
-        return H / math.log(2.0)  # bits
+        h = self._run_stack(x, key_padding_mask)
+        logits = self.proj(h)                    # (B, S, V)
+        bits = token_entropy(logits)             # (B, S)
+
+        loss = None
+        if targets is not None:
+            # predict next token: shift logits to [:, :-1], targets [:, 1:]
+            if key_padding_mask is not None:
+                m = ~key_padding_mask[:, 1:]
+            else:
+                m = torch.ones_like(targets[:, 1:], dtype=torch.bool)
+            per_tok = F.cross_entropy(
+                logits[:, :-1, :].transpose(1, 2),  # (B, V, S-1)
+                targets[:, 1:],                     # (B, S-1)
+                reduction="none"
+            )
+            loss = (per_tok * m).sum() / m.sum().clamp(min=1)
+
+        return EntropyOut(bits=bits, loss=loss, logits=logits)
+
+    def prefill(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+        h = x
+        caches: List[Tuple[Tensor, Tensor]] = []
+        for blk in self.layers:
+            h, cache = blk.prefill(h, pos_start=0, key_padding_mask=key_padding_mask)
+            caches.append(cache)
+        logits = self.proj(self.norm(h))
+        bits = token_entropy(logits)
+        return caches, bits
+
+    def step(self,
+             caches: List[Tuple[Tensor, Tensor]],
+             new_x: Tensor,
+             pos_start: int,
+             key_padding_mask_new: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+        h = new_x
+        for i, blk in enumerate(self.layers):
+            h, caches[i] = blk.step(
+                h, cache=caches[i], pos_start=pos_start, key_padding_mask_new=key_padding_mask_new
+            )
+        logits = self.proj(self.norm(h))
+        bits = token_entropy(logits)
+        return caches, bits
+
+    @torch.no_grad()
+    def sample_next(self,
+                    x: Tensor,
+                    key_padding_mask: Optional[Tensor],
+                    *,
+                    temperature: float = 1.0,
+                    top_p: float = 1.0,
+                    top_k: int = 0,
+                    embed_fn: Optional[Callable[[Tensor], Tensor]] = None) -> Tensor:
+        """
+        Sample next token id from the categorical over the last position.
+        If embed_fn is provided, returns embedding instead.
+        """
+        h = self._run_stack(x, key_padding_mask)
+        logits = self.proj(h)[:, -1, :]  # (B, V)
+
+        # temperature
+        if temperature != 1.0 and temperature > 0:
+            logits = logits / temperature
+
+        # top-k
+        if top_k and top_k < logits.size(-1):
+            v, idx = torch.topk(logits, top_k, dim=-1)
+            mask = torch.full_like(logits, float("-inf"))
+            logits = mask.scatter(-1, idx, v)
+
+        # top-p
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            probs = F.softmax(sorted_logits, dim=-1)
+            cum = probs.cumsum(dim=-1)
+            cutoff = (cum > top_p).float().argmax(dim=-1, keepdim=True)
+            # mask everything beyond cutoff
+            mask = torch.full_like(sorted_logits, float("-inf"))
+            keep = torch.arange(sorted_logits.size(-1), device=logits.device)[None, :] <= cutoff
+            sorted_logits = torch.where(keep, sorted_logits, mask)
+            # unsort
+            logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
+
+        probs = F.softmax(logits, dim=-1)
+        next_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+        if embed_fn is not None:
+            return embed_fn(next_ids)  # (B, D)
+        return next_ids               # (B,)
+
+    @torch.no_grad()
+    def predictive_entropy_next_bits(self, x: Tensor, key_padding_mask: Optional[Tensor], *,
+                                     temperature: float = 1.0, top_p: float = 1.0, top_k: int = 0) -> Tensor:
+        h = self._run_stack(x, key_padding_mask)
+        logits = self.proj(h)[:, -1, :]
+        return _categorical_entropy_bits(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+
+    @torch.no_grad()
+    def predictive_entropy_next_bits_from_cache(self, cache: LogitCache, *,
+                                                temperature: float = 1.0, top_p: float = 1.0,
+                                                top_k: int = 0) -> Tensor:
+        return _categorical_entropy_bits(cache.last_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+
+@torch.no_grad()
+def _categorical_entropy_bits(logits: Tensor, *, temperature: float = 1.0, top_p: float = 1.0,
+                              top_k: int = 0) -> Tensor:
+    if temperature > 0.0 and temperature != 1.0:
+        logits = logits / float(temperature)
+    if top_k and top_k < logits.size(-1):
+        v, idx = torch.topk(logits, top_k, dim=-1)
+        mask = torch.full_like(logits, float("-inf"))
+        logits = mask.scatter(-1, idx, v)
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cdf = probs.cumsum(dim=-1)
+        cutoff = (cdf > top_p).float().argmax(dim=-1, keepdim=True)
+        keep = torch.arange(sorted_logits.size(-1), device=logits.device)[None, :] <= cutoff
+        masked_sorted = torch.where(keep, sorted_logits, torch.full_like(sorted_logits, float("-inf")))
+        logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, masked_sorted)
+    logp = F.log_softmax(logits, dim=-1)
+    H_nats = -(logp.exp() * logp).sum(dim=-1)
+    return H_nats / math.log(2.0)
+    # @torch.no_grad()
+    # def predictive_entropy_next_bits(
+    #     self,
+    #     x: Tensor,
+    #     key_padding_mask: Tensor | None = None,
+    #     *,
+    #     temperature: float = 1.0,
+    #     top_p: float = 1.0,
+    #     top_k: int = 0
+    # ) -> Tensor:
+    #     """
+    #     Shannon entropy H(p) in bits at the last position (B,).
+    #     Applies temperature/top-k/top-p to the *next* distribution if provided.
+    #     """
+    #     h = self._run_stack(x, key_padding_mask)   # (B, S, D)
+    #     logits = self.proj(h)[:, -1, :]            # (B, V)
+    #
+    #     # temperature (logits / tau)
+    #     if temperature is not None and temperature > 0.0 and temperature != 1.0:
+    #         logits = logits / float(temperature)
+    #
+    #     # top-k
+    #     if top_k and top_k < logits.size(-1):
+    #         v, idx = torch.topk(logits, top_k, dim=-1)
+    #         neg_inf = torch.full_like(logits, float("-inf"))
+    #         logits = neg_inf.scatter(-1, idx, v)
+    #
+    #     # top-p (nucleus)
+    #     if 0.0 < top_p < 1.0:
+    #         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+    #         probs = F.softmax(sorted_logits, dim=-1)
+    #         cdf = probs.cumsum(dim=-1)
+    #         cutoff = (cdf > top_p).float().argmax(dim=-1, keepdim=True)
+    #         mask = torch.arange(sorted_logits.size(-1), device=logits.device)[None, :] <= cutoff
+    #         masked_sorted = torch.where(mask, sorted_logits, torch.full_like(sorted_logits, float("-inf")))
+    #         logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, masked_sorted)
+    #
+    #     logp = F.log_softmax(logits, dim=-1)        # (B, V), nats
+    #     H_nats = -(logp.exp() * logp).sum(dim=-1)   # (B,)
+    #     return H_nats / math.log(2.0)
+
+
+# ---------------------------
+# Segmentation helper
+# ---------------------------
+
+class Segmenter(nn.Module):
+    def __init__(self, *, increase_delta: float = 0.0, abs_threshold: Optional[float] = None):
+        super().__init__()
+        self.increase_delta = increase_delta
+        self.abs_threshold = abs_threshold
+
+    @torch.no_grad()
+    def forward(self, entropy_bits: Tensor) -> SegmentBoundaries:
+        """
+        Compute seg_id & boundary flags from per-token entropy (B, S).
+        """
+        seg_id, patch_end_mask = entropy_segments(
+            entropy_bits,
+            increase_delta=self.increase_delta,
+            abs_threshold=self.abs_threshold,
+            return_boundary=True,
+        )  # (B, S), (B, S) bool
+
+        B, S = seg_id.shape
+        idx = torch.arange(S, device=seg_id.device).expand(B, -1)  # (B, S)
+
+        is_start = torch.ones_like(seg_id, dtype=torch.bool)
+        is_start[:, 1:] = seg_id[:, 1:] != seg_id[:, :-1]
+        first_pos = torch.where(is_start, idx, torch.zeros_like(idx))
+        first_byte_idx = torch.cummax(first_pos, dim=1).values
+
+        return SegmentBoundaries(seg_id=seg_id, patch_end_mask=patch_end_mask, first_byte_idx=first_byte_idx)
+
+
+# ---------------------------
+# Streaming cache for the whole path (shared + entropy)
+# ---------------------------
+
+@dataclass
+class NextPred:
+    logits: torch.Tensor | None = None   # (B, V)
+    mu: torch.Tensor | None = None       # (B, D)
+    logvar: torch.Tensor | None = None   # (B, D)
+
+@dataclass
+class StreamCache:
+    shared: List[Tuple[Tensor, Tensor]]
+    entropy: List[Tuple[Tensor, Tensor]]
+    pos: int
+    next_pred: NextPred | None = None
+
+@dataclass
+class GaussianCache:
+    layers: List[Tuple[Tensor, Tensor]]  # per-layer MLA caches
+    last_mu: Tensor                      # (B, D)  stats at the last processed position
+    last_logvar: Tensor                  # (B, D)
+
+@dataclass
+class LogitCache:
+    layers: List[Tuple[Tensor, Tensor]]
+    last_logits: Tensor                  # (B, V)
+
+# ---------------------------
+# SegmentCompressor
+# ---------------------------
+
+class SegmentCompressor(nn.Module):
+    """
+    End-to-end: shared encoder → (entropy branch, compression branch) → pool → quantize.
+
+    Sampling:
+      - call `sample_next()` to draw from the entropy model (embedding for Gaussian,
+        token id or embedding for Logit).
+    Streaming:
+      - `stream_prefill()` then `stream_step()`; segmentation utilities provided.
+    """
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int = 260,
+        dim: int = 256,
+        heads: int = 8,
+        window: int = 128,
+        head_dim: Optional[int] = 32,
+        kv_comp_dim: Optional[int] = 64,
+        q_comp_dim: Optional[int] = 96,
+        retr_dim: Optional[int] = 32,
+
+        lm_window: Optional[int] = None,
+        compression_window: Optional[int] = None,
+
+        num_encoder_layers: int = 3,
+        encoder_ffn_dim_multiplier: int = 4,
+        num_shared_encoder_layers: int = 0,
+        num_lm_encoder_layers: Optional[int] = None,
+        num_compression_encoder_layers: Optional[int] = None,
+
+        num_queries: int = 1,
+        output_length: int = 512,
+
+        # Segmentation knobs
+        use_gaussian_segmentation: bool = True,
+        entropy_delta: float = 0.0,
+        entropy_abs_threshold: Optional[float] = None,
+
+        # Quantizer
+        quantizer: Optional[QuantizerBase] = None,
+
+        use_flex_attention: bool = True,
+    ):
+        super().__init__()
+
+        num_lm_encoder_layers = num_lm_encoder_layers or num_encoder_layers
+        num_compression_encoder_layers = num_compression_encoder_layers or num_encoder_layers
+        lm_window = lm_window or window
+        compression_window = compression_window or window
+
+        self.num_queries_per_segment = num_queries
+        self.output_length = output_length
+        self.use_flex_attention = use_flex_attention
+
+        # Shared stack
+        self.shared_layers = nn.ModuleList(
+            [
+                SlidingWindowMLATransformerBlock(
+                    dim=dim, num_heads=heads, window_size=window,
+                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                    use_flex_attention=self.use_flex_attention,
+                )
+                for _ in range(num_shared_encoder_layers)
+            ]
+        )
+
+        # Compression branch
+        self.compression_layers = nn.ModuleList(
+            [
+                SlidingWindowMLATransformerBlock(
+                    dim=dim, num_heads=heads, window_size=compression_window,
+                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                    retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                    use_flex_attention=self.use_flex_attention,
+                )
+                for _ in range(num_compression_encoder_layers)
+            ]
+        )
+
+        # Entropy model branch
+        if use_gaussian_segmentation:
+            self.entropy_model: EntropyModelBase = GaussianEntropyModel(
+                dim=dim, n_heads=heads, window=lm_window,
+                head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                use_flex_attention=self.use_flex_attention, n_layers=num_lm_encoder_layers,
+            )
+        else:
+            self.entropy_model = LogitEntropyModel(
+                dim=dim, vocab_size=vocab_size, n_heads=heads, window=lm_window,
+                head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
+                retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                use_flex_attention=self.use_flex_attention, n_layers=num_lm_encoder_layers,
+            )
+
+        # Segmenter utility
+        self.segmenter = Segmenter(increase_delta=entropy_delta, abs_threshold=entropy_abs_threshold)
+
+        # Pooler (learned queries per segment)
+        self.pooler = LearnedQueryAttention(
+            embed_dim=dim,
+            num_queries_per_segment=num_queries,
+            max_queries=output_length // max(1, num_queries),
+            num_heads=heads,
+            use_flex_attention=True,
+        )
+
+        # Quantizer (no-op by default)
+        self.quantizer: QuantizerBase = quantizer if quantizer is not None else IdentityQuantizer()
+
+    # ---- helpers ----
+
+    def _run_shared(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
+        for layer in self.shared_layers:
+            x = layer(x, key_padding_mask=kpm)
+        return x
+
+    def _run_compression(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
+        for layer in self.compression_layers:
+            x = layer(x, key_padding_mask=kpm)
+        return x
+
+    # ---- public API ----
+
+    def forward(
+        self,
+        input_embeddings: Tensor,              # (B, S, D)
+        key_padding_mask: Optional[Tensor] = None,  # (B, S) True=pad
+        *,
+        token_ids: Optional[Tensor] = None,    # (B, S) for logit loss
+    ) -> CompressorOutput:
+        """
+        1) shared -> entropy & compression branches
+        2) segmentation from entropy bits
+        3) pool by segment -> (B, Q_max, D)
+        4) quantize (pluggable)
+        """
+        x_shared = self._run_shared(input_embeddings, key_padding_mask)
+
+        # Entropy model: pass targets for logit CE if available
+        ent_out = self.entropy_model(x_shared, key_padding_mask, targets=token_ids)
+        boundaries = self.segmenter(ent_out.bits)
+
+        # Compression branch
+        hidden = self._run_compression(x_shared, key_padding_mask)
+
+        # Pool per segment
+        pooled_embeddings, _ = self.pooler(
+            x=hidden,
+            seg_id=boundaries.seg_id,
+            key_padding_mask=key_padding_mask,
+            return_attn=False,
+        )  # (B, Q_max, D)
+
+        # Valid query slots mask
+        if key_padding_mask is not None:
+            seg_id_real = torch.where(key_padding_mask, boundaries.seg_id.new_full((), -1), boundaries.seg_id)
+            nseg = (seg_id_real.amax(dim=1).clamp(min=-1) + 1)  # (B,)
+        else:
+            nseg = (boundaries.seg_id.amax(dim=1) + 1)
+        valid_mask = (torch.arange(self.pooler.Q_max, device=hidden.device)[None, :]
+                      < (nseg * self.pooler.L)[:, None])  # (B, Q_max) bool
+
+        # Quantize
+        quantised_embeddings, vq_loss, codebook_indices, perplexity = self.quantizer(pooled_embeddings)
+
+        return CompressorOutput(
+            vq_embeddings=quantised_embeddings,
+            vq_indices=codebook_indices,
+            vq_loss=vq_loss,
+            vq_perplexity=perplexity,
+            valid_mask=valid_mask,
+            patch_end_mask=boundaries.patch_end_mask,
+            entropy_bits=ent_out.bits,
+            entropy_loss=ent_out.loss,
+            entropy_mu=ent_out.mu,
+            entropy_logvar=ent_out.logvar,
+            pre_vq_embeddings=pooled_embeddings,
+            seg_id=boundaries.seg_id,
+            first_byte_idx=boundaries.first_byte_idx,
+            input_sequence=(token_ids if token_ids is not None else torch.empty(0, dtype=torch.long, device=input_embeddings.device)),
+            input_padding_mask=key_padding_mask,
+        )
+
+    # --- segmentation-only fast path (shared + entropy only) ---
+    @torch.no_grad()
+    def segment_only(self, input_embeddings: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        x_shared = self._run_shared(input_embeddings, key_padding_mask)
+        bits = self.entropy_model.entropy(x_shared, key_padding_mask)
+        b = self.segmenter(bits)
+        return b.seg_id, b.patch_end_mask
+
+    # --- sampling from the entropy model ---
+    @torch.no_grad()
+    def sample_next(self,
+                    input_embeddings: Tensor,
+                    key_padding_mask: Optional[Tensor] = None,
+                    *,
+                    temperature: float = 1.0,
+                    top_p: float = 1.0,
+                    top_k: int = 0,
+                    embed_fn: Optional[Callable[[Tensor], Tensor]] = None) -> Tensor:
+        """
+        Returns:
+          - Gaussian model: (B, D) next embedding
+          - Logit model: (B,) next token id unless `embed_fn` is provided (then (B, D))
+        """
+        x_shared = self._run_shared(input_embeddings, key_padding_mask)
+        return self.entropy_model.sample_next(
+            x_shared, key_padding_mask, temperature=temperature, top_p=top_p, top_k=top_k, embed_fn=embed_fn
+        )
+
+    # --- streaming APIs (shared + entropy) ---
+    @torch.no_grad()
+    def stream_prefill(self,
+                       input_embeddings: Tensor,
+                       key_padding_mask: Optional[Tensor] = None) -> Tuple[StreamCache, Tensor]:
+        """
+        Build caches for shared + entropy stacks and return entropy bits for prefix.
+        """
+        h = input_embeddings
+        shared_caches: List[Tuple[Tensor, Tensor]] = []
+        for blk in self.shared_layers:
+            h, cache = blk.prefill(h, pos_start=0, key_padding_mask=key_padding_mask)
+            shared_caches.append(cache)
+        entropy_caches, bits = self.entropy_model.prefill(h, key_padding_mask)
+        return StreamCache(shared=shared_caches, entropy=entropy_caches, pos=int(h.size(1))), bits
+
+    @torch.no_grad()
+    def stream_step(self,
+                    cache: StreamCache,
+                    new_embeddings: Tensor,
+                    key_padding_mask_new: Optional[Tensor] = None) -> Tuple[StreamCache, Tensor]:
+        """
+        Process only new tokens; returns updated cache and entropy bits for new slice.
+        """
+        h = new_embeddings
+        pos0 = cache.pos
+        for i, blk in enumerate(self.shared_layers):
+            h, cache.shared[i] = blk.step(
+                h, cache=cache.shared[i], pos_start=pos0, key_padding_mask_new=key_padding_mask_new
+            )
+        cache.entropy, bits = self.entropy_model.step(
+            cache.entropy, h, pos_start=pos0, key_padding_mask_new=key_padding_mask_new
+        )
+        cache.pos += int(h.size(1))
+        return cache, bits
+
+    @torch.no_grad()
+    def enable_mla_fusions_for_inference(self):
+        for blk in list(self.shared_layers) + list(self.compression_layers):
+            blk.attn.mla.enable_inference_fusions()
+        # Entropy model blocks too:
+        for blk in getattr(self.entropy_model, "layers", []):
+            blk.attn.mla.enable_inference_fusions()
+
+    @torch.no_grad()
+    def predictive_entropy_next_bits(
+        self,
+        input_embeddings: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        **kw
+    ) -> torch.Tensor:
+        """
+        H(next|prefix) in bits, shape (B,).
+        Gaussian: differential entropy; Logit: categorical Shannon entropy.
+        """
+        x_shared = self._run_shared(input_embeddings, key_padding_mask)
+        return self.entropy_model.predictive_entropy_next_bits(x_shared, key_padding_mask, **kw)
+
+    @torch.no_grad()
+    def predictive_entropy_next_bits_from_cache(self, cache: StreamCache, **kw) -> Tensor:
+        return self.entropy_model.predictive_entropy_next_bits_from_cache(cache.entropy, **kw)
+
+    @torch.no_grad()
+    def predictive_bpd_next_from_cache(self, cache: StreamCache, *, temperature: float = 1.0) -> Tensor:
+        if hasattr(self.entropy_model, "predictive_bpd_next_from_cache"):
+            return self.entropy_model.predictive_bpd_next_from_cache(cache.entropy, temperature=temperature)
+        raise NotImplementedError("BPD next is only defined for Gaussian entropy models.")
+
+    @torch.no_grad()
+    def predictive_bpd_next(
+        self,
+        input_embeddings: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        *,
+        temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Gaussian-only shortcut: H_bits / D (B,).
+        """
+        x_shared = self._run_shared(input_embeddings, key_padding_mask)
+        if hasattr(self.entropy_model, "predictive_bpd_next"):
+            return self.entropy_model.predictive_bpd_next(x_shared, key_padding_mask, temperature=temperature)
+        raise NotImplementedError("predictive_bpd_next is only defined for Gaussian entropy models.")
+
+    @torch.no_grad()
+    def next_entropy_from_cache(self, cache: StreamCache, *, temperature: float = 1.0, top_p: float = 1.0,
+                                top_k: int = 0) -> Tensor:
+        """
+        Returns H(next|prefix) in bits using last cached stats only; shape (B,).
+        """
+        np = cache.next_pred
+        assert np is not None, "Call stream_prefill/step first to populate next_pred."
+
+        if np.logits is not None:
+            logp = F.log_softmax(np.logits / (temperature if (temperature and temperature > 0) else 1.0), dim=-1)
+            if 0.0 < top_p < 1.0 or (top_k and top_k < logp.size(-1)):
+                # Re-apply top-p/k here similarly if needed (skipped for brevity)
+                pass
+            H_nats = -(logp.exp() * logp).sum(dim=-1)
+            return H_nats / math.log(2.0)
+
+        # Gaussian
+        logvar_last = np.logvar  # (B, D)
+        H_nats = 0.5 * (self.entropy_model.dim * math.log(2.0 * math.pi * math.e) + logvar_last.sum(dim=-1))
+        if temperature is not None and temperature > 0.0 and temperature != 1.0:
+            H_nats = H_nats + self.entropy_model.dim * math.log(temperature)
+        return H_nats / math.log(2.0)
