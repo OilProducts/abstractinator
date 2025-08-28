@@ -2,6 +2,7 @@ import torch
 
 from components.code_sequence_transformer import CodeSequenceTransformer
 from components.vector_quantizer import VectorQuantizer
+from configs.base_config import TopTransformerConfig
 
 
 def test_continuous_transformer_forward():
@@ -15,7 +16,13 @@ def test_continuous_transformer_forward():
         padding_token_id=0,
         eop_token_id=0,
     )
-    model = CodeSequenceTransformer(embed_dim=4, dim=8, num_layers=1, num_heads=1, vq=vq)
+    cfg = TopTransformerConfig(
+        embed_dim=4,
+        dim=8,
+        num_layers=1,
+        num_heads=1,
+    )
+    model = CodeSequenceTransformer(cfg, vq=vq)
     x = torch.randn(2, 3, 4)
     out = model(x)
     assert out["predictions_pre_vq"].shape == x.shape

@@ -395,6 +395,7 @@ def _build_time_keep_fn(window: int):
     return lambda _b, _h, q, k: (k <= q) & ((q - k) <= window)
 
 
+@torch._dynamo.disable()
 @lru_cache(maxsize=64)
 def _cached_flex_sliding_mask(seq_len: int, window: int, device):
     keep = _build_time_keep_fn(window)
@@ -414,7 +415,7 @@ class SlidingWindowMLA(nn.Module):
         self.o_proj = nn.Linear(mla_kwargs.get("dim_q"), mla_kwargs.get("dim_q"), bias=False)
 
     @staticmethod
-    @dynamo.disable
+    # @dynamo.disable
     def _make_block_mask(
         seq_len: int,
         window: int,
@@ -491,6 +492,102 @@ class SlidingWindowMLA(nn.Module):
         # optional hygiene: clear the attribute so nothing stale lingers
         self.mla._pad_for_scores = None
         return ctx
+
+
+    @staticmethod
+    @dynamo.disable
+    def _build_decode_block_mask(
+        q_len: int,
+        kv_len: int,
+        window: int,
+        pos_start: int,          # absolute position of first new query/key
+        device: torch.device,
+        block_size: int = 128,
+    ):
+        """
+        FlexAttention 'keep' mask for decode with caches.
+        keep iff key_abs <= query_abs and (query_abs - key_abs) <= window
+        where key_abs ∈ [0..kv_len-1], query_abs ∈ [pos_start..pos_start+q_len-1].
+        NOTE: use elementwise tensor ops (&), not Python 'and'.
+        """
+        def _keep(_b, _h, q, k):
+            # q, k are *tensor* index grids provided by create_block_mask/vmap
+            q_abs = q + pos_start          # tensor + int → tensor
+            return (k <= q_abs) & ((q_abs - k) <= window)
+
+        return create_block_mask(
+            _keep,
+            B=None, H=None,
+            Q_LEN=int(q_len), KV_LEN=int(kv_len),
+            BLOCK_SIZE=int(block_size),
+            device=device,
+        )
+
+    def forward_cached(
+        self,
+        x_new: Tensor,                               # [B, S_new, D]  (pre‑LN hidden to attend with)
+        *,
+        pos_start: int,                              # absolute pos index of x_new[:,0]
+        cache: tuple[Tensor, Tensor] | None = None,  # (kv_c_cache [B,Ltot,c], k_r_cache [B,H,Ltot,r])
+        key_padding_mask_new: Tensor | None = None,  # [B, S_new] True=pad
+        return_cache: bool = True,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """
+        Decode path that appends new keys and attends with caches.
+        Returns (context_new, updated_cache). Context is in model space (after o_proj).
+        """
+        B, S_new, _ = x_new.shape
+        dev = x_new.device
+
+        # Project new tokens into compressed K/V space
+        kv_c_new = self.kv_proj(x_new)
+        if key_padding_mask_new is not None:
+            kv_c_new = kv_c_new.masked_fill(key_padding_mask_new[..., None], 0.0)
+
+        # KV length prior to appending
+        L_old = 0 if cache is None else int(cache[0].size(1))
+        # Build a time‑window mask (Flex path); for torch fallback, leave None
+        block_mask = None
+        if self.mla.use_flex_attention:
+            block_mask = self._build_decode_block_mask(
+                q_len=S_new, kv_len=L_old + S_new,
+                window=self.window, pos_start=pos_start, device=dev
+            )
+
+        # Hand per‑key padding to MLA’s score_mod (cheap)
+        self.mla._pad_for_scores = key_padding_mask_new.to(torch.bool) if key_padding_mask_new is not None else None
+
+        # Hand a KV‑length pad mask to MLA’s score_mod (must be length L_old+S_new)
+        if key_padding_mask_new is not None:
+            B = x_new.size(0)
+
+            if L_old > 0:
+                pad_old = torch.zeros(B, L_old, dtype=torch.bool, device=dev)
+                pad_all = torch.cat([pad_old, key_padding_mask_new.to(torch.bool)], dim=1)  # (B, L_old+S_new)
+            else:
+                pad_all = key_padding_mask_new.to(torch.bool)
+            # sanity: match KV len
+
+            assert pad_all.size(1) == (L_old + S_new), (pad_all.size(), L_old, S_new)
+            self.mla._pad_for_scores = pad_all
+        else:
+            self.mla._pad_for_scores = None
+
+
+        # MLA does: rotate new keys at write‑time, append caches, rotate queries at read‑time
+        out_m = self.mla(
+            x_new, kv_c_new, block_mask=block_mask,
+            use_cache=True, pos_start=pos_start, cache=cache, return_cache=return_cache
+        )
+        if return_cache:
+            out, new_cache = out_m
+        else:
+            out, new_cache = out_m, None
+
+        # hygiene
+        self.mla._pad_for_scores = None
+
+        return out, new_cache
 
 
 
@@ -585,6 +682,50 @@ class SlidingWindowMLATransformerBlock(nn.Module):
         # Feed‑forward (Pre‑LN)
         x = x + self.ffn(self.norm2(x))
         return x
+
+
+    @torch.no_grad()
+    def prefill(
+        self,
+        x_block: Tensor,                         # [B, S0, D]  full prefix
+        *,
+        pos_start: int = 0,
+        key_padding_mask: Tensor | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """
+        Build caches for the whole prefix in one go (fast prefill).
+        Returns (y_block, cache) where y_block is the block output for the whole prefix.
+        """
+        q = self.norm1(x_block)
+        ctx, cache = self.attn.forward_cached(
+            q, pos_start=pos_start, cache=None,
+            key_padding_mask_new=key_padding_mask, return_cache=True
+        )
+        y = x_block + ctx
+        y = y + self.ffn(self.norm2(y))
+        return y, cache
+
+    @torch.no_grad()
+    def step(
+        self,
+        x_new: Tensor,                            # [B, S_new, D]  NEW tokens only (usually S_new=1)
+        *,
+        cache: tuple[Tensor, Tensor],
+        pos_start: int,                           # absolute index of x_new[:,0]
+        key_padding_mask_new: Tensor | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """
+        One streaming decode step (or micro‑batch of steps).
+        Returns (y_new, updated_cache) for just the new slice.
+        """
+        q = self.norm1(x_new)
+        ctx, cache = self.attn.forward_cached(
+            q, pos_start=pos_start, cache=cache,
+            key_padding_mask_new=key_padding_mask_new, return_cache=True
+        )
+        y = x_new + ctx
+        y = y + self.ffn(self.norm2(y))
+        return y, cache
 
 @torch._dynamo.disable()
 @lru_cache(maxsize=64)

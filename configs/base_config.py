@@ -78,7 +78,7 @@ class AbstractinatorConfig:
     # Shared / tokens
     #
     vocab_size: int = 260                     # byte-level at L0; for higher levels set to K_eff(prev)
-    D: int = 384                              # model dim for both compressor/expander
+    D: int = 512                              # model dim for both compressor/expander
     eos_id: int = 257
     eop_id: int = 259
     bos_id: int = 256
@@ -87,17 +87,17 @@ class AbstractinatorConfig:
     #
     # Compressor (encoder) hyperparams
     #
-    c_heads: int = 6
+    c_heads: int = 8
     c_window: int = 128
 
     c_head_dim: Optional[int] = 64  # if None, inferred as D / c_heads
-    c_kv_comp_dim: Optional[int] = 48  # d_c; if None, inferred as D / 2
-    c_q_comp_dim: Optional[int] = 96  # d_c`; if None, inferred as D * 3 / 4
-    c_retr_dim: Optional[int] = 16  # r; if None, inferred as D / 4
+    c_kv_comp_dim: Optional[int] = 64  # d_c; if None, inferred as D / 2
+    c_q_comp_dim: Optional[int] = 128  # d_c`; if None, inferred as D * 3 / 4
+    c_retr_dim: Optional[int] = 32  # r; if None, inferred as D / 4
 
-    c_num_encoder_layers: int = 3
+    c_num_encoder_layers: int = 6
     c_num_shared_encoder_layers: int = 0
-    c_num_lm_encoder_layers: Optional[int] = 14
+    c_num_lm_encoder_layers: Optional[int] = 4
     c_num_compression_encoder_layers: Optional[int] = None
     c_num_queries: int = 1                    # IMPORTANT: use 1 unless you wire seg-to-query mapping (see note)
     c_entropy_delta: float = 0.2
@@ -137,7 +137,7 @@ class AbstractinatorConfig:
 
 @dataclass
 class TopTransformerConfig:
-    embed_dim: int = 384
+    embed_dim: int = 512
     dim: int = 512
     num_layers: int = 16
     num_heads: int = 8
@@ -145,10 +145,13 @@ class TopTransformerConfig:
     continuous: bool = False  # When False, the top LM predicts discrete codes using cross-entropy
     mse_weight: float = 1.0  # Weight for the MSE component of the top LM loss
     ce_weight: float = 1 # Weight for the cross-entropy component of the top LM loss
-    head_dim: Optional[int] = 32  # K
+    #
+    # MLA params (mirror compressor settings in AbstractinatorConfig)
+    #
+    head_dim: Optional[int] = 64  # K
     kv_comp_dim: Optional[int] = 64  # d_c
-    q_comp_dim: Optional[int] = 96  # d_c`
-    retr_dim: Optional[int] = 64  # r
+    q_comp_dim: Optional[int] = 128  # d_c`
+    retr_dim: Optional[int] = 32  # r
     lm_window: Optional[int] = 128
     lm_fixed_length: Optional[int] = 1024  # Fixed length for the top LM input, will be padded if necessary
     lm_pad_id: int = 258
