@@ -25,7 +25,7 @@ __all__ = [
     "AbstractinatorPyramid",
 ]
 
-from .byte_segment_compressor import ByteSegmentCompressor as ByteSegmentCompressor
+from .segment_compressor import SegmentCompressor as SegmentCompressor
 from .checkpoint_utils import (
     load_base_components as load_base_components,
 )
@@ -37,7 +37,7 @@ from .swiglu import SwiGLU as SwiGLU
 from .tokenizer import ByteLevelTokenizer as ByteLevelTokenizer
 
 __all__ += [
-    "ByteSegmentCompressor",
+    "SegmentCompressor",
     "load_base_components",
     "save_base_components",
     "CodeSequenceTransformer",
