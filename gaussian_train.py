@@ -1,6 +1,5 @@
-# training_loop.py
-
-import os, time, math, itertools, contextlib
+#  EXPERIMENTAL!!! THIS MODULE IS NOT IN USE.
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, Dict, Any
 
@@ -11,7 +10,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
 from transformers import get_scheduler
 
-from components.gaussian_transformer import ByteGaussianProbe, GenCfg, generate_with_probe, token_ce_loss_from_mog
+from components.gaussian_transformer import ByteGaussianProbe, GenCfg, generate_with_probe
 
 
 # ---- your model pieces are assumed available in scope ----

@@ -74,7 +74,7 @@ class ExpConfig:
     propagate_key_padding_mask: bool = True
 
     learning_rate: float = 5e-4
-    batch_size: int = 16
+    batch_size: int = 8
     sequence_length: int = 1024
     num_epochs: int = 1
     max_steps: Optional[int] = None

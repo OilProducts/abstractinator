@@ -11,7 +11,7 @@ from torch import Tensor
 
 from .utils import entropy_segments, token_entropy
 from .mla import SlidingWindowMLATransformerBlock
-from .learned_query_attention import LearnedQueryAttention
+from .attention.pooling.learned_query import LearnedQueryAttention
 
 # ---------------------------
 # Data containers / Protocols

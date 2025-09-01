@@ -1,4 +1,6 @@
-from .learned_query_attention import LearnedQueryAttention as LearnedQueryAttention
+from .attention import (
+    LearnedQueryAttention as LearnedQueryAttention,
+)
 from .utils import (
     build_segment_queries_mask as build_segment_queries_mask,
 )

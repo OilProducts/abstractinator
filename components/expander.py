@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .rope import RoPECache, apply_rope
-from .sliding_window_attention import AttnCache, SegmentCausalCrossAttention
+from .attention.cache import AttnCache
+from .attention.sdpa.cross_segment import SegmentCausalCrossAttention
 from .swiglu import SwiGLU
 from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, \
     LearnedCodebookAdapter

@@ -1,3 +1,5 @@
+#  EXPERIMENTAL
+
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -7,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from components import SwiGLU
-from components.attentions import TransformerBlock, TransformerEncoder
+from components.attention.sdpa.block import TransformerBlock, TransformerEncoder
 from components.mla import CausalMLATransformerBlock
 from components.rope import apply_rope, RoPECache
 
@@ -574,4 +576,3 @@ def token_ce_loss_from_mog(probe, tokens, attn_mask=None):
     else:
         loss = loss.mean()
     return loss
-
