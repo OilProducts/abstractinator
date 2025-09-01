@@ -327,7 +327,7 @@ class MultiheadLatentAttention(nn.Module):
             # two‑step (training/default): K→d_c'→r
             q_big = torch.einsum("bshk,hkq->bshq", q_hk, self.w_kc_q)    # [B,S,H,d_c′]
             q_r   = torch.einsum("bshq,hqr->bshr", q_big, self.W_qr)    # [B,S,H,r]
-        q_r = q_r.permute(0, 2, 1, 3) #.contiguous()  # [B,H,S,r]
+        q_r = q_r.permute(0, 2, 1, 3).contiguous()  # [B,H,S,r]
 
         # --------- 2) K path: build k_r for keys (new block OR full block) ---
         if use_cache:
@@ -357,9 +357,7 @@ class MultiheadLatentAttention(nn.Module):
         q_r = apply_rope(q_r, cos_q, sin_q)  # [B,H,S,r]
 
         # --------- 4) Values: broadcast kv_c_cache across heads --------------
-        v_c = kv_c_cache.unsqueeze(1).expand(-1, self.h, -1, -1) #.contiguous()  # [B,H,Ltot,c] or [B,H,L,c]
-        # keep it broadcasted; many kernels can consume this
-        # v_c = kv_c_cache.unsqueeze(1)  # [B,1,L,c], stride-0 along head dim
+        v_c = kv_c_cache.unsqueeze(1).expand(-1, self.h, -1, -1).contiguous()  # [B,H,Ltot,c] or [B,H,L,c]
 
         # --------- 5) Attention in compressed space --------------------------
         ctx_c = self._attn(q_r, k_r_cache, v_c, block_mask=block_mask)  # [B,H,S,c]
@@ -431,7 +429,7 @@ class SlidingWindowMLA(nn.Module):
 
         if pad is not None:
             # ensure clean indexing
-            pad = pad.to(torch.bool) #.contiguous()
+            pad = pad.to(torch.bool).contiguous()
 
             def _keep_pad(b, h, _q, k):
                 return ~pad[b, k]
@@ -729,8 +727,8 @@ class SlidingWindowMLATransformerBlock(nn.Module):
         y = y + self.ffn(self.norm2(y))
         return y, cache
 
-# @torch._dynamo.disable()
-# @lru_cache(maxsize=64)
+@torch._dynamo.disable()
+@lru_cache(maxsize=64)
 def _cached_causal_mask(seq_len: int, device: torch.device):
     """
     Fast‑path builder for a FlexAttention‑compatible causal mask.
