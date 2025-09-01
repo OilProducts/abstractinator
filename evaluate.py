@@ -1,13 +1,7 @@
 import argparse
-import importlib.util
 import json
 import logging
-
-import torch
-from lm_eval import evaluator, utils
-
-import components.hae_lm  # registers HierarchicalAELM with lm_eval
-from configs.base_config import ExpConfig
+from lm_eval import evaluator
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +28,7 @@ def main():
         "--config",
         type=str,
         default=None,
-        help=("Path to configuration file for hier_ae models. If omitted, the checkpoint's stored config is used"),
+        help=("Optional config path (unused for HF models)."),
     )
     parser.add_argument(
         "--tasks",
@@ -65,39 +59,10 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
 
-    if args.model == "hier_ae":
-        model_args = utils.simple_parse_args_string(args.model_args or "")
-        checkpoint = model_args.get("checkpoint")
-        if checkpoint is None:
-            raise ValueError("model_args must include 'checkpoint' for hier_ae model")
-
-        if args.config:
-            spec = importlib.util.spec_from_file_location("config_module", args.config)
-            config_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(config_module)
-            exp_config = config_module.exp_config
-            device = args.device or getattr(config_module, "DEVICE", None)
-        else:
-            ckpt = torch.load(checkpoint, map_location="cpu")
-            if "exp_config" not in ckpt:
-                raise ValueError("Checkpoint missing exp_config; provide --config")
-            cfg = ckpt["exp_config"]
-            if isinstance(cfg, dict):
-                exp_config = ExpConfig(**cfg)
-            else:
-                exp_config = cfg
-            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        lm = components.hae_lm.HierarchicalAELM(
-            checkpoint=checkpoint,
-            config=exp_config,
-            device=device,
-        )
-        model_param = lm
-        model_args_param = None
-    else:
-        model_param = args.model
-        model_args_param = args.model_args
+    # Only support external harness models (e.g., HF) here.
+    # The old HierarchicalAELM adapter is removed; use AbstractinatorPyramid directly for custom eval.
+    model_param = args.model
+    model_args_param = args.model_args
 
     results = evaluator.simple_evaluate(
         model=model_param,
@@ -105,7 +70,7 @@ def main():
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
-        device=args.device if args.model != "hier_ae" else None,
+        device=args.device,
         limit=args.limit,
     )
 
