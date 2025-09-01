@@ -14,6 +14,7 @@ from .utils import (
 from .vector_quantizer import VectorQuantizer as VectorQuantizer
 
 from .abstractinator_pyramid import AbstractinatorPyramid
+from .config_types import AbstractinatorConfig, TopTransformerConfig, PyramidConfig
 
 __all__ = [
     "LearnedQueryAttention",
@@ -23,6 +24,9 @@ __all__ = [
     "token_entropy",
     "VectorQuantizer",
     "AbstractinatorPyramid",
+    "AbstractinatorConfig",
+    "TopTransformerConfig",
+    "PyramidConfig",
 ]
 
 from .segment_compressor import SegmentCompressor as SegmentCompressor
@@ -35,13 +39,14 @@ from .checkpoint_utils import (
 from .code_sequence_transformer import CodeSequenceTransformer as CodeSequenceTransformer
 from .swiglu import SwiGLU as SwiGLU
 from .tokenizer import ByteLevelTokenizer as ByteLevelTokenizer
+from .expander import DecoderOnlyExpanderRVQ as DecoderOnlyExpanderRVQ
 
 __all__ += [
     "SegmentCompressor",
     "load_base_components",
     "save_base_components",
     "CodeSequenceTransformer",
-    "DecoderOnlyExpander",
+    "DecoderOnlyExpanderRVQ",
     "SwiGLU",
     "ByteLevelTokenizer",
 ]
