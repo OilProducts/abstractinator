@@ -1,3 +1,31 @@
+"""
+TODO (training cleanups):
+
+1) Base-component freezing logic
+   - When loading base components via `--load_base_from`, we currently call
+     `model.compressors.eval()` and `model.expanders.eval()` in `train_loop`.
+     The pyramid exposes levels under `model.levels`, each with
+     `level.compressor` and `level.expander`. Replace the blanket calls with:
+       for lvl in model.levels:
+           lvl.compressor.eval()
+           lvl.expander.eval()
+     Optionally also set `requires_grad=False` for their parameters if we intend
+     to fully freeze them (note: `load_base_components(..., freeze=True)` already
+     handles `requires_grad=False`).
+
+2) Top‑LM VQ/quantizer wiring
+   - We set `top_lm = CodeSequenceTransformer(..., vq=None)` and later assign
+     `model.top_lm.vq = model.levels[-1].compressor.vq`, but `SegmentCompressor`
+     exposes `quantizer`, not `vq`. Options:
+       a) If the compressor’s `quantizer` implements the same `(z) ->
+          (z_q, vq_loss, indices, perplexity)` API as `VectorQuantizer`, set
+          `model.top_lm.vq = model.levels[-1].compressor.quantizer`.
+       b) Generalize `CodeSequenceTransformer` to accept a `QuantizerBase`, or
+          add a small adapter/wrapper to match the expected interface.
+   - Decide which quantizer the top LM should use (top level vs. shared), and
+     document the choice.
+"""
+
 import argparse
 import importlib.util
 import logging
@@ -24,15 +52,16 @@ from components.metrics import MlflowBatchLogger, TrainingMetrics
 # from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
 from components.tokenizer import ByteLevelTokenizer
 from components.utils import short_num
-from configs.base_config import (
+from experiments.exp_config import (
     DEVICE as DEFAULT_DEVICE,
 )
-from configs.base_config import (
+from experiments.exp_config import (
     N_CPU as DEFAULT_N_CPU,
 )
-from configs.base_config import (
-    ExpConfig, PyramidConfig
+from experiments.exp_config import (
+    ExpConfig,
 )
+from components.config_types import PyramidConfig, TopTransformerConfig
 from data_utils import tokenize_and_process_examples
 
 # Name for loggers created in this module so logs don't show '__main__'

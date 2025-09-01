@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from configs import AbstractinatorConfig
+from components.config_types import AbstractinatorConfig
 from .segment_compressor import SegmentCompressor, CompressorOutput
 from .vector_quantizer import MultiStageResidualVQ, ComposedIndexCodec
 from .expander import DecoderOnlyExpanderRVQ

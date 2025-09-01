@@ -7,7 +7,7 @@ from .mla import CausalMLATransformerBlock
 from .vector_quantizer import VectorQuantizer
 try:
     # Optional import for type hints
-    from configs import TopTransformerConfig  # type: ignore
+    from components.config_types import TopTransformerConfig  # type: ignore
 except Exception:  # pragma: no cover - keep import lightweight in minimal envs
     TopTransformerConfig = None  # type: ignore
 
