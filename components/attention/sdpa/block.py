@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from components import SwiGLU
+from components.attention.masks import merge_masks
 
 
 class TransformerBlock(nn.Module):
@@ -70,39 +71,16 @@ class TransformerBlock(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        final = None
-
-        if attn_mask is not None:
-            am = attn_mask
-            if am.dtype == torch.bool:
-                am = torch.where(
-                    am, torch.finfo(dtype).min, torch.zeros(1, dtype=dtype, device=device)
-                )
-            else:
-                am = am.to(dtype)
-
-            if am.dim() == 2:
-                am = am.view(1, 1, T_q, T_k)
-            elif am.dim() == 3:
-                am = am.view(B, 1, T_q, T_k)
-
-            final = am
-
-        if key_padding_mask is not None:
-            kpm = key_padding_mask
-            if kpm.dtype == torch.bool:
-                kpm = torch.where(
-                    kpm, torch.finfo(dtype).min, torch.zeros(1, dtype=dtype, device=device)
-                )
-            else:
-                kpm = kpm.to(dtype)
-            kpm = kpm.view(B, 1, 1, T_k)
-            final = kpm if final is None else final + kpm
-
-        if final is not None and final.size(1) == 1 and H > 1:
-            final = final.expand(B, H, T_q, T_k)
-
-        return final
+        return merge_masks(
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            B=B,
+            H=H,
+            L_q=T_q,
+            L_k=T_k,
+            dtype=dtype,
+            device=device,
+        )
 
     def _self_attention(
         self,
@@ -196,4 +174,3 @@ class TransformerEncoder(nn.Module):
                 hiddens.append(x)
         x = self.final_norm(x)
         return (x, hiddens) if return_hidden_states else x
-
