@@ -12,6 +12,7 @@ from .rope import RoPECache, apply_rope
 from .attention.cache import AttnCache
 from .attention.base import SegmentContext
 from .attention.sdpa.adapter import SDPASegmentCrossAttention
+from .config_types import AttentionConfig
 from .swiglu import SwiGLU
 from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, \
     LearnedCodebookAdapter
@@ -541,7 +542,7 @@ class SegmentCausalCrossAttention(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self, idx: int, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim):
+    def __init__(self, idx: int, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim, *, cross_attn_config: "AttentionConfig" | None = None):
         super().__init__()
         self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
@@ -550,8 +551,9 @@ class SlidingDecoderBlock(nn.Module):
             retr_dim=d_model // num_heads, rope_max_seqlen=8192, use_flex_attention=True
         )
         self.norm2 = nn.RMSNorm(d_model)
+        lookback = cross_attn_config.lookback if (cross_attn_config and cross_attn_config.lookback is not None) else cross_window
         self.cross_attn = SDPASegmentCrossAttention(
-            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False
+            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=lookback, bias=False
         )
         self.norm3 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, 4 * d_model)
@@ -585,12 +587,13 @@ class SlidingDecoderBlock(nn.Module):
 
 
 class SlidingDecoder(nn.Module):
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int, *, cross_attn_config: "AttentionConfig" | None = None):
         super().__init__()
         self.layers = nn.ModuleList()
         for l_idx in range(num_layers):
             layer = SlidingDecoderBlock(
-                idx=l_idx, d_model=d_model, num_heads=num_heads, cross_window=cross_window, q_dim=q_dim, kv_dim=kv_dim
+                idx=l_idx, d_model=d_model, num_heads=num_heads, cross_window=cross_window, q_dim=q_dim, kv_dim=kv_dim,
+                cross_attn_config=cross_attn_config,
             )
             self.layers.append(layer)
 
@@ -676,7 +679,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True) if hi_vq is not None else None
 
         # Your existing decoder block
-        self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=D, kv_dim=D)
+        self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=D, kv_dim=D, cross_attn_config=None)
 
         # Factorized head
         self.head = RVQFactorizedHead(self.lo_adapt,

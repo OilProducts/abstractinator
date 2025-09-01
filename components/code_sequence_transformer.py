@@ -3,7 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mla import CausalMLATransformerBlock
+from .attention.factory import make_causal_self_block
+from .config_types import AttentionConfig
 from .vector_quantizer import VectorQuantizer
 try:
     # Optional import for type hints
@@ -24,6 +25,7 @@ class CodeSequenceTransformer(nn.Module):
         *,
         vq: VectorQuantizer | None = None,
         use_flex_attention: bool = True,
+        attention_config: AttentionConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -46,21 +48,28 @@ class CodeSequenceTransformer(nn.Module):
         self.use_flex_attention = use_flex_attention
 
         self.in_proj = nn.Linear(embed_dim, dim)
-        self.encoder = nn.ModuleList(
-            [
-                CausalMLATransformerBlock(
-                    dim=dim,
-                    num_heads=num_heads,
-                    ffn_dim_multiplier=ffn_dim_multiplier,
-                    head_dim=head_dim,
-                    kv_comp_dim=kv_comp_dim,
-                    q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim,
-                    use_flex_attention=self.use_flex_attention,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+        # Attention config: default to MLA with provided flags unless overridden
+        attn_cfg = attention_config
+        if attn_cfg is None:
+            from components.config_types import AttentionConfig as _AC
+            attn_cfg = _AC(
+                backend="mla",
+                use_flex_attention=self.use_flex_attention,
+                head_dim=head_dim,
+                kv_comp_dim=kv_comp_dim,
+                q_comp_dim=q_comp_dim,
+                retr_dim=retr_dim,
+            )
+
+        self.encoder = nn.ModuleList([
+            make_causal_self_block(
+                dim=dim,
+                num_heads=num_heads,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                cfg=attn_cfg,
+            )
+            for _ in range(num_layers)
+        ])
         self.final_norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, embed_dim)
 

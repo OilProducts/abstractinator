@@ -12,6 +12,7 @@ from torch import Tensor
 from .utils import entropy_segments, token_entropy
 from .mla import SlidingWindowMLATransformerBlock
 from .attention.pooling.learned_query import LearnedQueryAttention
+from .config_types import AttentionConfig
 
 # ---------------------------
 # Data containers / Protocols
@@ -695,6 +696,7 @@ class SegmentCompressor(nn.Module):
         quantizer: Optional[QuantizerBase] = None,
 
         use_flex_attention: bool = True,
+        attention_config: AttentionConfig | None = None,
     ):
         super().__init__()
 
@@ -705,7 +707,7 @@ class SegmentCompressor(nn.Module):
 
         self.num_queries_per_segment = num_queries
         self.output_length = output_length
-        self.use_flex_attention = use_flex_attention
+        self.use_flex_attention = use_flex_attention if (attention_config is None) else bool(attention_config.use_flex_attention)
 
         # Shared stack
         self.shared_layers = nn.ModuleList(

@@ -3,6 +3,21 @@ from typing import List, Optional
 
 
 @dataclass
+class AttentionConfig:
+    backend: str = "mla"               # "mla" | "sdpa"
+    use_rope: bool = True
+    causal: bool = True
+    window: Optional[int] = None        # for sliding/global self-attn (reserved)
+    lookback: Optional[int] = None      # for segment cross-attn
+    use_flex_attention: bool = True     # MLA fast path
+
+    # MLA-specific knobs (safe to ignore for SDPA)
+    head_dim: Optional[int] = None
+    kv_comp_dim: Optional[int] = 64
+    q_comp_dim: Optional[int] = 128
+    retr_dim: Optional[int] = 32
+
+@dataclass
 class AbstractinatorConfig:
     # Shared / tokens
     vocab_size: int = 260
@@ -82,4 +97,3 @@ class PyramidConfig:
     w_vq: float = 1.0
     w_byte_lm: float = 1.0
     use_top_code_lm: bool = True
-
