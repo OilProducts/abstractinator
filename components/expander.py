@@ -10,7 +10,8 @@ import torch.nn.functional as F
 
 from .rope import RoPECache, apply_rope
 from .attention.cache import AttnCache
-from .attention.sdpa.cross_segment import SegmentCausalCrossAttention
+from .attention.base import SegmentContext
+from .attention.sdpa.adapter import SDPASegmentCrossAttention
 from .swiglu import SwiGLU
 from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, \
     LearnedCodebookAdapter
@@ -549,7 +550,7 @@ class SlidingDecoderBlock(nn.Module):
             retr_dim=d_model // num_heads, rope_max_seqlen=8192, use_flex_attention=True
         )
         self.norm2 = nn.RMSNorm(d_model)
-        self.cross_attn = SegmentCausalCrossAttention(
+        self.cross_attn = SDPASegmentCrossAttention(
             q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=cross_window, bias=False
         )
         self.norm3 = nn.RMSNorm(d_model)
@@ -570,15 +571,15 @@ class SlidingDecoderBlock(nn.Module):
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), key_padding_mask=tgt_key_padding_mask) # attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)
 
-        x = x + self.cross_attn(
-            self.norm2(x),
-            kv_src=memory,
+        seg_ctx = SegmentContext(
             seg_id=seg_ids,
-            q_pos_ids=q_pos_ids,
-            kv_pos_ids=kv_pos_ids,
+            q_pos_ids=q_pos_ids if q_pos_ids is not None else torch.arange(x.size(1), device=x.device),
+            kv_pos_ids=kv_pos_ids if kv_pos_ids is not None else torch.arange(memory.size(1), device=memory.device),
+            lookback=0,
             kv_mask=memory_key_padding_mask,
             q_pad_mask=tgt_key_padding_mask,
         )
+        x = x + self.cross_attn(self.norm2(x), memory, segment=seg_ctx)
         x = x + self.ffn(self.norm3(x))
         return x
 
