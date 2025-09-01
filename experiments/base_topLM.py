@@ -1,17 +1,12 @@
 from copy import deepcopy
 
-from configs import AbstractinatorConfig
-from configs.base_config import (
-    # CompressorLevelConfig,
-    # ExpanderConfig,
-    ExpConfig,
-    TopTransformerConfig,
-)
-from configs.base_config import (
+from components.config_types import AbstractinatorConfig, TopTransformerConfig
+from experiments.exp_config import ExpConfig
+from experiments.exp_config import (
     exp_config as _base_exp_config,
 )
 
-# Use defaults from base_config without modification
+# Use defaults from experiments.exp_config without modification
 exp_config = _base_exp_config #: ExpConfig = deepcopy(_base_exp_config)
 
 exp_config.batch_size = 2 #16
