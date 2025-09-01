@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-from components.rope import RoPECache, apply_rope
+from ...rope import RoPECache, apply_rope
 
 
 class SegmentCausalCrossAttention(nn.Module):
@@ -154,4 +154,3 @@ class SegmentCausalCrossAttention(nn.Module):
         return (
             x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()
         )
-

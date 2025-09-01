@@ -1,6 +1,3 @@
-from .attention import (
-    LearnedQueryAttention as LearnedQueryAttention,
-)
 from .utils import (
     build_segment_queries_mask as build_segment_queries_mask,
 )
@@ -19,7 +16,6 @@ from .abstractinator_pyramid import AbstractinatorPyramid
 from .config_types import AbstractinatorConfig, TopTransformerConfig, PyramidConfig
 
 __all__ = [
-    "LearnedQueryAttention",
     "build_segment_queries_mask",
     "entropy_segments",
     "safe_softmax",

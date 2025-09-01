@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from components import SwiGLU
-from components.attention.masks import merge_masks
+from ...swiglu import SwiGLU
+from ..masks import merge_masks
 
 
 class TransformerBlock(nn.Module):

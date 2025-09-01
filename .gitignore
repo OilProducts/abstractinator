@@ -22,6 +22,11 @@ checkpoints/
 mlruns/
 models/
 
+# Saved datasets / traces (ignore)
+fw_edu_saved/
+stories_saved/
+trace.json
+
 # IDE and tooling
 .idea/
 .aim/
