@@ -48,7 +48,8 @@ class SlidingSelf(nn.Module):
 
     # Streaming API (recompute fallback)
     def prefill(self, x: torch.Tensor, *, pos_start: int = 0, key_padding_mask: Optional[torch.Tensor] = None):
-        return {"x": x, "kpm": key_padding_mask}, self.forward(x, key_padding_mask)
+        y = self.forward(x, key_padding_mask)
+        return y, {"x": x, "kpm": key_padding_mask}
 
     def step(
         self,
@@ -70,6 +71,6 @@ class SlidingSelf(nn.Module):
         y_cat = self.forward(x_cat, kpm_cat)
         y_new = y_cat[:, -new_x.size(1) :, :]
         cache = {"x": x_cat, "kpm": kpm_cat}
-        return cache, y_new
+        return y_new, cache
 
 __all__ = ["SlidingSelf"]
