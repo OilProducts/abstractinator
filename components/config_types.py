@@ -4,7 +4,7 @@ from typing import List, Optional
 
 @dataclass
 class AttentionConfig:
-    backend: str = "mla"               # "mla" | "sdpa"
+    backend: str = "sdpa"               # "mla" | "sdpa"
     use_rope: bool = True
     causal: bool = True
     window: Optional[int] = None        # for sliding/global self-attn (reserved)

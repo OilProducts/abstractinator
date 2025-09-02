@@ -7,7 +7,8 @@ import torch.nn as nn
 
 from ..config_types import AttentionConfig
 from .sdpa.block import TransformerBlock as SDPATransformerBlock
-from ..mla import CausalMLATransformerBlock  # local import; avoid re-export cycles
+from .sdpa.local import LocalSDPABlock
+from ..mla import CausalMLATransformerBlock, SlidingWindowMLATransformerBlock  # local import; avoid re-export cycles
 
 
 class _SelfCausalSDPABlock(nn.Module):
@@ -36,7 +37,7 @@ def make_causal_self_block(
     num_heads: int,
     ffn_dim_multiplier: int = 4,
     cfg: Optional[AttentionConfig] = None,
-) -> nn.Module:
+    ) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.backend == "sdpa":
         return _SelfCausalSDPABlock(dim, num_heads, ffn_dim_multiplier)
@@ -57,3 +58,33 @@ def make_causal_self_block(
         use_flex_attention=use_flex,
     )
 
+
+def make_sliding_self_block(
+    *,
+    dim: int,
+    num_heads: int,
+    window_size: int,
+    ffn_dim_multiplier: int = 4,
+    cfg: Optional[AttentionConfig] = None,
+) -> nn.Module:
+    cfg = cfg or AttentionConfig()
+    if cfg.backend == "sdpa":
+        return LocalSDPABlock(
+            d_model=dim,
+            n_heads=num_heads,
+            window_size=window_size,
+            d_ff=dim * ffn_dim_multiplier,
+        )
+    # default MLA
+    head_dim = cfg.head_dim if cfg.head_dim is not None else (dim // num_heads)
+    return SlidingWindowMLATransformerBlock(
+        dim=dim,
+        num_heads=num_heads,
+        window_size=window_size,
+        head_dim=head_dim,
+        kv_comp_dim=cfg.kv_comp_dim,
+        q_comp_dim=cfg.q_comp_dim,
+        retr_dim=cfg.retr_dim,
+        ffn_dim_multiplier=ffn_dim_multiplier,
+        use_flex_attention=cfg.use_flex_attention,
+    )

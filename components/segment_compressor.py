@@ -10,8 +10,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .utils import entropy_segments, token_entropy
-from .mla import SlidingWindowMLATransformerBlock
+from .attention.factory import make_sliding_self_block
 from .attention.pooling.learned_query import LearnedQueryAttention
+from .config_types import AttentionConfig
 from .config_types import AttentionConfig
 
 # ---------------------------
@@ -206,19 +207,22 @@ class GaussianEntropyModel(EntropyModelBase):
                  ffn_dim_multiplier: int = 4,
                  use_flex_attention: bool = True,
                  n_layers: int = 2,
-                 clamp_logvar: Tuple[float, float] = (-8.0, 8.0)):
+                 clamp_logvar: Tuple[float, float] = (-8.0, 8.0),
+                 attention_config: AttentionConfig | None = None,
+                 ):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim, num_heads=n_heads, window_size=window,
-                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim, ffn_dim_multiplier=ffn_dim_multiplier,
-                    use_flex_attention=use_flex_attention
-                )
-                for _ in range(n_layers)
-            ]
+        cfg = attention_config or AttentionConfig(
+            backend="mla", use_flex_attention=use_flex_attention,
+            head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
         )
+        self.layers = nn.ModuleList([
+            make_sliding_self_block(
+                dim=dim, num_heads=n_heads, window_size=window,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                cfg=cfg,
+            )
+            for _ in range(n_layers)
+        ])
         self.mu = nn.Linear(dim, dim)
         self.logvar = nn.Linear(dim, dim)
         self.clamp = clamp_logvar
@@ -382,7 +386,8 @@ class LogitEntropyModel(EntropyModelBase):
     """
     Causal token LM that outputs logits and uses token entropy for segmentation.
     """
-    def __init__(self,
+    def __init__(
+        self,
                  dim: int,
                  vocab_size: int = 260,
                  n_heads: int = 8,
@@ -393,19 +398,22 @@ class LogitEntropyModel(EntropyModelBase):
                  retr_dim: Optional[int] = 32,
                  ffn_dim_multiplier: int = 4,
                  use_flex_attention: bool = True,
-                 n_layers: int = 2):
+                 n_layers: int = 2,
+        attention_config: AttentionConfig | None = None,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim, num_heads=n_heads, window_size=window,
-                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim, ffn_dim_multiplier=ffn_dim_multiplier,
-                    use_flex_attention=use_flex_attention
-                )
-                for _ in range(n_layers)
-            ]
+        cfg = attention_config or AttentionConfig(
+            backend="mla", use_flex_attention=use_flex_attention,
+            head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
         )
+        self.layers = nn.ModuleList([
+            make_sliding_self_block(
+                dim=dim, num_heads=n_heads, window_size=window,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                cfg=cfg,
+            )
+            for _ in range(n_layers)
+        ])
         self.norm = nn.RMSNorm(dim)
         self.proj = nn.Linear(dim, vocab_size)
         self.vocab_size = vocab_size
@@ -710,30 +718,29 @@ class SegmentCompressor(nn.Module):
         self.use_flex_attention = use_flex_attention if (attention_config is None) else bool(attention_config.use_flex_attention)
 
         # Shared stack
-        self.shared_layers = nn.ModuleList(
-            [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim, num_heads=heads, window_size=window,
-                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
-                )
-                for _ in range(num_shared_encoder_layers)
-            ]
+        attn_cfg = attention_config or AttentionConfig(
+            backend="mla", use_flex_attention=self.use_flex_attention,
+            head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
         )
 
+        self.shared_layers = nn.ModuleList([
+            make_sliding_self_block(
+                dim=dim, num_heads=heads, window_size=window,
+                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                cfg=attn_cfg,
+            )
+            for _ in range(num_shared_encoder_layers)
+        ])
+
         # Compression branch
-        self.compression_layers = nn.ModuleList(
-            [
-                SlidingWindowMLATransformerBlock(
-                    dim=dim, num_heads=heads, window_size=compression_window,
-                    head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                    retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    use_flex_attention=self.use_flex_attention,
-                )
-                for _ in range(num_compression_encoder_layers)
-            ]
-        )
+        self.compression_layers = nn.ModuleList([
+            make_sliding_self_block(
+                dim=dim, num_heads=heads, window_size=compression_window,
+                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                cfg=attn_cfg,
+            )
+            for _ in range(num_compression_encoder_layers)
+        ])
 
         # Entropy model branch
         if use_gaussian_segmentation:

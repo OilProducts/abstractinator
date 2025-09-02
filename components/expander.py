@@ -542,13 +542,14 @@ class SegmentCausalCrossAttention(nn.Module):
 class SlidingDecoderBlock(nn.Module):
     """Decoder block using causal self-attention and sliding-window cross attention."""
 
-    def __init__(self, idx: int, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim, *, cross_attn_config: "AttentionConfig" | None = None):
+    def __init__(self, idx: int, d_model: int, num_heads: int, cross_window: int, q_dim, kv_dim, *, cross_attn_config: "AttentionConfig" | None = None, self_attn_config: "AttentionConfig" | None = None):
         super().__init__()
         self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
-        self.self_attn = CausalMLA(
-            dim_q=d_model, num_heads=num_heads, kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32,
-            retr_dim=d_model // num_heads, rope_max_seqlen=8192, use_flex_attention=True
+        from .attention.factory import make_causal_self_block
+        self.self_attn = make_causal_self_block(
+            dim=d_model, num_heads=num_heads, ffn_dim_multiplier=4,
+            cfg=self_attn_config or AttentionConfig(backend="mla", use_flex_attention=True, kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32, retr_dim=d_model // num_heads),
         )
         self.norm2 = nn.RMSNorm(d_model)
         lookback = cross_attn_config.lookback if (cross_attn_config and cross_attn_config.lookback is not None) else cross_window
@@ -587,13 +588,13 @@ class SlidingDecoderBlock(nn.Module):
 
 
 class SlidingDecoder(nn.Module):
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int, *, cross_attn_config: "AttentionConfig" | None = None):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, cross_window: int, q_dim: int, kv_dim: int, *, cross_attn_config: "AttentionConfig" | None = None, self_attn_config: "AttentionConfig" | None = None):
         super().__init__()
         self.layers = nn.ModuleList()
         for l_idx in range(num_layers):
             layer = SlidingDecoderBlock(
                 idx=l_idx, d_model=d_model, num_heads=num_heads, cross_window=cross_window, q_dim=q_dim, kv_dim=kv_dim,
-                cross_attn_config=cross_attn_config,
+                cross_attn_config=cross_attn_config, self_attn_config=self_attn_config,
             )
             self.layers.append(layer)
 
