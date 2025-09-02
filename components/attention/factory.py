@@ -39,14 +39,15 @@ def make_causal_self_block(
     cfg: Optional[AttentionConfig] = None,
     ) -> nn.Module:
     cfg = cfg or AttentionConfig()
-    if cfg.backend == "sdpa":
+    if cfg.variant == "regular":
+        # Regular attention via SDPA (flex kernel for regular can be added later; fallback to SDPA)
         return _SelfCausalSDPABlock(dim, num_heads, ffn_dim_multiplier)
-    # default MLA
+    # MLA path
     head_dim = cfg.head_dim if cfg.head_dim is not None else (dim // num_heads)
     kv_comp_dim = cfg.kv_comp_dim
     q_comp_dim = cfg.q_comp_dim
     retr_dim = cfg.retr_dim
-    use_flex = cfg.use_flex_attention
+    use_flex = (cfg.kernel == "flex")
     return CausalMLATransformerBlock(
         dim=dim,
         num_heads=num_heads,
@@ -68,14 +69,14 @@ def make_sliding_self_block(
     cfg: Optional[AttentionConfig] = None,
 ) -> nn.Module:
     cfg = cfg or AttentionConfig()
-    if cfg.backend == "sdpa":
+    if cfg.variant == "regular":
         return CausalLocalSDPABlock(
             d_model=dim,
             n_heads=num_heads,
             window_size=window_size,
             d_ff=dim * ffn_dim_multiplier,
         )
-    # default MLA
+    # MLA path
     head_dim = cfg.head_dim if cfg.head_dim is not None else (dim // num_heads)
     return SlidingWindowMLATransformerBlock(
         dim=dim,
@@ -86,5 +87,5 @@ def make_sliding_self_block(
         q_comp_dim=cfg.q_comp_dim,
         retr_dim=cfg.retr_dim,
         ffn_dim_multiplier=ffn_dim_multiplier,
-        use_flex_attention=cfg.use_flex_attention,
+        use_flex_attention=(cfg.kernel == "flex"),
     )

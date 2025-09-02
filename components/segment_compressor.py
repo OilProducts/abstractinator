@@ -212,7 +212,7 @@ class GaussianEntropyModel(EntropyModelBase):
                  ):
         super().__init__()
         cfg = attention_config or AttentionConfig(
-            backend="mla", use_flex_attention=use_flex_attention,
+            variant="mla", kernel=("flex" if use_flex_attention else "sdpa"),
             head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
         )
         self.layers = nn.ModuleList([
@@ -403,7 +403,7 @@ class LogitEntropyModel(EntropyModelBase):
     ):
         super().__init__()
         cfg = attention_config or AttentionConfig(
-            backend="mla", use_flex_attention=use_flex_attention,
+            variant="mla", kernel=("flex" if use_flex_attention else "sdpa"),
             head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
         )
         self.layers = nn.ModuleList([

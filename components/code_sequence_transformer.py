@@ -53,8 +53,8 @@ class CodeSequenceTransformer(nn.Module):
         if attn_cfg is None:
             from components.config_types import AttentionConfig as _AC
             attn_cfg = _AC(
-                backend="mla",
-                use_flex_attention=self.use_flex_attention,
+                variant="mla",
+                kernel=("flex" if self.use_flex_attention else "sdpa"),
                 head_dim=head_dim,
                 kv_comp_dim=kv_comp_dim,
                 q_comp_dim=q_comp_dim,

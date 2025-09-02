@@ -549,7 +549,7 @@ class SlidingDecoderBlock(nn.Module):
         from .attention.factory import make_causal_self_block
         self.self_attn = make_causal_self_block(
             dim=d_model, num_heads=num_heads, ffn_dim_multiplier=4,
-            cfg=self_attn_config or AttentionConfig(backend="mla", use_flex_attention=True, kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32, retr_dim=d_model // num_heads),
+            cfg=self_attn_config or AttentionConfig(variant="mla", kernel="flex", kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32, retr_dim=d_model // num_heads),
         )
         self.norm2 = nn.RMSNorm(d_model)
         lookback = cross_attn_config.lookback if (cross_attn_config and cross_attn_config.lookback is not None) else cross_window

@@ -4,14 +4,18 @@ from typing import List, Optional
 
 @dataclass
 class AttentionConfig:
-    backend: str = "sdpa"               # "mla" | "sdpa"
+    # Variant: attention formulation
+    variant: str = "mla"                 # "regular" | "mla"
+
+    # Kernel: how to compute it
+    kernel: str = "flex"                 # "sdpa" | "flex"
+
     use_rope: bool = True
     causal: bool = True
-    window: Optional[int] = None        # for sliding/global self-attn (reserved)
-    lookback: Optional[int] = None      # for segment cross-attn
-    use_flex_attention: bool = True     # MLA fast path
+    window: Optional[int] = None         # sliding window radius (self-attn)
+    lookback: Optional[int] = None       # segment cross-attn lookback
 
-    # MLA-specific knobs (safe to ignore for SDPA)
+    # MLA-specific knobs (ignored for regular)
     head_dim: Optional[int] = None
     kv_comp_dim: Optional[int] = 64
     q_comp_dim: Optional[int] = 128
