@@ -50,6 +50,9 @@ class CodeSequenceTransformer(nn.Module):
         self.in_proj = nn.Linear(embed_dim, dim)
         # Attention config: default to MLA with provided flags unless overridden
         attn_cfg = attention_config
+        # Prefer config-provided attention_config if present
+        if attn_cfg is None and hasattr(cfg, "attention_config"):
+            attn_cfg = getattr(cfg, "attention_config")
         if attn_cfg is None:
             from components.config_types import AttentionConfig as _AC
             attn_cfg = _AC(

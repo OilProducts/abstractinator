@@ -73,6 +73,11 @@ class AbstractinatorConfig:
     # Device hint (string form only; experiments resolve actual device)
     device: Optional[str] = None
 
+    # Attention configs (optional overrides to thread through to components)
+    compressor_attention: Optional["AttentionConfig"] = None
+    decoder_self_attention: Optional["AttentionConfig"] = None
+    decoder_cross_attention: Optional["AttentionConfig"] = None
+
 
 @dataclass
 class TopTransformerConfig:
@@ -93,6 +98,8 @@ class TopTransformerConfig:
     lm_window: Optional[int] = 128
     lm_fixed_length: Optional[int] = 1024
     lm_pad_id: int = 258
+    # Optional attention configuration for the top transformer
+    attention_config: Optional["AttentionConfig"] = None
 
 
 @dataclass

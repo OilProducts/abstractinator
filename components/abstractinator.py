@@ -51,6 +51,7 @@ class Abstractinator(nn.Module):
             entropy_delta=cfg.c_entropy_delta,
             entropy_abs_threshold=cfg.c_entropy_abs_threshold,
             output_length=cfg.c_output_length,
+            attention_config=cfg.compressor_attention,
         )
         # Embedding is owned here; SegmentCompressor consumes precomputed embeddings.
 
@@ -81,6 +82,8 @@ class Abstractinator(nn.Module):
             residual_conditioning=cfg.d_residual_conditioning,
             use_sqdist_logits=cfg.d_use_sqdist_logits,
             device=cfg.device,
+            self_attn_config=cfg.decoder_self_attention,
+            cross_attn_config=cfg.decoder_cross_attention,
         )
 
         # codec for the low side (factorized digits or degenerate depth=1)

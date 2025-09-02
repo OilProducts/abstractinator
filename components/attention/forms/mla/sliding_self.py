@@ -42,5 +42,11 @@ class SlidingSelf(nn.Module):
     def forward(self, x, key_padding_mask=None):
         return self.inner(x, key_padding_mask=key_padding_mask)
 
-__all__ = ["SlidingSelf"]
+    # Streaming API (native MLA)
+    def prefill(self, x, *, pos_start: int = 0, key_padding_mask=None):
+        return self.inner.prefill(x, pos_start=pos_start, key_padding_mask=key_padding_mask)
 
+    def step(self, x_new, cache, *, pos_start: int, key_padding_mask_new=None):
+        return self.inner.step(cache=cache, x_new=x_new, pos_start=pos_start, key_padding_mask_new=key_padding_mask_new)
+
+__all__ = ["SlidingSelf"]
