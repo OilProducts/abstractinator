@@ -5,10 +5,17 @@
   - `abstractinator.py`: Single-level encoder/decoder module.
   - `abstractinator_pyramid.py`: Multi-level orchestration (`AbstractinatorPyramid`).
   - `segment_compressor.py`: Entropy-driven segmentation and `SegmentCompressor` (Gaussian or logit entropy, learned-query pooling, optional VQ).
-  - `expander.py`: Decoder-only expanders (e.g., `DecoderOnlyExpanderRVQ`) and attention blocks.
+  - `expander.py`: Decoder-only expanders (e.g., `DecoderOnlyExpanderRVQ`).
   - `code_sequence_transformer.py`: Optional top-level `CodeSequenceTransformer` over high-level codes.
   - `vector_quantizer.py`: VQ and residual VQ implementations plus adapters.
-  - Attention/utility modules: `learned_query_attention.py`, `sliding_window_attention.py`, `mla.py`, `attentions.py`, `rope.py`, `swiglu.py`.
+  - Attention/utility modules:
+    - `attention/`: attention system organized by form and backend
+      - `forms/regular/`: regular attention (SDPA or Flex)
+      - `forms/mla/`: MLA attention (Flex or fallback)
+      - `backends/`: SDPA and FlexAttention runners
+      - `factory.py`: `make_causal_self_block`, `make_sliding_self_block`, `make_segment_cross_attention`
+    - `attention/pooling/learned_query.py`: learned-query segment pooling
+    - `rope.py`, `swiglu.py`
   - Other utilities: `tokenizer.py`, `metrics.py`, `checkpoint_utils.py`, `utils.py`.
 - `components/config_types.py`: Component configuration dataclasses (`AbstractinatorConfig`, `TopTransformerConfig`, `PyramidConfig`). Pure types, no runtime logic.
 - `experiments/`: Experiment/runtime configuration and helpers

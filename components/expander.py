@@ -656,7 +656,11 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                  lo_d_c: int = 64,  # Factorized rank for bytes
                  residual_conditioning: bool = True,
                  use_sqdist_logits: bool = False,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 *,
+                 cross_attn_config: Optional[AttentionConfig] = None,
+                 self_attn_config: Optional[AttentionConfig] = None,
+                 ):
         super().__init__()
         self.lo_vq = lo_vq
         self.hi_vq = hi_vq
@@ -684,8 +688,13 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         # ---- high side (memory) ----
         self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True) if hi_vq is not None else None
 
-        # Your existing decoder block
-        self.decoder = SlidingDecoder(N_dec, D, H, cross_window, q_dim=D, kv_dim=D, cross_attn_config=None)
+        # Decoder block with configurable attention forms/backends
+        self.decoder = SlidingDecoder(
+            N_dec, D, H, cross_window,
+            q_dim=D, kv_dim=D,
+            cross_attn_config=cross_attn_config,
+            self_attn_config=self_attn_config,
+        )
 
         # Factorized head
         self.head = RVQFactorizedHead(self.lo_adapt,

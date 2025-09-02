@@ -125,8 +125,10 @@ Key modules under `components/` include:
   representations via a bank of learned queries.
 - **VectorQuantizer** – EMA codebook with dead‑code resets; discretizes segment
   embeddings and provides the VQ loss.
-- **SlidingWindowAttention / MLA** – Efficient local attention and latent
-  attention primitives used by the encoders/decoders.
+- **Attention** – Pluggable attention along two axes:
+  - Forms: Regular vs MLA (Multi‑Head Latent Attention)
+  - Backends: SDPA vs FlexAttention
+  - See `components/attention/factory.py` and `components/attention/forms/*`.
 
 
 See `notes.md` for additional design thoughts.
