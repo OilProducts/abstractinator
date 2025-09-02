@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from ..config_types import AttentionConfig
 from .sdpa.block import TransformerBlock as SDPATransformerBlock
-from .sdpa.local import LocalSDPABlock
+from .sdpa.local import CausalLocalSDPABlock
 from ..mla import CausalMLATransformerBlock, SlidingWindowMLATransformerBlock  # local import; avoid re-export cycles
 
 
@@ -69,7 +69,7 @@ def make_sliding_self_block(
 ) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.backend == "sdpa":
-        return LocalSDPABlock(
+        return CausalLocalSDPABlock(
             d_model=dim,
             n_heads=num_heads,
             window_size=window_size,

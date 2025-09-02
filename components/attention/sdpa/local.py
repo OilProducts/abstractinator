@@ -9,10 +9,11 @@ from .block import TransformerBlock as SDPATransformerBlock
 from ..masks import merge_masks, additive_neg_inf
 
 
-class LocalSDPABlock(nn.Module):
+class CausalLocalSDPABlock(nn.Module):
     """
-    Non-causal local self-attention using SDPA, with a symmetric sliding window
-    of radius `window_size` around each position. Pre‑LN block structure.
+    Causal local self-attention using SDPA with a sliding window of radius
+    `window_size` over past tokens only. Each query attends to keys k where
+    0 <= k <= q and (q - k) <= window_size. Pre‑LN block structure.
     """
 
     def __init__(
@@ -38,16 +39,16 @@ class LocalSDPABlock(nn.Module):
             bias=bias,
         )
 
-    def _band_mask(self, L: int, device: torch.device) -> torch.Tensor:
+    def _causal_band_mask(self, L: int, device: torch.device) -> torch.Tensor:
         i = torch.arange(L, device=device)[:, None]
         j = torch.arange(L, device=device)[None, :]
-        return (torch.abs(i - j) > self.window)  # True = disallow
+        # Disallow future (j > i) or past beyond window (i - j > window)
+        return (j > i) | ((i - j) > self.window)
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, _ = x.shape
-        band = self._band_mask(L, x.device)  # (L, L) bool
-        # Convert to additive mask now (block will merge KPM)
+        band = self._causal_band_mask(L, x.device)  # (L, L) bool
+        # Convert to additive mask now (block will merge KPM); pass is_causal=True, too.
         bias = torch.where(band, additive_neg_inf(x.dtype, x.device), torch.zeros(1, dtype=x.dtype, device=x.device))
         bias = bias.view(1, 1, L, L)  # (1,1,L,L)
-        return self.block(x, attn_mask=bias, key_padding_mask=key_padding_mask, is_causal=False)
-
+        return self.block(x, attn_mask=bias, key_padding_mask=key_padding_mask, is_causal=True)
