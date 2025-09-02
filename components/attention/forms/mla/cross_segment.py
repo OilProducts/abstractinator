@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .core import MultiheadLatentAttention
+from .impl import MultiheadLatentAttention
 
 
 class MLASegmentCrossAttention(nn.Module):
@@ -104,4 +104,3 @@ class MLASegmentCrossAttention(nn.Module):
 
 
 __all__ = ["MLASegmentCrossAttention"]
-

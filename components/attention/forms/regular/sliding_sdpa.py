@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .block_impl import TransformerBlock as SDPATransformerBlock
+from .self_sdpa import TransformerBlock as SDPATransformerBlock
 from ...masks import merge_masks, additive_neg_inf
 
 
@@ -51,4 +51,3 @@ class CausalLocalSDPABlock(nn.Module):
         bias = torch.where(band, additive_neg_inf(x.dtype, x.device), torch.zeros(1, dtype=x.dtype, device=x.device))
         bias = bias.view(1, 1, L, L)  # (1,1,L,L)
         return self.block(x, attn_mask=bias, key_padding_mask=key_padding_mask, is_causal=True)
-

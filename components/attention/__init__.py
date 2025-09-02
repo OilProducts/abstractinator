@@ -4,7 +4,7 @@ from .masks import merge_masks, causal_mask
 
 # SDPA exports
 from .forms.regular.self_sdpa import TransformerBlock, TransformerEncoder
-from .forms.regular.cross_segment_impl import SegmentCausalCrossAttention
+from .forms.regular.cross_segment_sdpa import SegmentCausalCrossAttention
 
 # Cache helpers
 from .cache import AttnCache
