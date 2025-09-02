@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from components import SwiGLU
-from .attention.sdpa.block import TransformerBlock, TransformerEncoder
+from .attention.forms.regular.block_impl import TransformerBlock, TransformerEncoder
 from components.attention.forms.mla.impl import CausalMLATransformerBlock
 from components.rope import apply_rope, RoPECache
 

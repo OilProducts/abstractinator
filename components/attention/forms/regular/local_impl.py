@@ -5,15 +5,14 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .block import TransformerBlock as SDPATransformerBlock
-from ..masks import merge_masks, additive_neg_inf
+from .block_impl import TransformerBlock as SDPATransformerBlock
+from ...masks import merge_masks, additive_neg_inf
 
 
 class CausalLocalSDPABlock(nn.Module):
     """
     Causal local self-attention using SDPA with a sliding window of radius
-    `window_size` over past tokens only. Each query attends to keys k where
-    0 <= k <= q and (q - k) <= window_size. Pre‑LN block structure.
+    `window_size` over past tokens only. Pre‑LN block structure.
     """
 
     def __init__(
@@ -52,3 +51,4 @@ class CausalLocalSDPABlock(nn.Module):
         bias = torch.where(band, additive_neg_inf(x.dtype, x.device), torch.zeros(1, dtype=x.dtype, device=x.device))
         bias = bias.view(1, 1, L, L)  # (1,1,L,L)
         return self.block(x, attn_mask=bias, key_padding_mask=key_padding_mask, is_causal=True)
+

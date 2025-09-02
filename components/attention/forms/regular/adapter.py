@@ -5,13 +5,13 @@ from typing import Optional, Any
 import torch
 import torch.nn as nn
 
-from ..base import SegmentContext, CrossAttentionBase
-from .cross_segment import SegmentCausalCrossAttention
+from ...base import SegmentContext
+from .cross_segment_impl import SegmentCausalCrossAttention
 
 
 class SDPASegmentCrossAttention(nn.Module):
     """
-    Adapter exposing a CrossAttentionBase-style interface around the existing
+    Adapter exposing a CrossAttentionBase-style interface around the regular
     SegmentCausalCrossAttention implementation.
     """
 

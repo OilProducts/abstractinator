@@ -5,14 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-from ...rope import RoPECache, apply_rope
+from components.rope import RoPECache, apply_rope
 
 
 class SegmentCausalCrossAttention(nn.Module):
     """
     Cross-attention where queries attend to a compressed memory of segments.
-    Uses RoPE and a fixed lookback over segment ids. Ported from
-    `components/sliding_window_attention.py` (behavior preserved).
+    Uses RoPE and a fixed lookback over segment ids.
     """
 
     def __init__(
@@ -154,3 +153,4 @@ class SegmentCausalCrossAttention(nn.Module):
         return (
             x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()
         )
+

@@ -3,16 +3,16 @@ from typing import Optional, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ...swiglu import SwiGLU
-from ..masks import merge_masks
+from components.swiglu import SwiGLU
+from ...masks import merge_masks
+from ...backends.sdpa import run as sdpa_run
 
 
 class TransformerBlock(nn.Module):
     """
     Standard SDPA-based Transformer block (self-attention + MLP) with residuals
-    and LayerNorm. Ported from components/attentions.py without behavior changes.
+    and LayerNorm, routed through the SDPA backend runner.
     """
 
     def __init__(
@@ -98,11 +98,11 @@ class TransformerBlock(nn.Module):
 
         mask = self._combine_masks(attn_mask, key_padding_mask, B, self.n_heads, T, T, x.device, q.dtype)
 
-        attn = F.scaled_dot_product_attention(
+        attn = sdpa_run(
             q, k, v,
-            attn_mask=mask,
-            dropout_p=self.attn_drop_p if self.training else 0.0,
+            attn_bias=mask,
             is_causal=is_causal,
+            dropout_p=self.attn_drop_p if self.training else 0.0,
         )
         attn = attn.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(attn)
@@ -174,3 +174,4 @@ class TransformerEncoder(nn.Module):
                 hiddens.append(x)
         x = self.final_norm(x)
         return (x, hiddens) if return_hidden_states else x
+
