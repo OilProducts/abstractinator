@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from ...base import SegmentContext
-from .cross_segment_impl import SegmentCausalCrossAttention
+from .cross_segment_sdpa import SegmentCausalCrossAttention
 
 
 class SDPASegmentCrossAttention(nn.Module):

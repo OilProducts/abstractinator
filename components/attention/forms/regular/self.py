@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .block_impl import TransformerBlock as SDPATransformerBlock
+from .self_sdpa import TransformerBlock as SDPATransformerBlock
 
 
 class CausalSelfRegularBlock(nn.Module):

@@ -8,4 +8,4 @@ import torch.nn.functional as F
 from typing import Optional, Dict
 
 from .attention.cache import AttnCache
-from .attention.sdpa.cross_segment import SegmentCausalCrossAttention
+from .attention import SegmentCausalCrossAttention
