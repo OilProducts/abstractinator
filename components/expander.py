@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from .rope import RoPECache, apply_rope
 from .attention.cache import AttnCache
 from .attention.base import SegmentContext
-from .attention.sdpa.adapter import SDPASegmentCrossAttention
 from .config_types import AttentionConfig
 from .swiglu import SwiGLU
 from .vector_quantizer import MultiStageResidualVQ, RVQEmbeddingAdapter, RVQFactorizedHead, ComposedIndexCodec, \
@@ -546,15 +545,21 @@ class SlidingDecoderBlock(nn.Module):
         super().__init__()
         self.layer_id = f'L{idx}'
         self.norm1 = nn.RMSNorm(d_model)
-        from .attention.factory import make_causal_self_block
+        from .attention.factory import make_causal_self_block, make_segment_cross_attention
         self.self_attn = make_causal_self_block(
             dim=d_model, num_heads=num_heads, ffn_dim_multiplier=4,
             cfg=self_attn_config or AttentionConfig(variant="mla", kernel="flex", kv_comp_dim=d_model // 16, q_comp_dim=d_model // 32, retr_dim=d_model // num_heads),
         )
         self.norm2 = nn.RMSNorm(d_model)
         lookback = cross_attn_config.lookback if (cross_attn_config and cross_attn_config.lookback is not None) else cross_window
-        self.cross_attn = SDPASegmentCrossAttention(
-            q_dim=q_dim, kv_dim=kv_dim, d_attn=d_model, n_heads=num_heads, lookback=lookback, bias=False
+        cfg_cross = cross_attn_config or AttentionConfig(variant="regular", kernel="sdpa", lookback=lookback)
+        self.cross_attn = make_segment_cross_attention(
+            q_dim=q_dim,
+            kv_dim=kv_dim,
+            d_attn=d_model,
+            n_heads=num_heads,
+            lookback=lookback,
+            cfg=cfg_cross,
         )
         self.norm3 = nn.RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, 4 * d_model)

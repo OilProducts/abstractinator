@@ -6,29 +6,23 @@ import torch
 import torch.nn as nn
 
 from ..config_types import AttentionConfig
-from .sdpa.block import TransformerBlock as SDPATransformerBlock
-from .sdpa.local import CausalLocalSDPABlock
-from ..mla import CausalMLATransformerBlock, SlidingWindowMLATransformerBlock  # local import; avoid re-export cycles
+from .forms.regular import (
+    CausalSelfRegularBlock,
+    CausalLocalRegularBlock,
+    SDPASegmentCrossAttention,
+    CausalSelfFlexBlock,
+    CausalLocalSelfFlexBlock,
+    SegmentCausalCrossAttentionFlex,
+)
+from .forms.mla.self import (
+    CausalMLATransformerBlock,
+    SlidingWindowMLATransformerBlock,
+)
+from .forms.mla.cross_segment import MLASegmentCrossAttention
 
 
-class _SelfCausalSDPABlock(nn.Module):
-    """Adapter to present a CausalMLATransformerBlock-like interface for SDPA blocks."""
-
-    def __init__(self, d_model: int, n_heads: int, ffn_dim_multiplier: int = 4):
-        super().__init__()
-        self.block = SDPATransformerBlock(
-            d_model=d_model,
-            n_heads=n_heads,
-            d_ff=d_model * ffn_dim_multiplier,
-            attn_dropout=0.0,
-            resid_dropout=0.0,
-            prenorm=True,
-            ln_eps=1e-5,
-            bias=True,
-        )
-
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.block(x, attn_mask=None, key_padding_mask=key_padding_mask, is_causal=True)
+class _SelfCausalSDPABlock(CausalSelfRegularBlock):
+    pass
 
 
 def make_causal_self_block(
@@ -40,7 +34,9 @@ def make_causal_self_block(
     ) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.variant == "regular":
-        # Regular attention via SDPA (flex kernel for regular can be added later; fallback to SDPA)
+        if cfg.kernel == "flex":
+            return CausalSelfFlexBlock(dim, num_heads, dim * ffn_dim_multiplier)
+        # Regular attention via SDPA
         return _SelfCausalSDPABlock(dim, num_heads, ffn_dim_multiplier)
     # MLA path
     head_dim = cfg.head_dim if cfg.head_dim is not None else (dim // num_heads)
@@ -70,7 +66,14 @@ def make_sliding_self_block(
 ) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.variant == "regular":
-        return CausalLocalSDPABlock(
+        if cfg.kernel == "flex":
+            return CausalLocalSelfFlexBlock(
+                d_model=dim,
+                n_heads=num_heads,
+                window_size=window_size,
+                d_ff=dim * ffn_dim_multiplier,
+            )
+        return CausalLocalRegularBlock(
             d_model=dim,
             n_heads=num_heads,
             window_size=window_size,
@@ -87,5 +90,57 @@ def make_sliding_self_block(
         q_comp_dim=cfg.q_comp_dim,
         retr_dim=cfg.retr_dim,
         ffn_dim_multiplier=ffn_dim_multiplier,
+        use_flex_attention=(cfg.kernel == "flex"),
+    )
+
+
+
+
+def make_segment_cross_attention(
+    *,
+    q_dim: int,
+    kv_dim: int,
+    d_attn: int,
+    n_heads: int,
+    lookback: int = 0,
+    cfg: Optional[AttentionConfig] = None,
+) -> nn.Module:
+    """
+    Factory for cross-attention over segment memories.
+
+    - cfg.variant == "regular" → SDPA implementation
+    - cfg.variant == "mla"     → MLA with flex or fallback kernel
+    """
+    cfg = cfg or AttentionConfig()
+    if cfg.variant == "regular":
+        look = lookback if cfg.lookback is None else int(cfg.lookback)
+        if cfg.kernel == "flex":
+            return SegmentCausalCrossAttentionFlex(
+                q_dim=q_dim,
+                kv_dim=kv_dim,
+                d_attn=d_attn,
+                n_heads=n_heads,
+                lookback=look,
+                bias=False,
+            )
+        return SDPASegmentCrossAttention(
+            q_dim=q_dim,
+            kv_dim=kv_dim,
+            d_attn=d_attn,
+            n_heads=n_heads,
+            lookback=look,
+            bias=False,
+        )
+
+    head_dim = cfg.head_dim if cfg.head_dim is not None else (q_dim // n_heads)
+    return MLASegmentCrossAttention(
+        q_dim=q_dim,
+        kv_dim=kv_dim,
+        n_heads=n_heads,
+        lookback=lookback if cfg.lookback is None else int(cfg.lookback),
+        head_dim=head_dim,
+        kv_comp_dim=int(cfg.kv_comp_dim or (q_dim // 8)),
+        q_comp_dim=int(cfg.q_comp_dim or (q_dim // 8)),
+        retr_dim=int(cfg.retr_dim or head_dim),
         use_flex_attention=(cfg.kernel == "flex"),
     )
