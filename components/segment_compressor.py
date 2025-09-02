@@ -715,12 +715,18 @@ class SegmentCompressor(nn.Module):
 
         self.num_queries_per_segment = num_queries
         self.output_length = output_length
-        self.use_flex_attention = use_flex_attention if (attention_config is None) else bool(attention_config.use_flex_attention)
+        self.use_flex_attention = (
+            use_flex_attention if (attention_config is None) else (attention_config.kernel == "flex")
+        )
 
         # Shared stack
         attn_cfg = attention_config or AttentionConfig(
-            backend="mla", use_flex_attention=self.use_flex_attention,
-            head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim, retr_dim=retr_dim,
+            variant="mla",
+            kernel=("flex" if self.use_flex_attention else "sdpa"),
+            head_dim=head_dim,
+            kv_comp_dim=kv_comp_dim,
+            q_comp_dim=q_comp_dim,
+            retr_dim=retr_dim,
         )
 
         self.shared_layers = nn.ModuleList([
@@ -745,17 +751,30 @@ class SegmentCompressor(nn.Module):
         # Entropy model branch
         if use_gaussian_segmentation:
             self.entropy_model: EntropyModelBase = GaussianEntropyModel(
-                dim=dim, n_heads=heads, window=lm_window,
-                head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                use_flex_attention=self.use_flex_attention, n_layers=num_lm_encoder_layers,
+                dim=dim,
+                n_heads=heads,
+                window=lm_window,
+                head_dim=head_dim,
+                kv_comp_dim=kv_comp_dim,
+                q_comp_dim=q_comp_dim,
+                retr_dim=retr_dim,
+                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                n_layers=num_lm_encoder_layers,
+                attention_config=attn_cfg,
             )
         else:
             self.entropy_model = LogitEntropyModel(
-                dim=dim, vocab_size=vocab_size, n_heads=heads, window=lm_window,
-                head_dim=head_dim, kv_comp_dim=kv_comp_dim, q_comp_dim=q_comp_dim,
-                retr_dim=retr_dim, ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                use_flex_attention=self.use_flex_attention, n_layers=num_lm_encoder_layers,
+                dim=dim,
+                vocab_size=vocab_size,
+                n_heads=heads,
+                window=lm_window,
+                head_dim=head_dim,
+                kv_comp_dim=kv_comp_dim,
+                q_comp_dim=q_comp_dim,
+                retr_dim=retr_dim,
+                ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+                n_layers=num_lm_encoder_layers,
+                attention_config=attn_cfg,
             )
 
         # Segmenter utility
