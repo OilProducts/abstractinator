@@ -532,10 +532,15 @@ def mog_bpd(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor, targ
     return bpd
 
 
-def gaussian_token_logits(mu: torch.Tensor, logvar: torch.Tensor, E: nn.Embedding, ln: nn.LayerNorm) -> torch.Tensor:
+def gaussian_token_logp(mu: torch.Tensor, logvar: torch.Tensor, E: nn.Embedding, ln: nn.LayerNorm) -> torch.Tensor:
     """
-    Single-component anisotropic logits (K=1), matching your Mahalanobis switch.
+    Single-component anisotropic log-probabilities up to a global constant.
+    Includes the row-wise constant term (-0.5 * sum(logvar)). Use when actual
+    log-likelihood magnitudes matter (e.g., reporting/calibration). For
+    softmax/CE or ranking, prefer gaussian_token_logits defined above.
+
     mu/logvar: (B,D)
+    Returns: (B,V) tensor of log-probabilities up to a constant per-row.
     """
     B, D = mu.shape
     proto = ln(E.weight)  # (V,D)
