@@ -92,6 +92,13 @@ class AbstractinatorPyramid(nn.Module):
 
         total_loss = sum(co['loss_total'] for co in comp_outs)
 
+        # Aggregate VQ loss across levels (0 if a level has no quantizer)
+        vq_total = torch.zeros((), device=total_loss.device)
+        for co in comp_outs:
+            comp = co.get("comp_out") if isinstance(co, dict) else None
+            if comp is not None and getattr(comp, "vq_loss", None) is not None:
+                vq_total = vq_total + comp.vq_loss
+
         # Optional Top-LM training (predict next top embedding)
         top_lm_avg_loss = None
         top_lm_details: dict[str, torch.Tensor] | None = None
@@ -143,6 +150,7 @@ class AbstractinatorPyramid(nn.Module):
         out = {
             "comp_outs": comp_outs,
             "loss_total": total_loss,
+            "loss_vq": vq_total,
             # "loss_digit_ce": total_digit,
             # "loss_special_ce": total_special,
             # "loss_vq": vq_total,
