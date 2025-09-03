@@ -239,9 +239,14 @@ class AbstractinatorPyramid(nn.Module):
         from .tokenizer import ByteLevelTokenizer
 
         tokenizer = ByteLevelTokenizer()
-        print(
-            f"{tokenizer.decode(prompt_ent_gen.squeeze())}{tokenizer.decode(torch.argmax(torch.cat(generated, dim=1) @ E.weight.T, dim=-1).squeeze())}"
+        decoded_prompt = tokenizer.decode(prompt_ent_gen.squeeze())
+        decoded_generated = tokenizer.decode(
+            torch.argmax(
+                torch.cat(generated, dim=1) @ E.weight.T,
+                dim=-1,
+            ).squeeze()
         )
+        print(f"{decoded_prompt}{decoded_generated}")
         for _ in range(max_top_steps):
             # ── Phase 1: Upward compression on current bytes ─────────────────────
             comp_all = self.compress_all(prompt, prompt_kpm, comp_only=True)

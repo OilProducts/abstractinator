@@ -14,8 +14,10 @@ Creates a directory like:
     README.txt        # quick offline instructions
 
 Usage (examples):
-  python bundle_hf_dataset.py --dataset wikitext --config wikitext-103-v1 --splits train validation --out ./wikitext_bundle
-  python bundle_hf_dataset.py --dataset c4 --config en --splits train --trust-remote-code
+  python bundle_hf_dataset.py --dataset wikitext --config wikitext-103-v1 \
+      --splits train validation --out ./wikitext_bundle
+  python bundle_hf_dataset.py --dataset c4 --config en --splits train \
+      --trust-remote-code
 
 On the offline box (option A: zero code changes):
   export HF_DATASETS_CACHE=/path/to/wikitext_bundle/cache
