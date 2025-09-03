@@ -75,6 +75,7 @@ class TrainingMetrics:
         self.output_seq_lengths_t: list[torch.Tensor | None] = [None] * self.num_levels
 
         self.all_codebook_perplexities_t: list[torch.Tensor | None] = [None] * self.num_levels
+        # Sum for window-average of perplexity; None means "no signal this window"
         self._ppl_sum_t: list[torch.Tensor | None] = [None] * self.num_levels
         self.non_padded_tokens_t = None
         self.count = 0
@@ -100,8 +101,8 @@ class TrainingMetrics:
             # initialise per-level lists
             self.input_seq_lengths_t = [zero.clone() for _ in range(self.num_levels)]
             self.output_seq_lengths_t = [zero.clone() for _ in range(self.num_levels)]
-            self.all_codebook_perplexities_t = [zero.clone() for _ in range(self.num_levels)]
-            self._ppl_sum_t = [zero.clone() for _ in range(self.num_levels)]
+            self.all_codebook_perplexities_t = [None for _ in range(self.num_levels)]
+            self._ppl_sum_t = [None for _ in range(self.num_levels)]
 
         # Window counters on device; no host syncs here
         self.total_loss_t = self.total_loss_t + output["loss_total"].detach()
@@ -179,8 +180,12 @@ class TrainingMetrics:
             self._saw_perplexities = True
             for lvl, ppl in enumerate(output["all_codebook_perplexities"]):
                 val = ppl if isinstance(ppl, torch.Tensor) else torch.tensor(float(ppl), device=dev)
+                if self.all_codebook_perplexities_t[lvl] is None:
+                    self.all_codebook_perplexities_t[lvl] = torch.zeros((), device=dev, dtype=torch.float32)
                 self.all_codebook_perplexities_t[lvl] = self.all_codebook_perplexities_t[lvl] + val.detach()
                 # Accumulate raw sum; apply EMA only at log time to avoid per‑batch syncs
+                if self._ppl_sum_t[lvl] is None:
+                    self._ppl_sum_t[lvl] = torch.zeros((), device=dev, dtype=torch.float32)
                 self._ppl_sum_t[lvl] = self._ppl_sum_t[lvl] + val.detach()
 
     # -------- Window summarization --------
@@ -287,10 +292,11 @@ class TrainingMetrics:
             parts.append(f"Ratios [{ratios_str}]")
 
         # Update smoothed PPL from window averages (one sync per level per log event)
-        for lvl in range(self.num_levels):
-            if self._ppl_sum_t and self._ppl_sum_t[lvl] is not None and self.count > 0:
-                avg_val = (self._ppl_sum_t[lvl] / self.count).item()
-                self._ppl_ema.update(lvl, avg_val)
+        if self._saw_perplexities:
+            for lvl in range(self.num_levels):
+                if self._ppl_sum_t[lvl] is not None and self.count > 0:
+                    avg_val = (self._ppl_sum_t[lvl] / self.count).item()
+                    self._ppl_ema.update(lvl, avg_val)
         ppl_str = ", ".join(
             f"{self._ppl_ema.values[lvl]:.4f}" if self._ppl_ema.ready[lvl] else "n/a" for lvl in range(self.num_levels)
         )

@@ -125,7 +125,20 @@ class AbstractinatorPyramid(nn.Module):
                 }
 
         # Collect useful diagnostics for logging
-        # all_codebook_perplexities = [co['comp_out'].vq_perplexity for co in comp_outs]
+        all_codebook_perplexities = []
+        try:
+            for co in comp_outs:
+                comp = co.get("comp_out") if isinstance(co, dict) else None
+                ppl = getattr(comp, "vq_perplexity", None) if comp is not None else None
+                # Use 0.0 if missing to keep list length consistent with levels
+                if ppl is None:
+                    zero = torch.tensor(0.0, device=total_loss.device)
+                    all_codebook_perplexities.append(zero)
+                else:
+                    all_codebook_perplexities.append(ppl)
+        except Exception:
+            # Fallback to zeros if structure differs
+            all_codebook_perplexities = [torch.tensor(0.0, device=total_loss.device) for _ in comp_outs]
 
         out = {
             "comp_outs": comp_outs,
@@ -134,7 +147,7 @@ class AbstractinatorPyramid(nn.Module):
             # "loss_special_ce": total_special,
             # "loss_vq": vq_total,
             # "loss_byte_lm_ce": total_byte_lm,
-            # "all_codebook_perplexities": all_codebook_perplexities,
+            "all_codebook_perplexities": all_codebook_perplexities,
         }
 
         if top_lm_avg_loss is not None and top_lm_details is not None:
