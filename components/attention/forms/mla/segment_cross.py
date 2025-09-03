@@ -30,9 +30,9 @@ class SegmentCross(nn.Module):
         self.inner = MLASegmentCrossAttention(
             q_dim=q_dim,
             kv_dim=kv_dim,
-            d_attn=q_dim,  # parity with original block
             n_heads=n_heads,
             lookback=lookback,
+            head_dim=head_dim,
             kv_comp_dim=kv_comp_dim,
             q_comp_dim=q_comp_dim,
             retr_dim=retr_dim,
@@ -43,4 +43,3 @@ class SegmentCross(nn.Module):
         return self.inner(*args, **kwargs)
 
 __all__ = ["SegmentCross"]
-

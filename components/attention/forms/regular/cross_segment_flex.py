@@ -104,7 +104,8 @@ class SegmentCausalCrossAttentionFlex(nn.Module):
 
         q_pos = q_pos_ids if q_pos_ids.dim() == 2 else q_pos_ids.unsqueeze(0).expand(B, -1)
         q_pos = q_pos.to(torch.long)
-        kv_pos = kv_pos_ids.to(torch.long).view(1, 1, Lk, 1)
+        # kv_pos: gather absolute RoPE positions for each key position per batch
+        kv_pos = kv_pos_ids.to(torch.long).view(1, 1, Lk, 1).expand(B, 1, -1, 1)
 
         cos_all, sin_all = self.rope.cos.to(device=qh.device, dtype=qh.dtype), self.rope.sin.to(device=qh.device, dtype=qh.dtype)
         Smax = cos_all.size(2)
@@ -114,8 +115,9 @@ class SegmentCausalCrossAttentionFlex(nn.Module):
         qh = apply_rope(qh, q_cos, q_sin)
 
         kv_pos = torch.clamp(kv_pos, 0, Smax - 1)
-        k_cos = torch.take_along_dim(cos_all.unsqueeze(3).expand(B, 1, -1, 1, cos_all.size(-1)), kv_pos, dim=2)
-        k_sin = torch.take_along_dim(sin_all.unsqueeze(3).expand(B, 1, -1, 1, sin_all.size(-1)), kv_pos, dim=2)
+        # Index along the sequence dimension to obtain per-key RoPE tables
+        k_cos = torch.take_along_dim(cos_all.expand(B, 1, -1, -1), kv_pos, dim=2)
+        k_sin = torch.take_along_dim(sin_all.expand(B, 1, -1, -1), kv_pos, dim=2)
         kh = apply_rope(kh, k_cos, k_sin)
 
         # Block mask from segment lookback + padding

@@ -451,29 +451,39 @@ class LogitEntropyModel(EntropyModelBase):
 
         return EntropyOut(bits=bits, loss=loss, logits=logits)
 
-    def prefill(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+    def prefill(self, x: Tensor, key_padding_mask: Optional[Tensor]) -> Tuple[LogitCache, Tensor]:
+        """
+        Build per-layer caches and materialize last-position logits.
+        Returns a LogitCache compatible with streaming APIs.
+        """
         h = x
         caches: List[Tuple[Tensor, Tensor]] = []
         for blk in self.layers:
             h, cache = blk.prefill(h, pos_start=0, key_padding_mask=key_padding_mask)
             caches.append(cache)
-        logits = self.proj(self.norm(h))
+        logits = self.proj(self.norm(h))  # (B, S, V)
         bits = token_entropy(logits)
-        return caches, bits
+        cache = LogitCache(layers=caches, last_logits=logits[:, -1, :])
+        return cache, bits
 
     def step(self,
-             caches: List[Tuple[Tensor, Tensor]],
+             cache: LogitCache,
              new_x: Tensor,
              pos_start: int,
-             key_padding_mask_new: Optional[Tensor]) -> Tuple[List[Tuple[Tensor, Tensor]], Tensor]:
+             key_padding_mask_new: Optional[Tensor]) -> Tuple[LogitCache, Tensor]:
+        """
+        Advance caches with only the new tokens and update last_logits.
+        Returns the updated LogitCache and entropy bits for the new tokens.
+        """
         h = new_x
         for i, blk in enumerate(self.layers):
-            h, caches[i] = blk.step(
-                h, cache=caches[i], pos_start=pos_start, key_padding_mask_new=key_padding_mask_new
+            h, cache.layers[i] = blk.step(
+                h, cache=cache.layers[i], pos_start=pos_start, key_padding_mask_new=key_padding_mask_new
             )
-        logits = self.proj(self.norm(h))
+        logits = self.proj(self.norm(h))  # (B, T_new, V)
         bits = token_entropy(logits)
-        return caches, bits
+        cache.last_logits = logits[:, -1, :]
+        return cache, bits
 
     @torch.no_grad()
     def sample_next(self,
@@ -693,10 +703,10 @@ class SegmentCompressor(nn.Module):
         num_compression_encoder_layers: Optional[int] = None,
 
         num_queries: int = 1,
-        output_length: int = 512,
+        output_length: int = 1024,
 
         # Segmentation knobs
-        use_gaussian_segmentation: bool = True,
+        use_gaussian_segmentation: bool = False,
         entropy_delta: float = 0.0,
         entropy_abs_threshold: Optional[float] = None,
 

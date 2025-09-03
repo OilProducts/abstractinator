@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .impl import MultiheadLatentAttention
+from torch.nn.attention.flex_attention import create_block_mask
 
 
 class MLASegmentCrossAttention(nn.Module):
@@ -61,6 +62,23 @@ class MLASegmentCrossAttention(nn.Module):
         good = (k_seg <= q_seg) & (k_seg >= (q_seg - self.lookback))
         return (~good).unsqueeze(1)                          # [B,1,Lq,Lk]
 
+    def _flex_lookback_block(self, seg_id_q: torch.Tensor, Lk: int, pad: Optional[torch.Tensor]) -> object:
+        # Build a FlexAttention block mask for lookback (and optional padding) gating.
+        # seg_id_q: [B,Lq] long; pad: [B,Lk] bool or None
+        seg_id_q = seg_id_q.contiguous()
+        if pad is not None:
+            pad = pad.to(torch.bool).contiguous()
+
+        def keep(b, h, q, k):
+            ok = (k <= seg_id_q[b, q]) & (k >= (seg_id_q[b, q] - self.lookback))
+            if pad is not None:
+                ok = ok & (~pad[b, k])
+            return ok
+
+        B = seg_id_q.size(0)
+        Lq = seg_id_q.size(1)
+        return create_block_mask(keep, B=B, H=self.mla.h, Q_LEN=Lq, KV_LEN=Lk, BLOCK_SIZE=128, device=seg_id_q.device)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -81,14 +99,17 @@ class MLASegmentCrossAttention(nn.Module):
         seg_id = getattr(segment, "seg_id", None)
         if seg_id is None:
             raise AssertionError("SegmentContext.seg_id is required for MLASegmentCrossAttention")
-        block = self._lookback_block(seg_id.to(device=dev, dtype=torch.long), Lk)
-
         # Merge key padding from SegmentContext and/or function arg
         kv_mask = getattr(segment, "kv_mask", None)
         if key_padding_mask is not None:
             kv_mask = key_padding_mask if kv_mask is None else (kv_mask | key_padding_mask)
-        if kv_mask is not None:
-            block = self._combine(block, kv_mask[:, None, None, :].to(device=dev, dtype=torch.bool))
+        seg_long = seg_id.to(device=dev, dtype=torch.long)
+        if self.mla.use_flex_attention:
+            block = self._flex_lookback_block(seg_long, Lk, kv_mask.to(torch.bool) if kv_mask is not None else None)
+        else:
+            block = self._lookback_block(seg_long, Lk)
+            if kv_mask is not None:
+                block = self._combine(block, kv_mask[:, None, None, :].to(device=dev, dtype=torch.bool))
 
         # Hint padding to MLA for score-side masking
         self.mla.set_pad_for_scores(kv_mask.to(torch.bool) if kv_mask is not None else None)

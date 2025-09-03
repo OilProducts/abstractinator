@@ -5,14 +5,14 @@ from components.config_types import PyramidConfig, AbstractinatorConfig, TopTran
 
 
 # Attention: MLA form on FlexAttention backend
-# Head dims: with D=256 and 8 heads → head_dim=32; choose kv/q/retr dims modestly
+# Head dims: with D=256 and 8 heads → head_dim=32; project down for MLA
 MLA_FLEX = AttentionConfig(
     variant="mla",
     kernel="flex",
     head_dim=32,
-    kv_comp_dim=64,
-    q_comp_dim=128,
-    retr_dim=32,
+    kv_comp_dim=16,
+    q_comp_dim=64,
+    retr_dim=16,
 )
 
 
@@ -22,9 +22,9 @@ level = AbstractinatorConfig(
     c_heads=8,
     c_window=64,
     c_head_dim=32,
-    c_kv_comp_dim=64,
-    c_q_comp_dim=128,
-    c_retr_dim=32,
+    c_kv_comp_dim=16,
+    c_q_comp_dim=64,
+    c_retr_dim=16,
     c_num_encoder_layers=6,
     c_num_shared_encoder_layers=0,
     c_num_lm_encoder_layers=12,
@@ -45,9 +45,9 @@ top_lm = TopTransformerConfig(
     num_layers=12,
     num_heads=8,
     head_dim=32,
-    kv_comp_dim=64,
-    q_comp_dim=128,
-    retr_dim=32,
+    kv_comp_dim=16,
+    q_comp_dim=64,
+    retr_dim=16,
     attention_config=MLA_FLEX,
 )
 
@@ -57,8 +57,7 @@ exp_config = ExpConfig(
     device=DEVICE,
     pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=True),
     top_transformer_config=top_lm,
-    batch_size=2,
-    sequence_length=256,
+    batch_size=16,
+    sequence_length=2048,
     num_epochs=1,
 )
-

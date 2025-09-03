@@ -36,7 +36,8 @@ class SegmentCausalCrossAttention(nn.Module):
         self.scale = self.hdim ** -0.5
         self.lookback = int(lookback)
 
-        self.rope_cache = RoPECache(max_seqlen=8192, head_dim=self.hdim, dtype=torch.bfloat16, device=device)
+        # Build cache on CPU; buffers move with module.to(device). We cast per‑use to match q/k dtype/device.
+        self.rope_cache = RoPECache(max_seqlen=8192, head_dim=self.hdim, dtype=torch.bfloat16, device="cpu")
         assert (self.hdim % 2) == 0, "RoPE requires even head dim per head"
         half_in_cache = self.rope_cache.cos.size(-1)
         assert half_in_cache * 2 == self.hdim, "RoPECache/head_dim mismatch"
@@ -153,4 +154,3 @@ class SegmentCausalCrossAttention(nn.Module):
         return (
             x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()
         )
-

@@ -44,8 +44,9 @@ exp_config = ExpConfig(
     device=DEVICE,
     pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=True),
     top_transformer_config=top_lm,
-    batch_size=2,
-    sequence_length=256,
+    batch_size=16,
+    sequence_length=2048,
     num_epochs=1,
+    generation_interval = 500
 )
 

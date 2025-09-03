@@ -59,12 +59,12 @@ class MultiheadLatentAttention(nn.Module):
 
     def __init__(
         self,
-        dim_q: int = 384,
+        dim_q: int = 256,
         num_heads: int = 8,
-        head_dim: int = 64,     # K
+        head_dim: int = 32,     # K
         kv_comp_dim: int = 64,  # c
-        q_comp_dim: int = 16,   # d_c'
-        retr_dim: int = 64,     # r  (must be even for RoPE)
+        q_comp_dim: int = 128,   # d_c'
+        retr_dim: int = 32,     # r  (must be even for RoPE)
         score_mod: Optional[Callable] = None,  # Flex mask/bias callback
         use_flex_attention: bool = True,
         rope_max_seqlen: int = 2048,

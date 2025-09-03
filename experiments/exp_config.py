@@ -85,13 +85,18 @@ class ExpConfig:
     warmup_steps: int = 1000
     scheduler_specific_kwargs: Dict[str, Any] = field(default_factory=lambda: {"min_lr": 1e-6})
 
-    dataset_name: str = "roneneldan/TinyStories"
-    dataset_config: Optional[str] = None
-    dataset_train_split: str = "train"
+    # dataset_name: str = "roneneldan/TinyStories"
+    # dataset_config: Optional[str] = None
+    # dataset_train_split: str = "train"
     text_column_name: str = "text"
 
+    dataset_name: str = "HuggingFaceFW/fineweb-edu"
+    dataset_config: str = "sample-10BT"
+    dataset_train_split: str = "train"
+    sample_prompt_for_generation = "The purpose of education is to"
+
+    # sample_prompt_for_generation: str = "In a land far away, "
     generation_interval: int = 100
-    sample_prompt_for_generation: str = "In a land far away, "
     generation_max_len_override: int = 32
 
     checkpoint_interval: int = 1000
