@@ -3,8 +3,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import get_scheduler
@@ -106,10 +108,7 @@ def bytes_decode(ids: torch.Tensor) -> str:
         return bytes([int(x) & 0xFF for x in ids.tolist()]).decode("utf-8", errors="ignore")
 
 
-import math
-
-import torch
-import torch.nn.functional as F
+ 
 
 
 # --- numeric helper: stable logvar with a variance floor ---
