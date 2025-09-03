@@ -18,6 +18,7 @@ class FullSelf(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim_multiplier: int = 4, *, backend: str = "sdpa"):
         super().__init__()
+        self._is_sdpa = (backend == "sdpa")
         if backend == "flex":
             self.inner = _FlexFullSelf(d_model, n_heads, d_ff=d_model * ffn_dim_multiplier)
         elif backend == "sdpa":
@@ -35,6 +36,10 @@ class FullSelf(nn.Module):
             raise ValueError(f"Unknown backend: {backend}")
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self._is_sdpa:
+            # SDPA path: enforce causal masking
+            return self.inner(x, key_padding_mask=key_padding_mask, is_causal=True)
+        # Flex path is already causal via its block mask
         return self.inner(x, key_padding_mask=key_padding_mask)
 
     # Streaming API (recompute fallback)

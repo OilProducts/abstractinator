@@ -28,7 +28,10 @@ def make_causal_self_block(
     ) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.variant == "regular":
-        return RegularFullSelf(dim, num_heads, ffn_dim_multiplier, backend=(cfg.kernel or "sdpa"))
+        return RegularFullSelf(
+            dim, num_heads, ffn_dim_multiplier,
+            backend=(cfg.kernel or "sdpa"),
+        )
     # MLA path
     head_dim = cfg.head_dim if cfg.head_dim is not None else (dim // num_heads)
     kv_comp_dim = cfg.kv_comp_dim

@@ -7,6 +7,7 @@ import torch.nn as nn
 from components.swiglu import SwiGLU
 from ...masks import merge_masks
 from ...backends.sdpa import run as sdpa_run
+from components.rope import RoPECache, apply_rope
 
 
 class TransformerBlock(nn.Module):
@@ -25,6 +26,8 @@ class TransformerBlock(nn.Module):
         prenorm: bool = True,
         ln_eps: float = 1e-5,
         bias: bool = True,
+        rope_max_seqlen: int = 8192,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -49,6 +52,17 @@ class TransformerBlock(nn.Module):
             self.mlp_drop,
         )
         self.apply(self._init_weights)
+
+        # RoPE (mandatory)
+        assert (self.head_dim % 2) == 0, "RoPE expects even head dim"
+        # Build on CPU; buffers move with module.to(device). Keep low-precision cache.
+        self.rope_cache = RoPECache(
+            max_seqlen=int(rope_max_seqlen),
+            head_dim=self.head_dim,
+            base=float(rope_base),
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
 
     @staticmethod
     def _init_weights(m: nn.Module):
@@ -92,9 +106,27 @@ class TransformerBlock(nn.Module):
         B, T, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B,H,T,d)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q/K (mandatory)
+        # Ensure cache capacity (simple guard; rebuild if needed)
+        Smax = int(self.rope_cache.cos.size(2))
+        if T > Smax:
+            # Rebuild a larger cache on-the-fly (on CPU; buffers move with module)
+            new_max = int(2 ** math.ceil(math.log2(T)))
+            self.rope_cache = RoPECache(
+                max_seqlen=new_max,
+                head_dim=self.head_dim,
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+            Smax = new_max
+        cos = self.rope_cache.cos[..., :T, :].to(device=q.device, dtype=q.dtype)
+        sin = self.rope_cache.sin[..., :T, :].to(device=q.device, dtype=q.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         mask = self._combine_masks(attn_mask, key_padding_mask, B, self.n_heads, T, T, x.device, q.dtype)
 
@@ -174,4 +206,3 @@ class TransformerEncoder(nn.Module):
                 hiddens.append(x)
         x = self.final_norm(x)
         return (x, hiddens) if return_hidden_states else x
-

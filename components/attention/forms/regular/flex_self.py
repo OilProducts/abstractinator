@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
 from components.swiglu import SwiGLU
+from components.rope import RoPECache, apply_rope
 from ...backends.flex import run as flex_run
 
 
@@ -73,6 +74,15 @@ class CausalSelfFlexBlock(nn.Module):
             SwiGLU(d_model, self.d_ff),
         )
 
+        # RoPE cache (mandatory positional info)
+        assert (self.head_dim % 2) == 0, "RoPE expects even head dim"
+        self.rope_cache = RoPECache(
+            max_seqlen=8192,
+            head_dim=self.head_dim,
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+
     def _shape(self, x: torch.Tensor, B: int, L: int) -> torch.Tensor:
         H, d = self.n_heads, self.head_dim
         return x.view(B, L, H, d).transpose(1, 2).contiguous()
@@ -85,6 +95,16 @@ class CausalSelfFlexBlock(nn.Module):
         q = self._shape(q, B, L)
         k = self._shape(k, B, L)
         v = self._shape(v, B, L)
+
+        # Apply RoPE to Q/K
+        Smax = int(self.rope_cache.cos.size(2))
+        if L > Smax:
+            new_max = 1 << (L - 1).bit_length()
+            self.rope_cache = RoPECache(max_seqlen=new_max, head_dim=self.head_dim, dtype=torch.bfloat16, device="cpu")
+        cos = self.rope_cache.cos[..., :L, :].to(device=q.device, dtype=q.dtype)
+        sin = self.rope_cache.sin[..., :L, :].to(device=q.device, dtype=q.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         block = _cached_causal_block_mask(L, x.device)
 
@@ -134,6 +154,15 @@ class CausalLocalSelfFlexBlock(nn.Module):
             SwiGLU(d_model, self.d_ff),
         )
 
+        # RoPE cache (mandatory positional info)
+        assert (self.head_dim % 2) == 0, "RoPE expects even head dim"
+        self.rope_cache = RoPECache(
+            max_seqlen=8192,
+            head_dim=self.head_dim,
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+
     def _shape(self, x: torch.Tensor, B: int, L: int) -> torch.Tensor:
         H, d = self.n_heads, self.head_dim
         return x.view(B, L, H, d).transpose(1, 2).contiguous()
@@ -146,6 +175,16 @@ class CausalLocalSelfFlexBlock(nn.Module):
         q = self._shape(q, B, L)
         k = self._shape(k, B, L)
         v = self._shape(v, B, L)
+
+        # Apply RoPE to Q/K
+        Smax = int(self.rope_cache.cos.size(2))
+        if L > Smax:
+            new_max = 1 << (L - 1).bit_length()
+            self.rope_cache = RoPECache(max_seqlen=new_max, head_dim=self.head_dim, dtype=torch.bfloat16, device="cpu")
+        cos = self.rope_cache.cos[..., :L, :].to(device=q.device, dtype=q.dtype)
+        sin = self.rope_cache.sin[..., :L, :].to(device=q.device, dtype=q.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         block = _cached_sliding_block_mask(L, self.window, x.device)
         pad = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
@@ -160,4 +199,3 @@ class CausalLocalSelfFlexBlock(nn.Module):
         x = x + self.proj(attn)
         x = x + self.mlp(self.ln2(x))
         return x
-
