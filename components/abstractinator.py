@@ -31,6 +31,21 @@ class Abstractinator(nn.Module):
         self.embedding = nn.Embedding(cfg.vocab_size, cfg.D)
 
         # ---- 1) Compressor (produces vq_embeddings, vq_indices, seg_id, masks, etc.)
+        # Optional high‑side quantizer to bottleneck segment memory while keeping it continuous (D‑space)
+        vq_d_c = cfg.c_vq_d_c if cfg.c_vq_d_c is not None else 64
+        self.hi_quantizer = MultiStageResidualVQ(
+            K=int(cfg.c_vq_K),
+            D=int(cfg.D),
+            depth=int(cfg.c_vq_depth),
+            d_c=int(vq_d_c),
+            beta=float(cfg.c_vq_beta),
+            reset_interval=int(cfg.c_vq_reset_interval),
+            bos_token_id=int(cfg.bos_id),
+            eos_token_id=int(cfg.eos_id),
+            padding_token_id=int(cfg.pad_id),
+            eop_token_id=int(cfg.eop_id),
+        )
+
         self.compressor = SegmentCompressor(
             vocab_size=cfg.vocab_size,
             dim=cfg.D,
@@ -48,6 +63,7 @@ class Abstractinator(nn.Module):
             entropy_delta=cfg.c_entropy_delta,
             entropy_abs_threshold=cfg.c_entropy_abs_threshold,
             output_length=cfg.c_output_length,
+            quantizer=self.hi_quantizer,
             attention_config=cfg.compressor_attention,
         )
         # Embedding is owned here; SegmentCompressor consumes precomputed embeddings.
@@ -232,7 +248,8 @@ class Abstractinator(nn.Module):
         comp: CompressorOutput = self.compressor(embeddings, key_padding_mask=key_padding_mask, token_ids=token_ids)
 
         # hi memory for decoder (continuous)
-        memory = comp.pre_vq_embeddings  # (B, Ŝ*L, D) when num_queries>1; (B,Ŝ,D) when L==1
+        # Prefer continuous quantized memory (z_hat). Falls back to pre‑VQ embeddings if needed.
+        memory = comp.vq_embeddings if comp.vq_embeddings is not None else comp.pre_vq_embeddings
         # src KPM (True==pad) over memory rows
         if comp.valid_mask is not None:
             if self.compressor.num_queries_per_segment == 1:
@@ -274,10 +291,8 @@ class Abstractinator(nn.Module):
         # standard CE on logits
         ce = F.cross_entropy(stage_logits[0].transpose(1, 2), tgt)
 
-        total = (
-            cfg.w_code_ce * ce + cfg.w_byte_lm_ce * comp.entropy_loss
-            # + cfg.w_vq * vq_loss
-        )
+        vq_loss = comp.vq_loss if comp.vq_loss is not None else torch.zeros((), device=embeddings.device)
+        total = cfg.w_code_ce * ce + cfg.w_byte_lm_ce * comp.entropy_loss + cfg.w_vq * vq_loss
 
         # ---- 5) Metrics (compression) ----
         stats = _compression_stats(comp, key_padding_mask, self.compressor.num_queries_per_segment)
