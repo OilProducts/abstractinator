@@ -5,21 +5,22 @@ from typing import List, Optional
 @dataclass
 class AttentionConfig:
     # Variant: attention formulation
-    variant: str = "mla"                 # "regular" | "mla"
+    variant: str = "mla"  # "regular" | "mla"
 
     # Kernel: how to compute it
-    kernel: str = "flex"                 # "sdpa" | "flex"
+    kernel: str = "flex"  # "sdpa" | "flex"
 
     use_rope: bool = True
     causal: bool = True
-    window: Optional[int] = None         # sliding window radius (self-attn)
-    lookback: Optional[int] = None       # segment cross-attn lookback
+    window: Optional[int] = None  # sliding window radius (self-attn)
+    lookback: Optional[int] = None  # segment cross-attn lookback
 
     # MLA-specific knobs (ignored for regular)
     head_dim: Optional[int] = None
     kv_comp_dim: Optional[int] = 64
     q_comp_dim: Optional[int] = 128
     retr_dim: Optional[int] = 32
+
 
 @dataclass
 class AbstractinatorConfig:

@@ -9,45 +9,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from components import SwiGLU
-from .attention.forms.regular.self_sdpa import TransformerBlock, TransformerEncoder
-from components.attention.forms.mla.impl import CausalMLATransformerBlock
-from components.rope import apply_rope, RoPECache
+from components.rope import RoPECache, apply_rope
 
 
 # ---------- math helpers ----------
 def gaussian_bpd(mu: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Diagonal-Gaussian bits-per-dim per step: (B,L,D)->(B,L)."""
     const = 0.5 * math.log(2 * math.pi)
-    nll = 0.5 * ((target - mu)**2 * torch.exp(-logvar) + logvar) + const   # (B,L,D) in nats
-    bpd = (nll / math.log(2.0)).mean(dim=-1)                               # (B,L)
+    nll = 0.5 * ((target - mu) ** 2 * torch.exp(-logvar) + logvar) + const  # (B,L,D) in nats
+    bpd = (nll / math.log(2.0)).mean(dim=-1)  # (B,L)
     return bpd
+
 
 def gaussian_entropy_bits(logvar: torch.Tensor) -> torch.Tensor:
     """Predicted differential entropy per step in bits: (B,L,D)->(B,L)."""
     B, L, D = logvar.shape
     const = 0.5 * (D * math.log(2 * math.e * math.pi))
-    H = const + 0.5 * logvar.sum(dim=-1)   # nats
-    return H / math.log(2.0)               # bits
+    H = const + 0.5 * logvar.sum(dim=-1)  # nats
+    return H / math.log(2.0)  # bits
+
 
 def l2_prototype_logits(z: torch.Tensor, E: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
     """
     Prototype (distance) logits over vocabulary from latent(s) z.
     z: (B,D) or (B,L,D); E: (V,D); logits ∝ -||z - E_i||^2 / tau.
     """
-    z2 = (z * z).sum(dim=-1, keepdim=True)                  # (B,1) or (B,L,1)
-    E2 = (E * E).sum(dim=-1).view(1, *([1]*(z.dim()-2)), -1)  # broadcast to (...,V)
-    Ez = z @ E.T                                             # (...,V)
-    logits = (2.0 * Ez - E2.squeeze(0)) / tau               # drop z2 (constant wrt i)
+    (z * z).sum(dim=-1, keepdim=True)  # (B,1) or (B,L,1)
+    E2 = (E * E).sum(dim=-1).view(1, *([1] * (z.dim() - 2)), -1)  # broadcast to (...,V)
+    Ez = z @ E.T  # (...,V)
+    logits = (2.0 * Ez - E2.squeeze(0)) / tau  # drop z2 (constant wrt i)
     return logits
+
 
 def gaussian_token_logits(mu, logvar, E, ln_layer):  # mu, logvar: (B,D)
     # Apply the SAME LayerNorm to prototypes that you used during training.
-    proto = ln_layer(E.weight)                        # (V,D)
-    invvar = torch.exp(-logvar).unsqueeze(1)          # (B,1,D)
-    diff = proto.unsqueeze(0) - mu.unsqueeze(1)       # (B,V,D)
+    proto = ln_layer(E.weight)  # (V,D)
+    invvar = torch.exp(-logvar).unsqueeze(1)  # (B,1,D)
+    diff = proto.unsqueeze(0) - mu.unsqueeze(1)  # (B,V,D)
     # Drop constants in i (the -0.5*sum(logvar) term is common across tokens).
-    logits = -0.5 * (diff.pow(2) * invvar).sum(-1)    # (B,V)
+    logits = -0.5 * (diff.pow(2) * invvar).sum(-1)  # (B,V)
     return logits
+
 
 # ---------- masks ----------
 def _causal_mask(S: int, device) -> torch.Tensor:
@@ -55,6 +57,7 @@ def _causal_mask(S: int, device) -> torch.Tensor:
     m = torch.zeros(S, S, device=device)
     m = m.masked_fill(torch.triu(torch.ones(S, S, device=device, dtype=torch.bool), 1), float('-inf'))
     return m
+
 
 def _valid_step_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """
@@ -68,13 +71,13 @@ def _valid_step_mask(attn_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor
     return prev & curr
 
 
-
 class MHA_RoPE(nn.Module):
     """
     Multi-head self-attention with RoPE on Q/K.
     - Pre-norm outside in block
     - Uses scaled_dot_product_attention with key-padding masking + causal
     """
+
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -90,19 +93,19 @@ class MHA_RoPE(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                      # (B, L, H)
-        attn_keep_mask: Optional[torch.Tensor], # (B, L) bool, True=keep (valid), False=pad
+        x: torch.Tensor,  # (B, L, H)
+        attn_keep_mask: Optional[torch.Tensor],  # (B, L) bool, True=keep (valid), False=pad
         rope: "RoPECache",
     ) -> torch.Tensor:
         B, L, H = x.shape
-        qkv = self.qkv(x)                                 # (B, L, 3H)
+        qkv = self.qkv(x)  # (B, L, 3H)
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)  # (B, h, L, d)
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
 
         # RoPE on Q/K
-        cos, sin = rope.slice(L)                          # (1,1,L,d/2) views
+        cos, sin = rope.slice(L)  # (1,1,L,d/2) views
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
@@ -110,19 +113,21 @@ class MHA_RoPE(nn.Module):
         # Broadcast to (B, 1, 1, L) so it applies to all heads & all queries.
         attn_mask = None
         if attn_keep_mask is not None:
-            key_mask = (~attn_keep_mask).view(B, 1, 1, L)   # True at pads along key axis
+            key_mask = (~attn_keep_mask).view(B, 1, 1, L)  # True at pads along key axis
             attn_mask = key_mask
 
         # SDPA handles scaling internally; combine with causal masking implicitly.
         # (We pass is_causal=True; attn_mask masks keys; queries that are pads get zeroed after.)
         attn = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,                # boolean mask, broadcastable
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,  # boolean mask, broadcastable
             dropout_p=self.attn_drop.p if self.training else 0.0,
-            is_causal=True
-        )                                       # (B, h, L, d)
+            is_causal=True,
+        )  # (B, h, L, d)
 
-        out = attn.transpose(1, 2).reshape(B, L, H)         # (B, L, H)
+        out = attn.transpose(1, 2).reshape(B, L, H)  # (B, L, H)
 
         # Zero out outputs for padded query rows (stability/consistency).
         if attn_keep_mask is not None:
@@ -133,6 +138,7 @@ class MHA_RoPE(nn.Module):
 
 class TransformerBlockRoPE(nn.Module):
     """Pre-Norm block: LN -> MHA_RoPE -> residual; LN -> SwiGLU -> residual."""
+
     def __init__(self, d_model: int, n_heads: int, mlp_hidden_dim: int, dropout: float):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model, eps=1e-5)
@@ -152,6 +158,7 @@ class CausalGaussianCoreRoPE(nn.Module):
     Causal encoder predicting μ/logσ²/π for next-step embedding, with RoPE inside attention.
     Compatible with your previous core's API (now with mixtures by setting n_components > 1).
     """
+
     def __init__(
         self,
         dim: int,
@@ -164,7 +171,7 @@ class CausalGaussianCoreRoPE(nn.Module):
         max_seq_len: int = 8192,
         rope_base: float = 10000.0,
         rope_dtype: torch.dtype = torch.bfloat16,
-        mlp_hidden_dim: Optional[int] = None,   # default ~LLaMA-style if None
+        mlp_hidden_dim: Optional[int] = None,  # default ~LLaMA-style if None
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -176,10 +183,9 @@ class CausalGaussianCoreRoPE(nn.Module):
             # LLaMA-style SwiGLU width ≈ 8/3 * d_model keeps params near GELU-4x MLP
             mlp_hidden_dim = int((8 * d_model) / 3)
 
-        self.blocks = nn.ModuleList([
-            TransformerBlockRoPE(d_model, n_heads, mlp_hidden_dim, dropout)
-            for _ in range(n_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [TransformerBlockRoPE(d_model, n_heads, mlp_hidden_dim, dropout) for _ in range(n_layers)]
+        )
 
         # Heads for mixture stats
         self.K = int(n_components)
@@ -195,13 +201,13 @@ class CausalGaussianCoreRoPE(nn.Module):
             head_dim=d_model // n_heads,
             base=rope_base,
             dtype=rope_dtype,
-            device="cuda",   # safe default; will follow module.to(device)
+            device="cuda",  # safe default; will follow module.to(device)
         )
 
     def forward(
         self,
-        x: torch.Tensor,                         # (B, S, D) embeddings
-        attn_mask: Optional[torch.Tensor] = None # (B, S) bool True=keep
+        x: torch.Tensor,  # (B, S, D) embeddings
+        attn_mask: Optional[torch.Tensor] = None,  # (B, S) bool True=keep
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Returns:
@@ -212,15 +218,15 @@ class CausalGaussianCoreRoPE(nn.Module):
         B, S, D = x.shape
         assert S >= 2, "Need S>=2"
         # We predict next at positions 1..S-1; encode prefixes 0..S-2
-        src = self.in_proj(x[:, :-1, :])                         # (B, S-1, H)
+        src = self.in_proj(x[:, :-1, :])  # (B, S-1, H)
 
         keep = attn_mask[:, :-1] if attn_mask is not None else None  # (B, S-1) or None
         h = src
         for blk in self.blocks:
-            h = blk(h, keep, self.rope)                          # (B, S-1, H)
+            h = blk(h, keep, self.rope)  # (B, S-1, H)
 
-        mu = self.mu(h).view(B, S-1, self.K, self.D)
-        logvar = self.logvar(h).view(B, S-1, self.K, self.D).clamp(*self.clamp)
+        mu = self.mu(h).view(B, S - 1, self.K, self.D)
+        logvar = self.logvar(h).view(B, S - 1, self.K, self.D).clamp(*self.clamp)
         pi_logit = self.pi(h) if self.K > 1 else None
         return mu, logvar, pi_logit
 
@@ -231,10 +237,18 @@ class ByteGaussianProbe(nn.Module):
       • Input: tokens (B,S) int; attn_mask (B,S) bool, True=valid
       • Embedding → LayerNorm → CausalGaussianCore → μ, logσ²
     """
-    def __init__(self, vocab_size: int = 256, dim: int = 512,
-                 d_model: int = 512, n_layers: int = 2, n_heads: int = 8,
-                 share_embedding: Optional[nn.Embedding] = None,
-                 dropout: float = 0.0, n_components: int = 1):
+
+    def __init__(
+        self,
+        vocab_size: int = 256,
+        dim: int = 512,
+        d_model: int = 512,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        share_embedding: Optional[nn.Embedding] = None,
+        dropout: float = 0.0,
+        n_components: int = 1,
+    ):
         super().__init__()
         self.embedding = share_embedding or nn.Embedding(vocab_size, dim)
         self.norm = nn.LayerNorm(dim, elementwise_affine=True)
@@ -244,10 +258,16 @@ class ByteGaussianProbe(nn.Module):
         return self.norm(self.embedding(tokens))
 
     # # ----- training loss -----
-    def loss_bpd(self, tokens: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
-                 detach_inputs: bool = False, detach_targets: bool = True) -> torch.Tensor:
+    def loss_bpd(
+        self,
+        tokens: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        detach_inputs: bool = False,
+        detach_targets: bool = True,
+    ) -> torch.Tensor:
         x = self._embed(tokens)
-        if detach_inputs: x = x.detach()
+        if detach_inputs:
+            x = x.detach()
         mu, logvar, pi_logit = self.core(x, attn_mask=attn_mask)  # (B,S-1,K,D), (..), (B,S-1,K) or None
 
         tgt = self._embed(tokens)[:, 1:, :]
@@ -301,18 +321,18 @@ class ByteGaussianProbe(nn.Module):
 # ---------- segmentation ----------
 @dataclass
 class SegmentationCfg:
-    threshold: float            # BPD (if use_bpd) or bits (if use_entropy)
+    threshold: float  # BPD (if use_bpd) or bits (if use_entropy)
     use_bpd: bool = True
     min_len: int = 1
     max_len: Optional[int] = None
-    smooth: Optional[int] = None   # causal SMA window
+    smooth: Optional[int] = None  # causal SMA window
+
 
 @torch.no_grad()
 @torch._dynamo.disable()
-def segment_greedy(tokens: torch.Tensor,
-                   probe: ByteGaussianProbe,
-                   cfg: SegmentationCfg,
-                   attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def segment_greedy(
+    tokens: torch.Tensor, probe: ByteGaussianProbe, cfg: SegmentationCfg, attn_mask: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Greedy entropy/BPD thresholding. Returns (end_mask, score) with shapes (B,S)."""
     score = probe.step_bpd(tokens, attn_mask) if cfg.use_bpd else probe.step_entropy(tokens, attn_mask)
 
@@ -320,7 +340,7 @@ def segment_greedy(tokens: torch.Tensor,
         k = cfg.smooth
         pad = (k - 1, 0)  # causal
         w = torch.ones(1, 1, k, device=tokens.device) / k
-        s = F.conv1d(score.unsqueeze(1), w, padding=pad)[..., :score.size(1)]
+        s = F.conv1d(score.unsqueeze(1), w, padding=pad)[..., : score.size(1)]
         score = s.squeeze(1)
 
     B, S = tokens.shape
@@ -344,13 +364,16 @@ def segment_greedy(tokens: torch.Tensor,
             start = stop + 1
     return end_mask, score
 
+
 @torch.no_grad()
-def segment_quantile(tokens: torch.Tensor,
-                     probe: ByteGaussianProbe,
-                     quantile: float = 0.70,
-                     use_bpd: bool = True,
-                     smooth: Optional[int] = 5,
-                     attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, float]:
+def segment_quantile(
+    tokens: torch.Tensor,
+    probe: ByteGaussianProbe,
+    quantile: float = 0.70,
+    use_bpd: bool = True,
+    smooth: Optional[int] = 5,
+    attn_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
     Quantile-based thresholding (auto-calibrated). Returns (end_mask, score, threshold).
     """
@@ -359,7 +382,7 @@ def segment_quantile(tokens: torch.Tensor,
         k = smooth
         pad = (k - 1, 0)
         w = torch.ones(1, 1, k, device=tokens.device) / k
-        s = F.conv1d(score.unsqueeze(1), w, padding=pad)[..., :score.size(1)]
+        s = F.conv1d(score.unsqueeze(1), w, padding=pad)[..., : score.size(1)]
         score = s.squeeze(1)
     # compute quantile over valid steps only
     if attn_mask is not None:
@@ -372,18 +395,20 @@ def segment_quantile(tokens: torch.Tensor,
     end_mask, _ = segment_greedy(tokens, probe, cfg, attn_mask)
     return end_mask, score, thr
 
+
 # ---------- generation ----------
 @dataclass
 class GenCfg:
     max_new_tokens: int
-    tau_proto: float = 0.8        # prototype-logits temperature
-    sample: bool = True           # True: sample; False: greedy
+    tau_proto: float = 0.8  # prototype-logits temperature
+    sample: bool = True  # True: sample; False: greedy
     topk: Optional[int] = None
     topp: Optional[float] = None
-    gaussian_temp: float = 1.0    # scale σ (sqrt of var) → exploration in latent space
-    entropy_cond_temp: Optional[Tuple[float,float]] = None
+    gaussian_temp: float = 1.0  # scale σ (sqrt of var) → exploration in latent space
+    entropy_cond_temp: Optional[Tuple[float, float]] = None
     n_components: int = 1
     # entropy_cond_temp=(a,b): τ_proto = clamp(a + b * (H_t / H_ref), τ_min, τ_max)
+
 
 def _top_filter(logits: torch.Tensor, topk: Optional[int], topp: Optional[float]) -> torch.Tensor:
     if topk is not None and topk > 0:
@@ -399,14 +424,15 @@ def _top_filter(logits: torch.Tensor, topk: Optional[int], topp: Optional[float]
         logits = logits.masked_fill(to_mask, float('-inf'))
     return logits
 
+
 @torch.no_grad()
 def generate_with_probe(
     probe: ByteGaussianProbe,
     E: nn.Embedding,
-    prefix: torch.Tensor,                  # (B,T0)
+    prefix: torch.Tensor,  # (B,T0)
     cfg: GenCfg,
     attn_mask: Optional[torch.Tensor] = None,
-    n_components: int = 1
+    n_components: int = 1,
 ) -> torch.Tensor:
     """
     Autoregressive generation using the probe's predictive Gaussian:
@@ -417,7 +443,7 @@ def generate_with_probe(
     device = prefix.device
     tokens = prefix.clone()
     for _ in range(cfg.max_new_tokens):
-        x = probe.norm(E(tokens))                 # (B,T,D)
+        x = probe.norm(E(tokens))  # (B,T,D)
         mu, logvar, pi_logit = probe.core(x, attn_mask=attn_mask) if x.size(1) > 1 else (None, None, None)
 
         if x.size(1) == 1:
@@ -442,9 +468,7 @@ def generate_with_probe(
         else:
             logits = mog_token_logits(mu_next, logvar_next, pi_next, E, probe.norm)  # (B,V)
 
-        assert torch.isfinite(logits).all(), (
-            f"non-finite logits: min={logits.min().item()}, max={logits.max().item()}"
-        )
+        assert torch.isfinite(logits).all(), f"non-finite logits: min={logits.min().item()}, max={logits.max().item()}"
 
         # Inspect mixture stats at the last step:
         print("min/max logvar last step:", logvar_next.min().item(), logvar_next.max().item())
@@ -466,8 +490,9 @@ def generate_with_probe(
     return tokens
 
 
-def mog_token_logits(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor,
-                     E: nn.Embedding, ln: nn.LayerNorm) -> torch.Tensor:
+def mog_token_logits(
+    mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor, E: nn.Embedding, ln: nn.LayerNorm
+) -> torch.Tensor:
     """
     Mixture Mahalanobis logits over tokens.
     mu:      (B,K,D)
@@ -477,29 +502,28 @@ def mog_token_logits(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Ten
     """
     out_dtype = mu.dtype
     with torch.amp.autocast(enabled=False, device_type='cuda'):  # disable autocast here
-        proto = ln(E.weight).float()                   # (V,D)
+        proto = ln(E.weight).float()  # (V,D)
         mu32, lv32, pi32 = mu.float(), logvar.float(), pi_logit.float()
-        invvar = torch.exp(-lv32)                      # (B,K,D)
+        invvar = torch.exp(-lv32)  # (B,K,D)
         diff = proto.unsqueeze(0).unsqueeze(0) - mu32.unsqueeze(2)  # (B,K,V,D)
-        energy = -0.5 * (diff.pow(2) * invvar.unsqueeze(2)).sum(-1) \
-                 - 0.5 * lv32.sum(-1, keepdim=True)    # (B,K,V)
-        logpi = pi32.log_softmax(dim=-1).unsqueeze(-1) # (B,K,1)
+        energy = -0.5 * (diff.pow(2) * invvar.unsqueeze(2)).sum(-1) - 0.5 * lv32.sum(-1, keepdim=True)  # (B,K,V)
+        logpi = pi32.log_softmax(dim=-1).unsqueeze(-1)  # (B,K,1)
         logits32 = torch.logsumexp(logpi + energy, dim=1)  # (B,V)
     return logits32.to(out_dtype)
 
-def mog_bpd(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor,
-            target: torch.Tensor) -> torch.Tensor:
+
+def mog_bpd(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Mixture NLL → bits-per-dim per step.
     mu/logvar: (B,S-1,K,D) , pi_logit: (B,S-1,K), target: (B,S-1,D)
     Returns: (B,S-1)
     """
     B, S1, K, D = mu.shape
-    invvar = torch.exp(-logvar)                                   # (B,S1,K,D)
-    diff2 = (target.unsqueeze(2) - mu).pow(2) * invvar            # (B,S1,K,D)
-    quad = diff2.sum(-1)                                          # (B,S1,K)
-    sum_logvar = logvar.sum(-1)                                   # (B,S1,K)
-    logpi = F.log_softmax(pi_logit, dim=-1)                       # (B,S1,K)
+    invvar = torch.exp(-logvar)  # (B,S1,K,D)
+    diff2 = (target.unsqueeze(2) - mu).pow(2) * invvar  # (B,S1,K,D)
+    quad = diff2.sum(-1)  # (B,S1,K)
+    sum_logvar = logvar.sum(-1)  # (B,S1,K)
+    logpi = F.log_softmax(pi_logit, dim=-1)  # (B,S1,K)
     const = 0.5 * D * math.log(2 * math.pi)
     # log p(z) = logsumexp_k [ logpi_k - 0.5*(quad_k + sum_logvar_k) - const ]
     logp = torch.logsumexp(logpi - 0.5 * (quad + sum_logvar) - const, dim=-1)  # (B,S1)
@@ -507,17 +531,19 @@ def mog_bpd(mu: torch.Tensor, logvar: torch.Tensor, pi_logit: torch.Tensor,
     bpd = (nll / math.log(2.0)) / D
     return bpd
 
+
 def gaussian_token_logits(mu: torch.Tensor, logvar: torch.Tensor, E: nn.Embedding, ln: nn.LayerNorm) -> torch.Tensor:
     """
     Single-component anisotropic logits (K=1), matching your Mahalanobis switch.
     mu/logvar: (B,D)
     """
     B, D = mu.shape
-    proto = ln(E.weight)                             # (V,D)
-    diff = proto.unsqueeze(0) - mu.unsqueeze(1)      # (B,V,D)
-    invvar = torch.exp(-logvar).unsqueeze(1)         # (B,1,D)
+    proto = ln(E.weight)  # (V,D)
+    diff = proto.unsqueeze(0) - mu.unsqueeze(1)  # (B,V,D)
+    invvar = torch.exp(-logvar).unsqueeze(1)  # (B,1,D)
     logits = -0.5 * (diff.pow(2) * invvar).sum(-1) - 0.5 * logvar.sum(-1, keepdim=True)  # (B,V)
     return logits  # global const dropped (same across tokens)
+
 
 def mog_sequence_logits(mu, logvar, pi_logit, E, ln):
     """
@@ -532,42 +558,43 @@ def mog_sequence_logits(mu, logvar, pi_logit, E, ln):
     B, S1, K, D = mu.shape
     V = E.num_embeddings
     # Prototypes in the SAME space used for training
-    P = ln(E.weight)             # (V, D)
-    Q = P * P                    # (V, D)
+    P = ln(E.weight)  # (V, D)
+    Q = P * P  # (V, D)
 
     invvar = torch.exp(-logvar)  # (B,S1,K,D)
-    a = invvar * mu              # (B,S1,K,D)
-    b = 0.5 * invvar             # (B,S1,K,D)
+    a = invvar * mu  # (B,S1,K,D)
+    b = 0.5 * invvar  # (B,S1,K,D)
 
     # Flatten (B,S1,K, D) -> (BSK, D) and do two GEMVs per component
-    A = a.reshape(-1, D)         # (BSK, D)
-    Bv = b.reshape(-1, D)        # (BSK, D)
+    A = a.reshape(-1, D)  # (BSK, D)
+    Bv = b.reshape(-1, D)  # (BSK, D)
 
     # term1 = P @ a   and  term2 = Q @ (0.5*invvar)
-    term1 = A @ P.t()            # (BSK, V)
-    term2 = Bv @ Q.t()           # (BSK, V)
+    term1 = A @ P.t()  # (BSK, V)
+    term2 = Bv @ Q.t()  # (BSK, V)
 
     const = -0.5 * ((mu * mu * invvar).sum(-1) + logvar.sum(-1))  # (B,S1,K)
-    energy = term1 - term2 + const.reshape(-1, 1)                # (BSK, V)
-    energy = energy.view(B, S1, K, V)                            # (B,S1,K,V)
+    energy = term1 - term2 + const.reshape(-1, 1)  # (BSK, V)
+    energy = energy.view(B, S1, K, V)  # (B,S1,K,V)
 
-    logpi = F.log_softmax(pi_logit, dim=-1).unsqueeze(-1)        # (B,S1,K,1)
-    logits = torch.logsumexp(logpi + energy, dim=2)              # (B,S1,V)
+    logpi = F.log_softmax(pi_logit, dim=-1).unsqueeze(-1)  # (B,S1,K,1)
+    logits = torch.logsumexp(logpi + energy, dim=2)  # (B,S1,V)
     return logits
+
 
 def token_ce_loss_from_mog(probe, tokens, attn_mask=None):
     """
     Cross-entropy over next-token using mixture logits.
     Uses the same core forward pass; safe for K=1 by passing pi_logit=0.
     """
-    x = probe._embed(tokens)                                        # (B,S,D)
-    mu, logvar, pi_logit = probe.core(x, attn_mask=attn_mask)       # (B,S-1,K,D), (..), (B,S-1,K|None)
+    x = probe._embed(tokens)  # (B,S,D)
+    mu, logvar, pi_logit = probe.core(x, attn_mask=attn_mask)  # (B,S-1,K,D), (..), (B,S-1,K|None)
 
     if pi_logit is None:  # K==1
-        pi_logit = torch.zeros(mu.shape[:3], device=mu.device)      # (B,S-1,1)
+        pi_logit = torch.zeros(mu.shape[:3], device=mu.device)  # (B,S-1,1)
 
     logits = mog_sequence_logits(mu, logvar, pi_logit, probe.embedding, probe.norm)  # (B,S-1,V)
-    tgt = tokens[:, 1:]                                              # (B,S-1)
+    tgt = tokens[:, 1:]  # (B,S-1)
 
     loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), reduction='none')
     if attn_mask is not None:

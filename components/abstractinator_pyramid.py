@@ -22,22 +22,20 @@ These can be introduced incrementally; for now, AbstractinatorPyramid already
 provides forward() training, compress_all(), and generate_bytes().
 """
 
-from typing import Optional, Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from components.config_types import AbstractinatorConfig, PyramidConfig
+from components.config_types import PyramidConfig
+
 from .abstractinator import Abstractinator
 from .segment_compressor import GaussianEntropyModel
 
 
 class AbstractinatorPyramid(nn.Module):
-    def __init__(self,
-                 cfg: PyramidConfig,
-                 top_lm: Optional[nn.Module] = None,
-                 device: Optional[torch.device] = None):
+    def __init__(self, cfg: PyramidConfig, top_lm: Optional[nn.Module] = None, device: Optional[torch.device] = None):
         super().__init__()
         self.cfg = cfg
 
@@ -53,11 +51,11 @@ class AbstractinatorPyramid(nn.Module):
         self.top_lm = top_lm
 
     def compress_all(
-            self,
-            tokens: torch.Tensor,
-            kpm: Optional[torch.Tensor],
-            *,
-            comp_only: bool = False,
+        self,
+        tokens: torch.Tensor,
+        kpm: Optional[torch.Tensor],
+        *,
+        comp_only: bool = False,
     ) -> List[Any]:
         """Return list of CompressorOutput from bottom(0)→top(L-1)."""
         outs = []
@@ -65,7 +63,7 @@ class AbstractinatorPyramid(nn.Module):
         for L, level in enumerate(self.levels):
             if comp_only:
                 co = level.compress(cur_ids, key_padding_mask=kpm)
-                outs.append({"comp_out": co})                             # keep shape compat
+                outs.append({"comp_out": co})  # keep shape compat
             else:
                 # co = level.compress(cur_ids, key_padding_mask=cur_kpm)  # CompressorOutput
                 co = level(cur_ids, key_padding_mask=cur_kpm)  # CompressorOutput
@@ -79,9 +77,7 @@ class AbstractinatorPyramid(nn.Module):
                 cur_kpm = None
         return outs
 
-    def forward(
-            self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Full training step:
           - compress all levels
@@ -90,8 +86,7 @@ class AbstractinatorPyramid(nn.Module):
           - losses: factorized code CE (+ specials), optional byte-LM CE, VQ loss
           - optional top code LM
         """
-        B = tokens.size(0)
-        device = tokens.device
+        tokens.size(0)
         comp_outs = self.compress_all(tokens, key_padding_mask)
         # vq_total = sum(co['loss_vq'] for co in comp_outs)
 
@@ -150,15 +145,15 @@ class AbstractinatorPyramid(nn.Module):
 
     @torch.no_grad()
     def generate_bytes(
-            self,
-            prompt: torch.Tensor,  # (1, S0) bytes
-            prompt_kpm: torch.Tensor | None = None,
-            *,
-            max_top_steps: int = 256,
-            max_child_len: int = 128,
-            lo_window: int = 128,  # low-side AR context window (like training)
-            top_sample_fn=None,  # optional CodeSequenceTransformer
-            honor_eos: bool = True,
+        self,
+        prompt: torch.Tensor,  # (1, S0) bytes
+        prompt_kpm: torch.Tensor | None = None,
+        *,
+        max_top_steps: int = 256,
+        max_child_len: int = 128,
+        lo_window: int = 128,  # low-side AR context window (like training)
+        top_sample_fn=None,  # optional CodeSequenceTransformer
+        honor_eos: bool = True,
     ) -> torch.Tensor:
         """
         Each full iteration within the generate_bytes loop should execute a precise, three-phase procedure to generate
@@ -199,8 +194,6 @@ class AbstractinatorPyramid(nn.Module):
             logits = (2.0 * Ez - E2) / tau
             return logits
 
-
-
         assert prompt.size(0) == 1
         device = prompt.device
         if prompt_kpm is None:
@@ -213,7 +206,6 @@ class AbstractinatorPyramid(nn.Module):
                 return S
             real = (~kpm[0]).nonzero(as_tuple=False)
             return int(real[-1].item()) + 1 if real.numel() else 0
-
 
         E = self.levels[-1].embedding  # (V, D)
         prompt_ent_gen = prompt.clone()
@@ -244,10 +236,12 @@ class AbstractinatorPyramid(nn.Module):
             cache, _ = compressor.stream_step(cache, x_new, kpm_new)  # pos auto-advances
             generated.append(x_new)
 
-
         from .tokenizer import ByteLevelTokenizer
+
         tokenizer = ByteLevelTokenizer()
-        print(f"{tokenizer.decode(prompt_ent_gen.squeeze())}{tokenizer.decode(torch.argmax(torch.cat(generated, dim=1) @ E.weight.T, dim=-1).squeeze())}")
+        print(
+            f"{tokenizer.decode(prompt_ent_gen.squeeze())}{tokenizer.decode(torch.argmax(torch.cat(generated, dim=1) @ E.weight.T, dim=-1).squeeze())}"
+        )
         for _ in range(max_top_steps):
             # ── Phase 1: Upward compression on current bytes ─────────────────────
             comp_all = self.compress_all(prompt, prompt_kpm, comp_only=True)
@@ -260,26 +254,26 @@ class AbstractinatorPyramid(nn.Module):
             if (self.top_lm is not None) and (top_sample_fn is not None) and (top_kpm is not None):
                 valid = int((~top_kpm).sum().item())
                 assert valid < top_mem.size(1), "No free top rows to write a new segment."
-                lm_out = top_sample_fn(top_mem[:, :valid, :].contiguous(),
-                                       key_padding_mask=top_kpm[:, :valid].contiguous())
+                lm_out = top_sample_fn(
+                    top_mem[:, :valid, :].contiguous(), key_padding_mask=top_kpm[:, :valid].contiguous()
+                )
                 next_top = lm_out.get("predictions_pre_vq", lm_out.get("predictions"))[:, -1, :]
                 # materialize the new row
                 top_mem = top_mem.clone()
                 top_kpm = top_kpm.clone()
                 top_mem[:, valid, :] = next_top
                 top_kpm[:, valid] = False
-                hi_memory = top_mem[:, :valid + 1, :]
-                src_kpm = top_kpm[:, :valid + 1]
-                target_row = valid
+                hi_memory = top_mem[:, : valid + 1, :]
+                src_kpm = top_kpm[:, : valid + 1]
             else:
                 # Continue under last existing row
                 if top_kpm is not None:
                     valid = int((~top_kpm).sum().item())
-                    target_row = valid - 1
+                    valid - 1
                     hi_memory = top_mem[:, :valid, :]
                     src_kpm = top_kpm[:, :valid]
                 else:
-                    target_row = top_mem.size(1) - 1
+                    top_mem.size(1) - 1
                     hi_memory = top_mem
                     src_kpm = None
 
@@ -373,7 +367,7 @@ class AbstractinatorPyramid(nn.Module):
                         break
 
                 # "New tokens" for this level (exclude the seed)
-                new_lo = run_lo[:, seed_lo.size(1):]
+                new_lo = run_lo[:, seed_lo.size(1) :]
 
                 if L == 0:
                     bottom_new = new_lo
@@ -384,7 +378,7 @@ class AbstractinatorPyramid(nn.Module):
 
             # If nothing new at bottom, stop the outer loop
             if bottom_new is None or bottom_new.size(1) == 0:
-                print(f'Warning: no new bottom bytes generated, stopping.')
+                print('Warning: no new bottom bytes generated, stopping.')
                 break
 
             # Append to bytes and continue
@@ -398,7 +392,6 @@ class AbstractinatorPyramid(nn.Module):
 
         self._set_all_mla_fusions(enabled=False, include_expanders=False)
 
-
         return torch.cat(all_new_bytes, dim=1) if all_new_bytes else prompt.new_zeros((1, 0), dtype=prompt.dtype)
 
     @torch.no_grad()
@@ -409,7 +402,11 @@ class AbstractinatorPyramid(nn.Module):
         """
         for lvl in self.levels:
             # Compressors: shared / lm / compression stacks
-            for blk in list(lvl.compressor.shared_layers) + list(lvl.compressor.entropy_model.layers) + list(lvl.compressor.compression_layers):
+            for blk in (
+                list(lvl.compressor.shared_layers)
+                + list(lvl.compressor.entropy_model.layers)
+                + list(lvl.compressor.compression_layers)
+            ):
                 if hasattr(blk, "attn") and hasattr(blk.attn, "mla"):
                     mla = blk.attn.mla
                     if enabled and hasattr(mla, "enable_inference_fusions"):
@@ -427,7 +424,6 @@ class AbstractinatorPyramid(nn.Module):
                                 mla.enable_inference_fusions()
                             elif not enabled and hasattr(mla, "disable_fusions"):
                                 mla.disable_fusions()
-
 
 
 def factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
@@ -453,7 +449,6 @@ def factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
         sp_target = codec.special_local_index(targets)
         sp_mask = valid & codec.is_special(targets)
         if sp_mask.any():
-            ce_sp = F.cross_entropy(
-                special_logits.transpose(1, 2)[sp_mask], sp_target[sp_mask], reduction="mean")
+            ce_sp = F.cross_entropy(special_logits.transpose(1, 2)[sp_mask], sp_target[sp_mask], reduction="mean")
             special_ce = ce_sp
     return {"digit_ce": ce_all, "special_ce": special_ce}

@@ -1,11 +1,9 @@
-import logging
-from typing import Tuple, List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch._dynamo as dynamo
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-import torch._dynamo as dynamo
 
 
 class VectorQuantizer(nn.Module):
@@ -67,7 +65,6 @@ class VectorQuantizer(nn.Module):
         if protected_ids:
             self.protected_mask[torch.tensor(protected_ids, dtype=torch.long)] = True
 
-
         # Codebook and EMA stats
         self.codebook = nn.Parameter(torch.randn(self.K, self.D))
         if self.ema:
@@ -77,10 +74,7 @@ class VectorQuantizer(nn.Module):
         # Replacement/reset machinery as DEVICE STATE (no Python mirrors)
         if self.reset_codes:
             # circular buffer of recent vectors
-            self.register_buffer(
-                "replacement_buffer",
-                torch.empty(self.replacement_buffer_size, self.D)
-            )
+            self.register_buffer("replacement_buffer", torch.empty(self.replacement_buffer_size, self.D))
             self.replacement_buffer.zero_()
             # 0‑dim device counters/flags
             self.register_buffer("buffer_idx", torch.zeros((), dtype=torch.long))
@@ -109,7 +103,7 @@ class VectorQuantizer(nn.Module):
             N = flat_input.size(0)
 
         B = self.replacement_buffer_size  # Python constant
-        idx0 = self.buffer_idx            # 0‑dim LongTensor on device
+        idx0 = self.buffer_idx  # 0‑dim LongTensor on device
 
         write_idx = (idx0 + torch.arange(N, device=flat_input.device, dtype=torch.long)) % B
         self.replacement_buffer.index_copy_(0, write_idx, flat_input)
@@ -118,8 +112,8 @@ class VectorQuantizer(nn.Module):
         new_idx = (idx0 + N) % B
         self.buffer_idx.copy_(new_idx)
 
-        wrapped = (idx0 + N) >= B                # 0‑dim bool
-        self.buffer_is_full.logical_or_(wrapped) # in‑place OR
+        wrapped = (idx0 + N) >= B  # 0‑dim bool
+        self.buffer_is_full.logical_or_(wrapped)  # in‑place OR
 
     @torch.no_grad()
     def _ema_update(self, encodings: torch.Tensor, flat_input: torch.Tensor) -> None:
@@ -134,8 +128,8 @@ class VectorQuantizer(nn.Module):
                 enc = enc.clone()
             enc[:, self.padding_token_id] = 0
 
-        dw = enc.transpose(0, 1) @ flat_input    # (K,D)
-        cluster = enc.sum(0)                     # (K,)
+        dw = enc.transpose(0, 1) @ flat_input  # (K,D)
+        cluster = enc.sum(0)  # (K,)
 
         self.ema_cluster_size.mul_(self.decay).add_(cluster, alpha=1 - self.decay)
         self.ema_weight_sum.mul_(self.decay).add_(dw, alpha=1 - self.decay)
@@ -143,7 +137,6 @@ class VectorQuantizer(nn.Module):
         n = self.ema_cluster_size.sum()
         stabilized = ((self.ema_cluster_size + self.eps) / (n + self.K * self.eps)) * n
         self.codebook.data.copy_(self.ema_weight_sum / stabilized.unsqueeze(1))
-
 
     @torch.no_grad()
     def _maybe_vectorized_reset(self) -> None:
@@ -163,9 +156,9 @@ class VectorQuantizer(nn.Module):
         # Quick exit via masking (no Python if): if not do_reset, all applies will be False
         # Replacement buffer “valid count”
         B = self.replacement_buffer_size
-        valid_count = torch.where(self.buffer_is_full,
-                                  torch.tensor(B, device=self.buffer_idx.device),
-                                  self.buffer_idx)  # 0-dim long
+        valid_count = torch.where(
+            self.buffer_is_full, torch.tensor(B, device=self.buffer_idx.device), self.buffer_idx
+        )  # 0-dim long
         has_source = valid_count > 0  # 0-dim bool
 
         # Sample R_MAX candidate code rows (constant shape)
@@ -246,10 +239,10 @@ class VectorQuantizer(nn.Module):
             self._update_replacement_buffer_tensor(flat.detach())
 
         # Nearest neighbors (squared L2)
-        x2 = (flat * flat).sum(dim=1, keepdim=True)                    # (N,1)
-        e2 = (self.codebook * self.codebook).sum(dim=1)                # (K,)
-        xe = F.linear(flat, self.codebook)                             # (N,K)
-        distances = x2 - 2 * xe + e2.unsqueeze(0)                      # (N,K)
+        x2 = (flat * flat).sum(dim=1, keepdim=True)  # (N,1)
+        e2 = (self.codebook * self.codebook).sum(dim=1)  # (K,)
+        xe = F.linear(flat, self.codebook)  # (N,K)
+        distances = x2 - 2 * xe + e2.unsqueeze(0)  # (N,K)
         if self.forbidden_mask.any():
             big = torch.finfo(distances.dtype).max
             distances = distances.masked_fill(self.forbidden_mask.unsqueeze(0), big)
@@ -268,7 +261,7 @@ class VectorQuantizer(nn.Module):
         # EMA + vectorized reset (no Python mirrors)
         if self.training:
             if self.ema:
-                onehot = F.one_hot(indices, self.K).type_as(flat)      # (N,K)
+                onehot = F.one_hot(indices, self.K).type_as(flat)  # (N,K)
                 self._ema_update(onehot, flat)
             if self.reset_codes:
                 self._maybe_vectorized_reset()
@@ -332,7 +325,7 @@ class MultiStageResidualVQ(nn.Module):
         self.d_c = d_c
         self.depth = int(depth)
         self.K = int(K)
-        self.K_eff = int(self.K ** self.depth)
+        self.K_eff = int(self.K**self.depth)
 
         # Special token ids (kept consistent with VectorQuantizer)
         self.bos_token_id = int(bos_token_id)
@@ -342,9 +335,12 @@ class MultiStageResidualVQ(nn.Module):
 
         # expose a codec so downstream code can (de)compose indices
         self.codec = ComposedIndexCodec(
-            K=self.K, depth=self.depth,
-            bos=self.bos_token_id, eos=self.eos_token_id,
-            pad=self.padding_token_id, eop=self.eop_token_id,
+            K=self.K,
+            depth=self.depth,
+            bos=self.bos_token_id,
+            eos=self.eos_token_id,
+            pad=self.padding_token_id,
+            eop=self.eop_token_id,
         )
 
         # Allow small effective K; special tokens may be unused for code VQs
@@ -438,6 +434,7 @@ class MultiStageResidualVQ(nn.Module):
     def stage_codebooks(self) -> list[torch.Tensor]:
         return [st.codebook for st in self.stages]
 
+
 class ComposedIndexCodec:
     def __init__(self, K: int, depth: int, bos: int, eos: int, pad: int, eop: int):
         self.K = int(K)
@@ -449,7 +446,7 @@ class ComposedIndexCodec:
     def is_special(self, x: torch.Tensor) -> torch.Tensor:
         mask = torch.zeros_like(x, dtype=torch.bool)
         for sid in self.special:
-            mask |= (x == sid)
+            mask |= x == sid
         return mask
 
     # Keep eager to avoid Inductor rewriting integer division into float paths
@@ -464,11 +461,11 @@ class ComposedIndexCodec:
         x = x.long()
         device = x.device
         # base = [K^0, K^1, ..., K^(D-1)] as LONG
-        base = (self.K ** torch.arange(0, self.depth, device=device, dtype=torch.long))  # (D,)
+        base = self.K ** torch.arange(0, self.depth, device=device, dtype=torch.long)  # (D,)
         # Integer division with explicit rounding keeps LONG dtype
-        q = torch.div(x.unsqueeze(-1), base, rounding_mode='trunc')                      # (B,L,D) long
-        digits = torch.remainder(q, self.K)                                             # (B,L,D) long
-        out = [digits[..., d] for d in range(self.depth)]                               # list of (B,L) long
+        q = torch.div(x.unsqueeze(-1), base, rounding_mode='trunc')  # (B,L,D) long
+        digits = torch.remainder(q, self.K)  # (B,L,D) long
+        out = [digits[..., d] for d in range(self.depth)]  # list of (B,L) long
         special = self.is_special(x)
         return out, special
 
@@ -481,9 +478,9 @@ class ComposedIndexCodec:
         assert len(digits) == self.depth
         device = digits[0].device
         D = self.depth
-        stacked = torch.stack([d.long() for d in digits], dim=-1)                       # (B,L,D) long
-        base = (self.K ** torch.arange(0, D, device=device, dtype=torch.long))          # (D,) long
-        composed = (stacked * base).sum(dim=-1)                                         # (B,L) long
+        stacked = torch.stack([d.long() for d in digits], dim=-1)  # (B,L,D) long
+        base = self.K ** torch.arange(0, D, device=device, dtype=torch.long)  # (D,) long
+        composed = (stacked * base).sum(dim=-1)  # (B,L) long
         return composed.long()
 
     @dynamo.disable()
@@ -495,7 +492,6 @@ class ComposedIndexCodec:
         return idx
 
 
-
 class RVQEmbeddingAdapter(nn.Module):
     """
     Bridges MultiStageResidualVQ to the expander.
@@ -504,11 +500,10 @@ class RVQEmbeddingAdapter(nn.Module):
     * Optionally embeds specials with a tiny (num_special × D) table.
     * Exposes stage codebooks for factorized output heads.
     """
-    def __init__(self,
-                 vq: "MultiStageResidualVQ",
-                 target_D: int,
-                 use_shared_proj: bool = True,
-                 tie_up_down: bool = False):
+
+    def __init__(
+        self, vq: "MultiStageResidualVQ", target_D: int, use_shared_proj: bool = True, tie_up_down: bool = False
+    ):
         super().__init__()
         self.vq = vq
         self.K = vq.K
@@ -518,10 +513,10 @@ class RVQEmbeddingAdapter(nn.Module):
         self.D = int(target_D)
 
         # projections
-        share_ok = False #use_shared_proj and (self.D == self.D_vq)
+        share_ok = False  # use_shared_proj and (self.D == self.D_vq)
         if share_ok:
-            self.up = vq.up                       # d_c -> Das
-            self.down = vq.down                   # D -> d_c
+            self.up = vq.up  # d_c -> Das
+            self.down = vq.down  # D -> d_c
         else:
             # One shared parameter for both directions
             dtype = vq.up.weight.dtype
@@ -531,12 +526,10 @@ class RVQEmbeddingAdapter(nn.Module):
             self.down = DownProj(Wdc)  # D -> d_c
             self.up = UpProj(Wdc)  # d_c -> D
 
-
     @torch.no_grad()
     def stage_codebook(self, s: int) -> torch.Tensor:
         # Return d_c codebook of stage s, detached so no grads leak into VQ from expander.
         return self.vq.stages[s].codebook.detach()
-
 
     def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
         """Embed composed ids via factorized codebooks only."""
@@ -552,7 +545,6 @@ class RVQEmbeddingAdapter(nn.Module):
         return self.up(y_dc)
 
 
-
 class RVQFactorizedHead(nn.Module):
     """
     Produces stage-wise logits for a MultiStageResidualVQ:
@@ -565,10 +557,10 @@ class RVQFactorizedHead(nn.Module):
       - Logits per stage are dot(y_res, codebook_s^T) or -||y_res - e||^2.
       - Tiny special head (optional).
     """
-    def __init__(self,
-                 adapter: RVQEmbeddingAdapter,
-                 residual_conditioning: bool = True,
-                 use_sqdist_logits: bool = False):
+
+    def __init__(
+        self, adapter: RVQEmbeddingAdapter, residual_conditioning: bool = True, use_sqdist_logits: bool = False
+    ):
         super().__init__()
         self.adapt = adapter
         self.depth = adapter.depth
@@ -582,30 +574,31 @@ class RVQFactorizedHead(nn.Module):
         # r_dc: (B, L, d_c), codebook: (K, d_c)
         if self.use_sqdist_logits:
             # -||r - e||^2 = - (||r||^2 - 2 r·e + ||e||^2) → same ordering as dot, but better geometry
-            r2 = (r_dc * r_dc).sum(-1, keepdim=True)                    # (B, L, 1)
-            e2 = (codebook * codebook).sum(-1).view(1, 1, -1)          # (1, 1, K)
-            dot = F.linear(r_dc, codebook)                              # (B, L, K)
-            return -(r2 - 2*dot + e2)
+            r2 = (r_dc * r_dc).sum(-1, keepdim=True)  # (B, L, 1)
+            e2 = (codebook * codebook).sum(-1).view(1, 1, -1)  # (1, 1, K)
+            dot = F.linear(r_dc, codebook)  # (B, L, K)
+            return -(r2 - 2 * dot + e2)
         else:
             return F.linear(r_dc, codebook)  # (B, L, K)
 
-    def forward(self,
-                h: torch.Tensor,                    # (B, L, D) decoder hidden
-                teacher_digits: Optional[List[torch.Tensor]] = None
-                ) -> Dict[str, List[torch.Tensor]]:
+    def forward(
+        self,
+        h: torch.Tensor,  # (B, L, D) decoder hidden
+        teacher_digits: Optional[List[torch.Tensor]] = None,
+    ) -> Dict[str, List[torch.Tensor]]:
         """
         Returns:
             {
               "stage_logits": [ (B,L,K) for s in 0..depth-1 ],
             }
         """
-        y0 = self.adapt.down(h)                      # (B, L, d_c)
+        y0 = self.adapt.down(h)  # (B, L, d_c)
         r = y0
         out: List[torch.Tensor] = []
 
         for s in range(self.depth):
-            W = self.adapt.stage_codebook(s)         # (K, d_c)
-            logits_s = self._stage_logits(r, W)      # (B, L, K)
+            W = self.adapt.stage_codebook(s)  # (K, d_c)
+            logits_s = self._stage_logits(r, W)  # (B, L, K)
             out.append(logits_s)
 
             if self.residual_conditioning:
@@ -614,9 +607,10 @@ class RVQFactorizedHead(nn.Module):
                 else:
                     # greedy residual update at inference
                     e = F.embedding(logits_s.argmax(dim=-1), W)
-                r = r - e.detach()                   # stop gradients across stages
+                r = r - e.detach()  # stop gradients across stages
 
         return {"stage_logits": out}
+
 
 class LearnedCodebookAdapter(nn.Module):
     """
@@ -625,21 +619,26 @@ class LearnedCodebookAdapter(nn.Module):
       - tied projections via a single shared matrix Wdc: d_c<->D
       - exposes 'stage_codebook(0)' and 'depth' for the same interface as MS-RVQ adapters.
     """
-    def __init__(self, K: int, D: int, d_c: int = 64,
-                 dtype: torch.dtype | None = None,
-                 device: torch.device | None = None):
+
+    def __init__(
+        self, K: int, D: int, d_c: int = 64, dtype: torch.dtype | None = None, device: torch.device | None = None
+    ):
         super().__init__()
         self.K, self.D, self.d_c = int(K), int(D), int(d_c)
         # Codebook lives in d_c (factorized embedding)
-        self.codebook = nn.Embedding(self.K, self.d_c,
-                                     dtype=dtype, device=device)
+        self.codebook = nn.Embedding(self.K, self.d_c, dtype=dtype, device=device)
         # Shared projection parameter Wdc (d_c x D)
-        self.Wdc = nn.Parameter(torch.empty(self.d_c, self.D,
-                                            dtype=dtype or self.codebook.weight.dtype,
-                                            device=device or self.codebook.weight.device))
+        self.Wdc = nn.Parameter(
+            torch.empty(
+                self.d_c,
+                self.D,
+                dtype=dtype or self.codebook.weight.dtype,
+                device=device or self.codebook.weight.device,
+            )
+        )
         # Tied modules
-        self.down = DownProj(self.Wdc)   # D -> d_c
-        self.up   = UpProj(self.Wdc)     # d_c -> D
+        self.down = DownProj(self.Wdc)  # D -> d_c
+        self.up = UpProj(self.Wdc)  # d_c -> D
 
         # Inits
         nn.init.normal_(self.codebook.weight, std=0.02)
@@ -647,14 +646,14 @@ class LearnedCodebookAdapter(nn.Module):
 
         # For API parity with RVQ adapter/head
         self.depth = 1
-        self.special_ids = []            # bottom-level: put EOS/EOP inside [0..K-1]
+        self.special_ids = []  # bottom-level: put EOS/EOP inside [0..K-1]
         self.special_to_local = {}
         self.special_emb = None
 
     # ---- RVQ-compatible surface ----
     def stage_codebook(self, s: int = 0) -> torch.Tensor:
         assert s == 0, "LearnedCodebookAdapter has depth=1"
-        return self.codebook.weight      # (K, d_c)
+        return self.codebook.weight  # (K, d_c)
 
     def embed_composed(self, ids: torch.Tensor) -> torch.Tensor:
         """
@@ -664,18 +663,23 @@ class LearnedCodebookAdapter(nn.Module):
         # Optional guard in eager:
         # if not torch._dynamo.is_compiling():
         #     assert ids.min().item() >= 0 and ids.max().item() < self.K, "byte id OOB"
-        y_dc = self.codebook(ids)        # (B, L, d_c)
-        return self.up(y_dc)             # (B, L, D)
+        y_dc = self.codebook(ids)  # (B, L, d_c)
+        return self.up(y_dc)  # (B, L, D)
 
 
-class DownProj(nn.Module):         # D -> d_c
+class DownProj(nn.Module):  # D -> d_c
     def __init__(self, Wdc: nn.Parameter):
-        super().__init__(); self.Wdc = Wdc        # shape (d_c, D)
-    def forward(self, x):                          # F.linear: x @ Wdc^T
+        super().__init__()
+        self.Wdc = Wdc  # shape (d_c, D)
+
+    def forward(self, x):  # F.linear: x @ Wdc^T
         return F.linear(x, self.Wdc)
 
-class UpProj(nn.Module):           # d_c -> D
+
+class UpProj(nn.Module):  # d_c -> D
     def __init__(self, Wdc: nn.Parameter):
-        super().__init__(); self.Wdc = Wdc        # same shared Parameter
-    def forward(self, x):                          # x @ (Wdc^T)^T = x @ Wdc
+        super().__init__()
+        self.Wdc = Wdc  # same shared Parameter
+
+    def forward(self, x):  # x @ (Wdc^T)^T = x @ Wdc
         return F.linear(x, self.Wdc.t())

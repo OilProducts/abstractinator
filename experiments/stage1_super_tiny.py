@@ -1,8 +1,8 @@
 from copy import deepcopy
 
-from experiments.exp_config import ExpConfig, exp_config as _base_exp_config
 from components.config_types import AbstractinatorConfig
-
+from experiments.exp_config import ExpConfig
+from experiments.exp_config import exp_config as _base_exp_config
 
 exp_config: ExpConfig = deepcopy(_base_exp_config)
 
@@ -24,7 +24,6 @@ exp_config.pyramid_config.levels = [
         c_vq_d_c=64,
         c_vq_beta=0.25,
         c_vq_reset_interval=250,
-
         d_layers=1,
         d_heads=8,
         d_cross_window=1,
@@ -46,4 +45,3 @@ exp_config.gradient_accumulation_steps = 1
 exp_config.dataset_name = "roneneldan/TinyStories"
 exp_config.dataset_config = None
 exp_config.sample_prompt_for_generation = "Once upon a time, in a land far, far away,"
-

@@ -1,14 +1,16 @@
 from __future__ import annotations
-from typing import Optional, Dict, List, Tuple
+
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from components.config_types import AbstractinatorConfig
-from .segment_compressor import SegmentCompressor, CompressorOutput
-from .vector_quantizer import MultiStageResidualVQ, ComposedIndexCodec
+
 from .expander import DecoderOnlyExpanderRVQ
+from .segment_compressor import CompressorOutput, SegmentCompressor
+from .vector_quantizer import ComposedIndexCodec, MultiStageResidualVQ
 
 
 class Abstractinator(nn.Module):
@@ -19,10 +21,7 @@ class Abstractinator(nn.Module):
          reusing the *same* MS-RVQ codebooks (no giant D×K_eff embeddings).
     """
 
-    def __init__(
-            self,
-            cfg: AbstractinatorConfig,
-            lo_vq: Optional[MultiStageResidualVQ] = None):
+    def __init__(self, cfg: AbstractinatorConfig, lo_vq: Optional[MultiStageResidualVQ] = None):
         super().__init__()
         self.cfg = cfg
 
@@ -37,12 +36,10 @@ class Abstractinator(nn.Module):
             dim=cfg.D,
             heads=cfg.c_heads,
             window=cfg.c_window,
-
             head_dim=cfg.c_head_dim,
             kv_comp_dim=cfg.c_kv_comp_dim,
             q_comp_dim=cfg.c_q_comp_dim,
             retr_dim=cfg.c_retr_dim,
-
             num_encoder_layers=cfg.c_num_encoder_layers,
             num_shared_encoder_layers=cfg.c_num_shared_encoder_layers,
             num_lm_encoder_layers=cfg.c_num_lm_encoder_layers,
@@ -69,7 +66,7 @@ class Abstractinator(nn.Module):
 
         self.expander = DecoderOnlyExpanderRVQ(
             lo_vq=self.lo_vq,
-            hi_vq=None, #self.hi_vq,  # None at bottom level; non-None for upper levels
+            hi_vq=None,  # self.hi_vq,  # None at bottom level; non-None for upper levels
             K_lo=K_lo,
             D=cfg.D,
             N_dec=cfg.d_layers,
@@ -92,8 +89,12 @@ class Abstractinator(nn.Module):
         else:
             # depth=1 byte space; specials in this space are your byte specials
             self.lo_codec = ComposedIndexCodec(
-                K=cfg.vocab_size, depth=1,
-                bos=cfg.bos_id, eos=cfg.eos_id, pad=cfg.pad_id, eop=cfg.eop_id,
+                K=cfg.vocab_size,
+                depth=1,
+                bos=cfg.bos_id,
+                eos=cfg.eos_id,
+                pad=cfg.pad_id,
+                eop=cfg.eop_id,
             )
 
         # Register useful ids
@@ -106,7 +107,9 @@ class Abstractinator(nn.Module):
     # ---------------------------
 
     @torch.no_grad()
-    def segment_only(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def segment_only(
+        self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Convenience wrapper: entropy-based segmentation using the compressor's LM branch,
         with embeddings computed at this level.
@@ -124,15 +127,15 @@ class Abstractinator(nn.Module):
         return self.compressor(x, key_padding_mask=key_padding_mask, token_ids=token_ids)
 
     def uncompress(
-            self,
-            memory: torch.Tensor,  # (B,S_hi,D) or (B,S_hi) if discrete & hi_vq provided
-            *,
-            target_low: Optional[torch.Tensor] = None,  # teacher-forced path when provided
-            seg_ids: Optional[torch.Tensor] = None,
-            src_key_padding_mask: Optional[torch.Tensor] = None,
-            tgt_key_padding_mask: Optional[torch.Tensor] = None,
-            max_new_tokens: Optional[int] = None,
-            seed: Optional[torch.Tensor] = None,
+        self,
+        memory: torch.Tensor,  # (B,S_hi,D) or (B,S_hi) if discrete & hi_vq provided
+        *,
+        target_low: Optional[torch.Tensor] = None,  # teacher-forced path when provided
+        seg_ids: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: Optional[int] = None,
+        seed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Inverse of compress (per level):
@@ -161,12 +164,12 @@ class Abstractinator(nn.Module):
             return {"generated": out}
 
     def decode_logits(
-            self,
-            memory: torch.Tensor,  # (B, S_hi, D) *continuous* memory OR (B, S_hi) discrete if hi_vq provided
-            codes_lo: torch.Tensor,  # (B, L) composed low codes to teacher-force
-            src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S_hi) True where memory is pad
-            tgt_key_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True where target token is pad
-            seg_ids: Optional[torch.Tensor] = None,  # (B, L) mapping each low token to a memory segment index
+        self,
+        memory: torch.Tensor,  # (B, S_hi, D) *continuous* memory OR (B, S_hi) discrete if hi_vq provided
+        codes_lo: torch.Tensor,  # (B, L) composed low codes to teacher-force
+        src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S_hi) True where memory is pad
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,  # (B, L) True where target token is pad
+        seg_ids: Optional[torch.Tensor] = None,  # (B, L) mapping each low token to a memory segment index
     ) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
         """
         Run the expander to obtain stage-wise logits (and optional special head logits).
@@ -180,10 +183,10 @@ class Abstractinator(nn.Module):
         )
 
     def compute_code_loss(
-            self,
-            logits: Dict[str, List[torch.Tensor] | torch.Tensor],  # from decode_logits()
-            codes_lo: torch.Tensor,  # (B, L)
-            tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        self,
+        logits: Dict[str, List[torch.Tensor] | torch.Tensor],  # from decode_logits()
+        codes_lo: torch.Tensor,  # (B, L)
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Stage-wise cross-entropy on digits, + optional special-head CE.
@@ -205,12 +208,12 @@ class Abstractinator(nn.Module):
         return {"digit_ce": digit_loss, "special_ce": torch.zeros((), device=codes_lo.device)}
 
     def forward(
-            self,
-            token_ids: torch.Tensor,  # (B,S_in) low stream
-            key_padding_mask: Optional[torch.Tensor] = None,  # (B,S_in) True==PAD
-            *,
-            insert_eop: bool = True,
-            return_logits: bool = False,
+        self,
+        token_ids: torch.Tensor,  # (B,S_in) low stream
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B,S_in) True==PAD
+        *,
+        insert_eop: bool = True,
+        return_logits: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Training step for one level:
@@ -221,8 +224,7 @@ class Abstractinator(nn.Module):
           5) report compression metrics
         """
         cfg = self.cfg
-        B = token_ids.size(0)
-        dev = token_ids.device
+        token_ids.size(0)
 
         embeddings = self.embedding(token_ids)  # (B, S_in, D)
 
@@ -267,15 +269,14 @@ class Abstractinator(nn.Module):
             seg_ids=seg_ids,
         )
         stage_logits: List[torch.Tensor] = logits["stage_logits"]  # len=depth, each (B,L,K)
-        special_logits: Optional[torch.Tensor] = logits.get("special_logits")
+        logits.get("special_logits")
 
         # standard CE on logits
         ce = F.cross_entropy(stage_logits[0].transpose(1, 2), tgt)
 
         total = (
-                cfg.w_code_ce * ce
-                + cfg.w_byte_lm_ce * comp.entropy_loss
-                # + cfg.w_vq * vq_loss
+            cfg.w_code_ce * ce + cfg.w_byte_lm_ce * comp.entropy_loss
+            # + cfg.w_vq * vq_loss
         )
 
         # ---- 5) Metrics (compression) ----
@@ -295,8 +296,8 @@ class Abstractinator(nn.Module):
 
     @torch.no_grad()
     def encode_for_next_level(
-            self,
-            comp: CompressorOutput,
+        self,
+        comp: CompressorOutput,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Return the ingredients typically fed into the *next* level:
@@ -305,7 +306,9 @@ class Abstractinator(nn.Module):
           src_keypad_mask  : (B, S_hat) True where memory row is padding
           token_to_seg_ids : (B, S_in) seg id per input token (for cross mapping)
         """
-        assert self.cfg.c_num_queries == 1, "If num_queries>1, decide how you map tokens to query rows (e.g., first of L)."
+        assert self.cfg.c_num_queries == 1, (
+            "If num_queries>1, decide how you map tokens to query rows (e.g., first of L)."
+        )
         codes_hi = comp.vq_indices  # (B, S_hat)
         cont_hi = comp.vq_embeddings  # (B, S_hat, D)
         src_kpm = ~comp.valid_mask  # (B, S_hat) True where padded
@@ -313,13 +316,13 @@ class Abstractinator(nn.Module):
 
     @torch.no_grad()
     def generate_codes(
-            self,
-            hi_memory: torch.Tensor,  # (B, S_hi, D) continuous OR (B, S_hi) discrete
-            seed_lo: torch.Tensor,  # (B, T0) seed codes (composed indices)
-            src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S_hi)
-            tgt_key_padding_mask: Optional[torch.Tensor] = None,  # compat; not used during generation
-            max_new_tokens: Optional[int] = None,
-            seg_ids: Optional[torch.Tensor] = None,
+        self,
+        hi_memory: torch.Tensor,  # (B, S_hi, D) continuous OR (B, S_hi) discrete
+        seed_lo: torch.Tensor,  # (B, T0) seed codes (composed indices)
+        src_key_padding_mask: Optional[torch.Tensor] = None,  # (B, S_hi)
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,  # compat; not used during generation
+        max_new_tokens: Optional[int] = None,
+        seg_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Autoregressive generation in the low code space (composed ids).
@@ -335,8 +338,9 @@ class Abstractinator(nn.Module):
 
 
 @torch.no_grad()
-def _compression_stats(comp: CompressorOutput, input_kpm: Optional[torch.Tensor], num_queries: int) -> Dict[
-    str, torch.Tensor]:
+def _compression_stats(
+    comp: CompressorOutput, input_kpm: Optional[torch.Tensor], num_queries: int
+) -> Dict[str, torch.Tensor]:
     """
     Report batch-mean compression ratio and a few simple stats.
     ratio = (valid_segments * num_queries) / real_input_tokens
@@ -345,8 +349,7 @@ def _compression_stats(comp: CompressorOutput, input_kpm: Optional[torch.Tensor]
     if input_kpm is not None:
         in_len = (~input_kpm).sum(dim=1).float()  # (B,)
     else:
-        in_len = torch.full((comp.vq_indices.size(0),), comp.input_sequence.size(1), device=dev,
-                            dtype=torch.float32)
+        in_len = torch.full((comp.vq_indices.size(0),), comp.input_sequence.size(1), device=dev, dtype=torch.float32)
 
     if comp.valid_mask is not None:
         out_len = (comp.valid_mask.sum(dim=1) * max(1, num_queries)).float()  # (B,)
@@ -358,8 +361,9 @@ def _compression_stats(comp: CompressorOutput, input_kpm: Optional[torch.Tensor]
         "compression_ratio_mean": ratio.mean(),
         "compression_ratio_min": ratio.min(),
         "compression_ratio_max": ratio.max(),
-        "segments_per_seq_mean": comp.valid_mask.sum(
-            dim=1).float().mean() if comp.valid_mask is not None else torch.tensor(0.0, device=dev),
+        "segments_per_seq_mean": comp.valid_mask.sum(dim=1).float().mean()
+        if comp.valid_mask is not None
+        else torch.tensor(0.0, device=dev),
     }
     return stats
 
@@ -368,7 +372,7 @@ def _factorized_code_ce(stage_logits, special_logits, targets, codec, tgt_kpm):
     digits, is_special = codec.decompose(targets)  # list[(B,L)], (B,L)
 
     # If no special head, we train specials via digits too
-    mask_specials_in_digits = (special_logits is not None)
+    mask_specials_in_digits = special_logits is not None
 
     valid = torch.ones_like(is_special, dtype=torch.bool)
     if tgt_kpm is not None:

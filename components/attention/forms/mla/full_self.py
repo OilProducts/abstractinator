@@ -26,7 +26,7 @@ class FullSelf(nn.Module):
         backend: str = "flex",
     ) -> None:
         super().__init__()
-        use_flex = (backend == "flex")
+        use_flex = backend == "flex"
         self.inner = CausalMLATransformerBlock(
             dim=dim,
             num_heads=num_heads,
@@ -61,11 +61,16 @@ class FullSelf(nn.Module):
             kpm_cat = None
         else:
             old_kpm = old_kpm if old_kpm is not None else torch.zeros_like(old_x[..., 0], dtype=torch.bool)
-            new_kpm = key_padding_mask_new if key_padding_mask_new is not None else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            new_kpm = (
+                key_padding_mask_new
+                if key_padding_mask_new is not None
+                else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            )
             kpm_cat = torch.cat([old_kpm, new_kpm], dim=1)
         y_cat = self.forward(x_cat, key_padding_mask=kpm_cat)
         y_new = y_cat[:, -new_x.size(1) :, :]
         cache = {"x": x_cat, "kpm": kpm_cat}
         return y_new, cache
+
 
 __all__ = ["FullSelf"]

@@ -34,11 +34,11 @@ def save_base_components(model: AbstractinatorPyramid, path: str) -> None:
 
 
 def load_base_components(
-        model: AbstractinatorPyramid,
-        path: str,
-        *,
-        freeze: bool = True,
-        map_location: str | torch.device | None = "cpu",
+    model: AbstractinatorPyramid,
+    path: str,
+    *,
+    freeze: bool = True,
+    map_location: str | torch.device | None = "cpu",
 ) -> None:
     """Load pretrained compressors and expanders from ``path``.
 
@@ -65,8 +65,8 @@ def load_base_components(
         compressors_sd = state["compressors"]
         expanders_sd = state["expanders"]
     else:
-        compressors_sd = {k[len("compressors."):]: v for k, v in state.items() if k.startswith("compressors.")}
-        expanders_sd = {k[len("expanders."):]: v for k, v in state.items() if k.startswith("expanders.")}
+        compressors_sd = {k[len("compressors.") :]: v for k, v in state.items() if k.startswith("compressors.")}
+        expanders_sd = {k[len("expanders.") :]: v for k, v in state.items() if k.startswith("expanders.")}
 
     # Load compressors starting from the bottom level.  The saved checkpoint may
     # contain fewer levels than ``model`` when fine‑tuning a larger hierarchy.

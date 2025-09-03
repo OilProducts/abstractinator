@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
+from ...base import SegmentContext
 from .adapter import SDPASegmentCrossAttention as _SDPASegmentCross
 from .cross_segment_flex import SegmentCausalCrossAttentionFlex as _FlexSegmentCross
-from ...base import SegmentContext
 
 
 class SegmentCross(nn.Module):
@@ -61,5 +61,5 @@ class SegmentCross(nn.Module):
     ) -> torch.Tensor:
         return self.inner(q, kv, segment=segment, attn_mask=attn_mask, key_padding_mask=key_padding_mask, cache=cache)
 
-__all__ = ["SegmentCross"]
 
+__all__ = ["SegmentCross"]

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
 
 from components.rope import RoPECache, apply_rope
 
@@ -33,7 +34,7 @@ class SegmentCausalCrossAttention(nn.Module):
         self.d_attn = d_attn
         self.n_heads = n_heads
         self.hdim = d_attn // n_heads
-        self.scale = self.hdim ** -0.5
+        self.scale = self.hdim**-0.5
         self.lookback = int(lookback)
 
         # Build cache on CPU; buffers move with module.to(device). We cast per‑use to match q/k dtype/device.
@@ -51,11 +52,11 @@ class SegmentCausalCrossAttention(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,                   # (B, Lq, q_dim)
-        kv_src: torch.Tensor,              # (B, Lkv, kv_dim)
-        seg_id: torch.Tensor,              # (B, Lq) int (used for lookback window)
-        q_pos_ids: torch.Tensor,           # (B, Lq) or (Lq,)
-        kv_pos_ids: torch.Tensor,          # (Lkv,)
+        q: torch.Tensor,  # (B, Lq, q_dim)
+        kv_src: torch.Tensor,  # (B, Lkv, kv_dim)
+        seg_id: torch.Tensor,  # (B, Lq) int (used for lookback window)
+        q_pos_ids: torch.Tensor,  # (B, Lq) or (Lq,)
+        kv_pos_ids: torch.Tensor,  # (Lkv,)
         kv_mask: Optional[torch.Tensor] = None,  # (B, Lkv) bool – True => mask out
         q_pad_mask: Optional[torch.Tensor] = None,  # (B, Lq) bool – True => padding
         cache: Optional[Dict[str, torch.Tensor]] = None,
@@ -112,16 +113,19 @@ class SegmentCausalCrossAttention(nn.Module):
         kv_pos_ids = kv_pos_ids.to(device=device, dtype=torch.long)  # (Lkv,)
         k_pos = torch.take_along_dim(
             kv_pos_ids.view(1, 1, Lkv, 1).expand(B, 1, -1, Kw),
-            gather_clamped.unsqueeze(1), dim=2,
+            gather_clamped.unsqueeze(1),
+            dim=2,
         )
         k_pos = torch.clamp(k_pos, 0, Smax - 1)
         k_cos = torch.take_along_dim(
             cos_all.unsqueeze(3).expand(B, 1, -1, Kw, cos_all.size(-1)),
-            k_pos.unsqueeze(-1), dim=2,
+            k_pos.unsqueeze(-1),
+            dim=2,
         )
         k_sin = torch.take_along_dim(
             sin_all.unsqueeze(3).expand(B, 1, -1, Kw, sin_all.size(-1)),
-            k_pos.unsqueeze(-1), dim=2,
+            k_pos.unsqueeze(-1),
+            dim=2,
         )
         k_sel = apply_rope(k_sel, k_cos, k_sin)
 
@@ -151,6 +155,4 @@ class SegmentCausalCrossAttention(nn.Module):
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         B, L, _ = x.shape
-        return (
-            x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()
-        )
+        return x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()

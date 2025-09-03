@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from experiments.exp_config import ExpConfig, DEVICE
-from components.config_types import PyramidConfig, AbstractinatorConfig, TopTransformerConfig, AttentionConfig
-
+from components.config_types import AbstractinatorConfig, AttentionConfig, PyramidConfig, TopTransformerConfig
+from experiments.exp_config import DEVICE, ExpConfig
 
 # Attention: Regular form on FlexAttention backend
 REGULAR_FLEX = AttentionConfig(
@@ -47,6 +46,5 @@ exp_config = ExpConfig(
     batch_size=16,
     sequence_length=2048,
     num_epochs=1,
-    generation_interval = 500
+    generation_interval=500,
 )
-

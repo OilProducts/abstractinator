@@ -22,9 +22,10 @@ def run(
     Returns [B, H, L_q, d_v].
     """
     return F.scaled_dot_product_attention(
-        q, k, v,
+        q,
+        k,
+        v,
         attn_mask=attn_bias,
         is_causal=is_causal and (attn_bias is None),
         dropout_p=dropout_p if q.requires_grad else 0.0,
     )
-

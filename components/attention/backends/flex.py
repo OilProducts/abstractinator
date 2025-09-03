@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 import torch
 from torch.nn.attention.flex_attention import flex_attention
@@ -21,4 +21,3 @@ def run(
     Returns [B, H, L_q, d_v].
     """
     return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
-

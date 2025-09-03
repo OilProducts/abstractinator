@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from components.swiglu import SwiGLU
 from components.rope import RoPECache, apply_rope
+from components.swiglu import SwiGLU
+
 from ...backends.flex import run as flex_run
 
 

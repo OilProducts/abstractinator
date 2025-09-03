@@ -25,12 +25,12 @@ class LearnedQueryAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            embed_dim: int,
-            num_queries_per_segment: int,
-            max_queries: int,
-            num_heads: int,
-            use_flex_attention: bool = True,
+        self,
+        embed_dim: int,
+        num_queries_per_segment: int,
+        max_queries: int,
+        num_heads: int,
+        use_flex_attention: bool = True,
     ):
         super().__init__()
         assert embed_dim % num_heads == 0
@@ -84,11 +84,11 @@ class LearnedQueryAttention(nn.Module):
         return (seg_id.amax(dim=1) + 1).to(torch.long)
 
     def forward(
-            self,
-            x: torch.Tensor,  # (B, S, D)  keys/values
-            seg_id: torch.Tensor,  # (B, S)     segment id per key position
-            key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) True==pad
-            return_attn: bool = False,
+        self,
+        x: torch.Tensor,  # (B, S, D)  keys/values
+        seg_id: torch.Tensor,  # (B, S)     segment id per key position
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B, S) True==pad
+        return_attn: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -117,7 +117,7 @@ class LearnedQueryAttention(nn.Module):
         if self.use_flex_attention:
             # Segment-local block mask in flex: keep(b,h,q,k) if
             # q < nseg[b]*L AND seg_id[b,k] == (q // L) AND ~pad[b,k]
-            from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+            from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
             pad = key_padding_mask.to(torch.bool).contiguous() if key_padding_mask is not None else None
             kseg = seg_id.to(torch.long).contiguous()
@@ -136,7 +136,7 @@ class LearnedQueryAttention(nn.Module):
                 qseg = torch.div(qidx, L, rounding_mode='floor')
                 same_seg = kseg[b, kidx].eq(qseg)
                 if pad is not None:
-                    not_pad = (~pad[b, kidx])
+                    not_pad = ~pad[b, kidx]
                 else:
                     # 0‑dim True tensor on the right device/dtype
                     not_pad = qidx.eq(qidx)  # always True, stays a tensor
@@ -144,10 +144,7 @@ class LearnedQueryAttention(nn.Module):
 
             # Keep the Python callback out of Dynamo graphs
             # with dynamo.disable():
-            block_mask = create_block_mask(
-                keep, B=Bn, H=Hn, Q_LEN=Qn, KV_LEN=Sn,
-                BLOCK_SIZE=128, device=q.device
-            )
+            block_mask = create_block_mask(keep, B=Bn, H=Hn, Q_LEN=Qn, KV_LEN=Sn, BLOCK_SIZE=128, device=q.device)
             ctx = flex_attention(q, k, v, block_mask=block_mask)
             attn_weights = queries.new_empty(0) if not return_attn else None
 
@@ -161,12 +158,11 @@ class LearnedQueryAttention(nn.Module):
 
             # segment mismatch mask: (B,Q,S)
             seg_q = (torch.arange(self.Q_max, device=x.device) // self.L)[None, :]  # (1,Q)
-            mismatch = (seg_id[:, None, :] != seg_q[:, :, None])  # (B,Q,S)
+            mismatch = seg_id[:, None, :] != seg_q[:, :, None]  # (B,Q,S)
             scores = scores.masked_fill(mismatch[:, None, :, :], float("-inf"))
 
             # drop invalid trailing queries: q >= nseg[b]*L
-            valid_q = (torch.arange(self.Q_max, device=x.device)[None, :] <
-                       (nseg * self.L)[:, None])  # (B,Q)
+            valid_q = torch.arange(self.Q_max, device=x.device)[None, :] < (nseg * self.L)[:, None]  # (B,Q)
             scores = scores.masked_fill(~valid_q[:, None, :, None], float("-inf"))
 
             attn = torch.softmax(scores, dim=-1)  # (B,H,Q,S)
@@ -178,8 +174,7 @@ class LearnedQueryAttention(nn.Module):
         out = self.out_proj(out)
 
         # Zero out invalid query slots so downstream components can be statically-shaped
-        valid_q_mask = (torch.arange(self.Q_max, device=x.device)[None, :] <
-                        (nseg * self.L)[:, None])  # (B,Q)
+        valid_q_mask = torch.arange(self.Q_max, device=x.device)[None, :] < (nseg * self.L)[:, None]  # (B,Q)
         out = out * valid_q_mask.to(out.dtype).unsqueeze(-1)
 
         return out, (attn_weights if return_attn else out.new_empty(()))

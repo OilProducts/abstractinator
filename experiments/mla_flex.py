@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from experiments.exp_config import ExpConfig, DEVICE
-from components.config_types import PyramidConfig, AbstractinatorConfig, TopTransformerConfig, AttentionConfig
-
+from components.config_types import AbstractinatorConfig, AttentionConfig, PyramidConfig, TopTransformerConfig
+from experiments.exp_config import DEVICE, ExpConfig
 
 # Attention: MLA form on FlexAttention backend
 # Head dims: with D=256 and 8 heads → head_dim=32; project down for MLA

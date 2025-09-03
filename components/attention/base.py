@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, Any
+from typing import Any, Optional, Protocol
 
 import torch
-import torch.nn as nn
 
 
 @dataclass
@@ -61,4 +60,3 @@ class CrossAttentionBase(Protocol):
         key_padding_mask: Optional[torch.Tensor] = None,
         cache: Optional[Any] = None,
     ) -> torch.Tensor: ...
-

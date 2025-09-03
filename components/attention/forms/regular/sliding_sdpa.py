@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from ...masks import additive_neg_inf
 from .self_sdpa import TransformerBlock as SDPATransformerBlock
-from ...masks import merge_masks, additive_neg_inf
 
 
 class CausalLocalSDPABlock(nn.Module):

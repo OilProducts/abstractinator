@@ -9,7 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None = None, dim: int = -1, eps: float = 1e-20) -> torch.Tensor:
+def safe_softmax(
+    scores: torch.Tensor, mask: torch.Tensor | None = None, dim: int = -1, eps: float = 1e-20
+) -> torch.Tensor:
     if mask is not None:
         scores = scores.masked_fill(mask, float("-inf"))
 
@@ -24,7 +26,6 @@ def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None = None, dim: in
 
     denom = exp.sum(dim=dim, keepdim=True)
     return exp / torch.clamp_min(denom, eps)
-
 
 
 # def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None, dim: int = -1) -> torch.Tensor:
@@ -71,7 +72,6 @@ def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None = None, dim: in
 #     safe_scores = scores.masked_fill(all_masked, 0.0)
 #     attn = torch.softmax(safe_scores, dim=dim)
 #     return attn.masked_fill(all_masked, 0.0)
-
 
 
 def short_num(n):
@@ -307,17 +307,17 @@ def get_tiled_queries(base_queries: torch.Tensor, B: int, S_hat: int) -> torch.T
     # ---- 4. Add batch dim and broadcast -----------------------------------
     return tiled.unsqueeze(0).expand(B, -1, -1).contiguous()
 
+
 # utils_segment_queries.py (or wherever you keep helpers)
 
-from typing import Tuple
-import torch
+
 
 @torch.no_grad()
 def build_segment_queries_qseg(
-    seg_id: torch.Tensor,        # [B, S] int; token -> segment id
-    query_embed: torch.Tensor,   # [L, D] learned template
+    seg_id: torch.Tensor,  # [B, S] int; token -> segment id
+    query_embed: torch.Tensor,  # [L, D] learned template
     *,
-    Q_max: int,                  # constant total #queries per item
+    Q_max: int,  # constant total #queries per item
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build segment-aware queries *without* a dense (B·H,Q,S) mask.
@@ -342,26 +342,26 @@ def build_segment_queries_qseg(
     # (1) Tile the L learned queries across S_hat_cap segment slots
     #     Shape is constant: (B, S_hat_cap, L, D) -> (B, Q_max, D)
     queries = (
-        query_embed.unsqueeze(0).unsqueeze(0)     # [1,1,L,D]
-        .expand(B, S_hat_cap, L, D)               # [B,S_hat_cap,L,D]
-        .reshape(B, Q_max, D)                     # [B,Q_max,D]
+        query_embed.unsqueeze(0)
+        .unsqueeze(0)  # [1,1,L,D]
+        .expand(B, S_hat_cap, L, D)  # [B,S_hat_cap,L,D]
+        .reshape(B, Q_max, D)  # [B,Q_max,D]
         .contiguous()
     )
 
     # (2) q_seg: segment id per query (0..S_hat_cap-1 for real slots, -1 for invalid)
-    q_pos = torch.arange(Q_max, device=device)           # [Q_max]
-    seg_idx_per_q = (q_pos // L)                         # [Q_max] 0..S_hat_cap-1
+    q_pos = torch.arange(Q_max, device=device)  # [Q_max]
+    seg_idx_per_q = q_pos // L  # [Q_max] 0..S_hat_cap-1
     q_seg = seg_idx_per_q.unsqueeze(0).expand(B, Q_max).clone()  # [B,Q_max]
     # mark queries that belong to non-existent segments
-    invalid_q = seg_idx_per_q.unsqueeze(0) >= seg_count.unsqueeze(1)   # [B,Q_max]
+    invalid_q = seg_idx_per_q.unsqueeze(0) >= seg_count.unsqueeze(1)  # [B,Q_max]
     q_seg[invalid_q] = -1
 
     # (3) valid segments per item: [B, S_hat_cap]
-    valid_segments_mask = (
-        torch.arange(S_hat_cap, device=device).unsqueeze(0) < seg_count.unsqueeze(1)
-    )
+    valid_segments_mask = torch.arange(S_hat_cap, device=device).unsqueeze(0) < seg_count.unsqueeze(1)
 
     return queries, q_seg, valid_segments_mask
+
 
 def build_segment_queries_mask(
     seg_id: torch.Tensor,  # [B, S_original]   – integer segment ids
@@ -402,17 +402,16 @@ def build_segment_queries_mask(
         # --- dynamic (old) path ---
         S_hat = seg_count.amax()
         queries = (
-            query_embed.unsqueeze(0).unsqueeze(0)    # [1,1,L,D]
-            .expand(B, S_hat, L, D)                  # [B,Ŝ,L,D]
-            .reshape(B, -1, D)                       # [B,Ŝ·L,D]
+            query_embed.unsqueeze(0)
+            .unsqueeze(0)  # [1,1,L,D]
+            .expand(B, S_hat, L, D)  # [B,Ŝ,L,D]
+            .reshape(B, -1, D)  # [B,Ŝ·L,D]
         )
         q_positions = torch.arange(queries.shape[1], device=device)
-        seg_for_q = (q_positions // L).expand(B, -1)           # [B, Ŝ·L]
+        seg_for_q = (q_positions // L).expand(B, -1)  # [B, Ŝ·L]
         same_segment = seg_for_q[:, :, None].eq(seg_id[:, None, :])
         att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)
-        valid_segments = (
-            torch.arange(S_hat, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
-        )
+        valid_segments = torch.arange(S_hat, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
         return queries, att_mask, valid_segments
 
     # --- fixed-shape path ---
@@ -421,26 +420,24 @@ def build_segment_queries_mask(
 
     # Queries: [B, S_hat_cap*L, D] with constant shape
     queries = (
-        query_embed.unsqueeze(0).unsqueeze(0)     # [1,1,L,D]
-        .expand(B, S_hat_cap, L, D)               # [B,Ŝ_cap,L,D]
-        .reshape(B, Q_max, D)                     # [B,Q_max,D]
+        query_embed.unsqueeze(0)
+        .unsqueeze(0)  # [1,1,L,D]
+        .expand(B, S_hat_cap, L, D)  # [B,Ŝ_cap,L,D]
+        .reshape(B, Q_max, D)  # [B,Q_max,D]
         .contiguous()
     )
 
     # Valid segments per item: [B, S_hat_cap]
-    valid_segments = (
-        torch.arange(S_hat_cap, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
-    )
+    valid_segments = torch.arange(S_hat_cap, device=device).unsqueeze(0).lt(seg_count.unsqueeze(1))
     # Valid queries per item: [B, Q_max]
     q_valid = valid_segments.unsqueeze(-1).expand(-1, -1, L).reshape(B, Q_max)
 
     # Attention mask (True = block), constant shape [B*H, Q_max, S]
     seg_for_q = (torch.arange(Q_max, device=device) // L).view(1, -1, 1)  # [1,Q_max,1]
-    same_segment = seg_for_q.eq(seg_id[:, None, :])                       # [B,Q_max,S]
-    att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)        # [B*H,Q_max,S]
+    same_segment = seg_for_q.eq(seg_id[:, None, :])  # [B,Q_max,S]
+    att_mask = (~same_segment).repeat_interleave(num_heads, dim=0)  # [B*H,Q_max,S]
     # Also block *all* keys for padded queries so they become no-ops
     # att_mask |= (~q_valid)[:, :, None]
     att_mask |= (~q_valid).repeat_interleave(num_heads, dim=0)[:, :, None]
 
     return queries, att_mask, valid_segments
-

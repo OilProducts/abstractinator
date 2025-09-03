@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .sliding_sdpa import CausalLocalSDPABlock as _SDPASlidingSelf
 from .flex_self import CausalLocalSelfFlexBlock as _FlexSlidingSelf
+from .sliding_sdpa import CausalLocalSDPABlock as _SDPASlidingSelf
 
 
 class SlidingSelf(nn.Module):
@@ -66,11 +66,16 @@ class SlidingSelf(nn.Module):
             kpm_cat = None
         else:
             old_kpm = old_kpm if old_kpm is not None else torch.zeros_like(old_x[..., 0], dtype=torch.bool)
-            new_kpm = key_padding_mask_new if key_padding_mask_new is not None else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            new_kpm = (
+                key_padding_mask_new
+                if key_padding_mask_new is not None
+                else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            )
             kpm_cat = torch.cat([old_kpm, new_kpm], dim=1)
         y_cat = self.forward(x_cat, kpm_cat)
         y_new = y_cat[:, -new_x.size(1) :, :]
         cache = {"x": x_cat, "kpm": kpm_cat}
         return y_new, cache
+
 
 __all__ = ["SlidingSelf"]

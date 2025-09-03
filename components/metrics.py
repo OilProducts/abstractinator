@@ -109,16 +109,21 @@ class TrainingMetrics:
         self.vq_loss_t = self.vq_loss_t + output.get("loss_vq", torch.zeros((), device=dev)).detach()
         # Reconstruction/entropy losses are now per-level under comp_outs; fall back to
         # 0 if omitted in a given batch (we still report 0 to surface gaps).
-        self.avg_reconstruction_loss_t = self.avg_reconstruction_loss_t + (
-            output.get("loss_digit_ce", torch.zeros((), device=dev))
-            + output.get("loss_special_ce", torch.zeros((), device=dev))
-        ).detach()
+        self.avg_reconstruction_loss_t = (
+            self.avg_reconstruction_loss_t
+            + (
+                output.get("loss_digit_ce", torch.zeros((), device=dev))
+                + output.get("loss_special_ce", torch.zeros((), device=dev))
+            ).detach()
+        )
         self.count += 1
         self.non_padded_tokens_t = self.non_padded_tokens_t + (~key_padding_mask).sum()
 
         for k, v in output.get("reconstruction_loss_details", {}).items():
             prev = self.reconstruction_loss_details.get(k)
-            self.reconstruction_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
+            self.reconstruction_loss_details[k] = (
+                prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)
+            ) + v.detach()
 
         # Entropy model loss (formerly Aux LM) – aggregated below from comp_outs
 
@@ -126,7 +131,9 @@ class TrainingMetrics:
             self.avg_top_code_lm_loss_t = self.avg_top_code_lm_loss_t + output["avg_top_code_lm_loss"].detach()
             for k, v in output.get("top_code_lm_loss_details", {}).items():
                 prev = self.top_code_lm_loss_details.get(k)
-                self.top_code_lm_loss_details[k] = (prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)) + v.detach()
+                self.top_code_lm_loss_details[k] = (
+                    prev if isinstance(prev, torch.Tensor) else torch.zeros((), device=dev)
+                ) + v.detach()
                 if k == "top_code_mse":
                     self.top_code_mse_t = self.top_code_mse_t + v.detach()
                 elif k == "top_code_vq_loss":
@@ -156,10 +163,14 @@ class TrainingMetrics:
                         if self.output_seq_lengths_t[lvl] is None:
                             self.output_seq_lengths_t[lvl] = torch.zeros((), device=dev, dtype=torch.float32)
                         if getattr(comp, "input_padding_mask", None) is not None:
-                            self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + (~comp.input_padding_mask).sum()
+                            self.input_seq_lengths_t[lvl] = (
+                                self.input_seq_lengths_t[lvl] + (~comp.input_padding_mask).sum()
+                            )
                         elif getattr(comp, "input_sequence", None) is not None:
                             # fallback: count full length if no mask provided
-                            self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[lvl] + comp.input_sequence.new_full((), comp.input_sequence.size(1)).to(torch.long)
+                            self.input_seq_lengths_t[lvl] = self.input_seq_lengths_t[
+                                lvl
+                            ] + comp.input_sequence.new_full((), comp.input_sequence.size(1)).to(torch.long)
                         if getattr(comp, "patch_end_mask", None) is not None:
                             self.output_seq_lengths_t[lvl] = self.output_seq_lengths_t[lvl] + comp.patch_end_mask.sum()
                         self._saw_compression = True
@@ -212,7 +223,6 @@ class TrainingMetrics:
         total_eta_sec: float,
         patches_per_second: List[float],
     ) -> List[str]:
-
         if self.count == 0:
             return []
 
@@ -221,7 +231,11 @@ class TrainingMetrics:
             self.total_loss_t,
             self.avg_reconstruction_loss_t,
             self.vq_loss_t,
-            (self.avg_aux_lm_loss_t if self.avg_aux_lm_loss_t is not None else torch.zeros((), device=self.total_loss_t.device)),
+            (
+                self.avg_aux_lm_loss_t
+                if self.avg_aux_lm_loss_t is not None
+                else torch.zeros((), device=self.total_loss_t.device)
+            ),
             (self.avg_top_code_lm_loss_t if self.top_lm_enabled else torch.zeros((), device=self.total_loss_t.device)),
         ]
         vals = torch.stack(scalars).to(torch.float32) / max(1, self.count)
@@ -310,13 +324,21 @@ class TrainingMetrics:
             "loss/total_avg_accum": float((self.total_loss_t / self.count).item()),
             "loss/vq_avg_accum": float((self.vq_loss_t / self.count).item()),
             "loss/reconstruction_avg_accum": float((self.avg_reconstruction_loss_t / self.count).item()),
-            "loss/entropy_model_avg_accum": float(((
-                (self.avg_aux_lm_loss_t if self.avg_aux_lm_loss_t is not None else zero_dev)
-            ) / max(1, self.count)).item()),
+            "loss/entropy_model_avg_accum": float(
+                (
+                    (self.avg_aux_lm_loss_t if self.avg_aux_lm_loss_t is not None else zero_dev) / max(1, self.count)
+                ).item()
+            ),
             "performance/tokens_per_sec": tokens_per_second,
-            "loss/top_code_lm_avg_accum": float((self.avg_top_code_lm_loss_t / self.count).item()) if self.top_lm_enabled else 0.0,
-            "loss/top_code_mse_avg_accum": float((self.top_code_mse_t / self.count).item()) if self.top_lm_enabled else 0.0,
-            "loss/top_code_vq_avg_accum": float((self.top_code_vq_loss_t / self.count).item()) if self.top_lm_enabled else 0.0,
+            "loss/top_code_lm_avg_accum": float((self.avg_top_code_lm_loss_t / self.count).item())
+            if self.top_lm_enabled
+            else 0.0,
+            "loss/top_code_mse_avg_accum": float((self.top_code_mse_t / self.count).item())
+            if self.top_lm_enabled
+            else 0.0,
+            "loss/top_code_vq_avg_accum": float((self.top_code_vq_loss_t / self.count).item())
+            if self.top_lm_enabled
+            else 0.0,
             "learning_rate": learning_rate,
         }
 
@@ -326,13 +348,19 @@ class TrainingMetrics:
             md[f"performance/patches_total_L{lvl}"] = self.total_patches_processed_per_level[lvl]
 
         for k, v in self.top_code_lm_loss_details.items():
-            md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
+            md[f"loss_detail_avg_accum/{k}"] = float(
+                ((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item()
+            )
         for k, v in self.reconstruction_loss_details.items():
-            md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
+            md[f"loss_detail_avg_accum/{k}"] = float(
+                ((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item()
+            )
         # Entropy model loss details (if any) are included under loss_detail_avg_accum/
         if self.avg_aux_lm_loss_t is not None:
             for k, v in self.aux_lm_loss_details.items():
-                md[f"loss_detail_avg_accum/{k}"] = float(((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item())
+                md[f"loss_detail_avg_accum/{k}"] = float(
+                    ((v if isinstance(v, torch.Tensor) else torch.tensor(v)) / self.count).item()
+                )
 
         if self._saw_compression:
             for lvl in range(self.num_levels):
@@ -340,9 +368,13 @@ class TrainingMetrics:
                 out_len_t = self.output_seq_lengths_t[lvl]
                 in_avg = float(((in_len_t / self.count) if in_len_t is not None else torch.tensor(0.0)).item())
                 out_avg = float(((out_len_t / self.count) if out_len_t is not None else torch.tensor(0.0)).item())
-                ratio_avg = float((
-                    (out_len_t / (in_len_t + 1e-9)) if (in_len_t is not None and out_len_t is not None) else torch.tensor(0.0)
-                ).item())
+                ratio_avg = float(
+                    (
+                        (out_len_t / (in_len_t + 1e-9))
+                        if (in_len_t is not None and out_len_t is not None)
+                        else torch.tensor(0.0)
+                    ).item()
+                )
                 md[f"compression_avg/ratio_L{lvl}"] = ratio_avg
                 md[f"compression_avg/input_len_L{lvl}"] = in_avg
                 md[f"compression_avg/output_len_L{lvl}"] = out_avg

@@ -1,6 +1,8 @@
+from typing import Tuple
+
 import torch
 from torch import nn
-from typing import Tuple
+
 
 class RoPECache(nn.Module):
     """
@@ -12,6 +14,7 @@ class RoPECache(nn.Module):
     - At step/forward time we only take views (slices): no extra kernels.
     - Shapes: cos/sin -> (1, 1, S_max, D_head//2)
     """
+
     def __init__(
         self,
         max_seqlen: int,
@@ -67,11 +70,11 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
     # Split even/odd components along the last dimension.
     x_even = x[..., 0::2]  # (..., L, D/2)
-    x_odd  = x[..., 1::2]  # (..., L, D/2)
+    x_odd = x[..., 1::2]  # (..., L, D/2)
 
     # Rotate (complex multiply): (a + i b) * (cos + i sin)
-    x_rot_even = x_even * cos - x_odd  * sin
-    x_rot_odd  = x_even * sin + x_odd  * cos
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
 
     # Interleave back to (..., L, D) without extra kernels.
     out = torch.empty_like(x)

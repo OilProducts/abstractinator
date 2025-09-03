@@ -4,9 +4,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention.flex_attention import create_block_mask
 
 from .impl import MultiheadLatentAttention
-from torch.nn.attention.flex_attention import create_block_mask
 
 
 class MLASegmentCrossAttention(nn.Module):
@@ -58,9 +58,9 @@ class MLASegmentCrossAttention(nn.Module):
         B, Lq = seg_id_q.shape
         dev = seg_id_q.device
         k_seg = torch.arange(Lk, device=dev).view(1, 1, Lk)  # [1,1,Lk]
-        q_seg = seg_id_q.view(B, Lq, 1)                      # [B,Lq,1]
+        q_seg = seg_id_q.view(B, Lq, 1)  # [B,Lq,1]
         good = (k_seg <= q_seg) & (k_seg >= (q_seg - self.lookback))
-        return (~good).unsqueeze(1)                          # [B,1,Lq,Lk]
+        return (~good).unsqueeze(1)  # [B,1,Lq,Lk]
 
     def _flex_lookback_block(self, seg_id_q: torch.Tensor, Lk: int, pad: Optional[torch.Tensor]) -> object:
         # Build a FlexAttention block mask for lookback (and optional padding) gating.

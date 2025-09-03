@@ -1,9 +1,9 @@
 from components.attention.forms.mla.impl import (
-    MultiheadLatentAttention,
     CausalMLA,
+    CausalMLATransformerBlock,
+    MultiheadLatentAttention,
     SlidingWindowMLA,
     SlidingWindowMLATransformerBlock,
-    CausalMLATransformerBlock,
 )
 
 __all__ = [
@@ -13,4 +13,3 @@ __all__ = [
     "SlidingWindowMLATransformerBlock",
     "CausalMLATransformerBlock",
 ]
-

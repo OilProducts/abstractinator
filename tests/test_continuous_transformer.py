@@ -1,8 +1,8 @@
 import torch
 
 from components.code_sequence_transformer import CodeSequenceTransformer
-from components.vector_quantizer import VectorQuantizer
 from components.config_types import TopTransformerConfig
+from components.vector_quantizer import VectorQuantizer
 
 
 def test_continuous_transformer_forward():

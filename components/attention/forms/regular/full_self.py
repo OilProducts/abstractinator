@@ -5,8 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .self_sdpa import TransformerBlock as _SDPAFullSelf
 from .flex_self import CausalSelfFlexBlock as _FlexFullSelf
+from .self_sdpa import TransformerBlock as _SDPAFullSelf
 
 
 class FullSelf(nn.Module):
@@ -18,7 +18,7 @@ class FullSelf(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim_multiplier: int = 4, *, backend: str = "sdpa"):
         super().__init__()
-        self._is_sdpa = (backend == "sdpa")
+        self._is_sdpa = backend == "sdpa"
         if backend == "flex":
             self.inner = _FlexFullSelf(d_model, n_heads, d_ff=d_model * ffn_dim_multiplier)
         elif backend == "sdpa":
@@ -62,11 +62,16 @@ class FullSelf(nn.Module):
             kpm_cat = None
         else:
             old_kpm = old_kpm if old_kpm is not None else torch.zeros_like(old_x[..., 0], dtype=torch.bool)
-            new_kpm = key_padding_mask_new if key_padding_mask_new is not None else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            new_kpm = (
+                key_padding_mask_new
+                if key_padding_mask_new is not None
+                else torch.zeros_like(new_x[..., 0], dtype=torch.bool)
+            )
             kpm_cat = torch.cat([old_kpm, new_kpm], dim=1)
         y_cat = self.forward(x_cat, kpm_cat)
         y_new = y_cat[:, -new_x.size(1) :, :]
         cache = {"x": x_cat, "kpm": kpm_cat}
         return y_new, cache
+
 
 __all__ = ["FullSelf"]

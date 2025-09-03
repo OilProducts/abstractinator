@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-import torch
 import torch.nn as nn
 
 from ..config_types import AttentionConfig
-from .forms.regular.full_self import FullSelf as RegularFullSelf
-from .forms.regular.sliding_self import SlidingSelf as RegularSlidingSelf
-from .forms.regular.segment_cross import SegmentCross as RegularSegmentCross
 from .forms.mla.full_self import FullSelf as MLAFullSelf
-from .forms.mla.sliding_self import SlidingSelf as MLASlidingSelf
 from .forms.mla.segment_cross import SegmentCross as MLASegmentCross
+from .forms.mla.sliding_self import SlidingSelf as MLASlidingSelf
+from .forms.regular.full_self import FullSelf as RegularFullSelf
+from .forms.regular.segment_cross import SegmentCross as RegularSegmentCross
+from .forms.regular.sliding_self import SlidingSelf as RegularSlidingSelf
 
 
 class _SelfCausalSDPABlock(RegularFullSelf):
@@ -25,11 +24,13 @@ def make_causal_self_block(
     num_heads: int,
     ffn_dim_multiplier: int = 4,
     cfg: Optional[AttentionConfig] = None,
-    ) -> nn.Module:
+) -> nn.Module:
     cfg = cfg or AttentionConfig()
     if cfg.variant == "regular":
         return RegularFullSelf(
-            dim, num_heads, ffn_dim_multiplier,
+            dim,
+            num_heads,
+            ffn_dim_multiplier,
             backend=(cfg.kernel or "sdpa"),
         )
     # MLA path
@@ -37,7 +38,7 @@ def make_causal_self_block(
     kv_comp_dim = cfg.kv_comp_dim
     q_comp_dim = cfg.q_comp_dim
     retr_dim = cfg.retr_dim
-    use_flex = (cfg.kernel == "flex")
+    use_flex = cfg.kernel == "flex"
     return MLAFullSelf(
         dim=dim,
         num_heads=num_heads,
@@ -80,8 +81,6 @@ def make_sliding_self_block(
         ffn_dim_multiplier=ffn_dim_multiplier,
         backend=("flex" if (cfg.kernel == "flex") else "fallback"),
     )
-
-
 
 
 def make_segment_cross_attention(

@@ -5,7 +5,9 @@ from typing import Optional
 import torch
 
 
-def causal_mask(L_q: int, L_k: int | None = None, *, device: torch.device, dtype: torch.dtype = torch.bool) -> torch.Tensor:
+def causal_mask(
+    L_q: int, L_k: int | None = None, *, device: torch.device, dtype: torch.dtype = torch.bool
+) -> torch.Tensor:
     """Return a causal mask with shape (L_q, L_k) as a boolean tensor (True = disallow)."""
     L_k = L_q if L_k is None else L_k
     m = torch.triu(torch.ones(L_q, L_k, device=device, dtype=torch.bool), diagonal=1)
@@ -41,9 +43,9 @@ def merge_masks(
         else:
             am = am.to(dtype)
 
-        if am.dim() == 2:            # (L_q, L_k)
+        if am.dim() == 2:  # (L_q, L_k)
             am = am.view(1, 1, L_q, L_k)
-        elif am.dim() == 3:          # (B, L_q, L_k)
+        elif am.dim() == 3:  # (B, L_q, L_k)
             am = am.view(B, 1, L_q, L_k)
         # else assume (B,H,L_q,L_k)
 
@@ -63,4 +65,3 @@ def merge_masks(
         final = final.expand(B, H, L_q, L_k)
 
     return final
-

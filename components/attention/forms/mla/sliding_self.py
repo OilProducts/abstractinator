@@ -26,7 +26,7 @@ class SlidingSelf(nn.Module):
         backend: str = "flex",
     ) -> None:
         super().__init__()
-        use_flex = (backend == "flex")
+        use_flex = backend == "flex"
         self.inner = SlidingWindowMLATransformerBlock(
             dim=dim,
             num_heads=num_heads,
@@ -48,5 +48,6 @@ class SlidingSelf(nn.Module):
 
     def step(self, x_new, cache, *, pos_start: int, key_padding_mask_new=None):
         return self.inner.step(cache=cache, x_new=x_new, pos_start=pos_start, key_padding_mask_new=key_padding_mask_new)
+
 
 __all__ = ["SlidingSelf"]

@@ -1,15 +1,13 @@
-from copy import deepcopy
 
 from components.config_types import AbstractinatorConfig, TopTransformerConfig
-from experiments.exp_config import ExpConfig
 from experiments.exp_config import (
     exp_config as _base_exp_config,
 )
 
 # Use defaults from experiments.exp_config without modification
-exp_config = _base_exp_config #: ExpConfig = deepcopy(_base_exp_config)
+exp_config = _base_exp_config  #: ExpConfig = deepcopy(_base_exp_config)
 
-exp_config.batch_size = 2 #16
+exp_config.batch_size = 2  # 16
 exp_config.gradient_accumulation_steps = 1
 exp_config.sequence_length = 2048
 exp_config.generation_interval = 500
@@ -19,24 +17,22 @@ exp_config.num_levels = 2
 
 layer_2 = AbstractinatorConfig(
     vocab_size=512**2,
-    D = 256,
-
+    D=256,
     # Compressor
-    c_heads = 16,
-    c_window = 128,
+    c_heads=16,
+    c_window=128,
     # c_num_encoder_layers=4,
     c_num_shared_encoder_layers=0,
     c_num_lm_encoder_layers=14,
     c_num_compression_encoder_layers=4,
     c_num_queries=1,
-    c_entropy_delta= 0.2,
+    c_entropy_delta=0.2,
     c_output_length=512,
     c_vq_K=512,
     c_vq_depth=2,
     c_vq_d_c=128,
     c_vq_beta=0.25,
     c_vq_reset_interval=250,
-
     # Expander/decoder
     d_layers=4,
     d_heads=16,
@@ -46,14 +42,11 @@ layer_2 = AbstractinatorConfig(
     d_predict_specials=True,
     d_max_len=1024,  # Should be previous level's output length
     d_lo_d_c=128,
-
     # Loss weights
-    w_code_ce= 1.0,
-    w_special_ce= 1.0,
-    w_byte_lm_ce= 1.0,
+    w_code_ce=1.0,
+    w_special_ce=1.0,
+    w_byte_lm_ce=1.0,
     w_vq=0.1,  # Weight for the VQ loss
-
-
 )
 
 

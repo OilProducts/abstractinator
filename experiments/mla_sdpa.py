@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from experiments.exp_config import ExpConfig, DEVICE
-from components.config_types import PyramidConfig, AbstractinatorConfig, TopTransformerConfig, AttentionConfig
-
+from components.config_types import AbstractinatorConfig, AttentionConfig, PyramidConfig, TopTransformerConfig
+from experiments.exp_config import DEVICE, ExpConfig
 
 # Attention: MLA form with SDPA-like setting maps to MLA fallback backend in implementation
 MLA_FALLBACK = AttentionConfig(
@@ -60,4 +59,3 @@ exp_config = ExpConfig(
     sequence_length=2048,
     num_epochs=1,
 )
-

@@ -28,13 +28,14 @@ Option B (explicit load):
 """
 
 from __future__ import annotations
+
 import argparse
 import json
 import os
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
 
-from datasets import load_dataset, Dataset, DatasetDict, DownloadConfig
+from datasets import Dataset, DatasetDict, DownloadConfig, load_dataset
 
 
 def _ensure_dir(p: Path) -> Path:
@@ -129,11 +130,11 @@ def main():
     print("\n[✓] Done.")
     print(f"    Bundle directory: {out_dir.resolve()}")
     print("    To use with *no code changes* on the offline box:")
-    print(f'      export HF_DATASETS_CACHE="{(out_dir/"cache").resolve()}"')
-    print( "      export HF_DATASETS_OFFLINE=1")
+    print(f'      export HF_DATASETS_CACHE="{(out_dir / "cache").resolve()}"')
+    print("      export HF_DATASETS_OFFLINE=1")
     print("      # your existing load_dataset(...) line will read from the cache.")
     print("\n    Or load a split explicitly:")
-    print(f'      from datasets import load_from_disk; ds = load_from_disk("{(exports_dir/"train").resolve()}")')
+    print(f'      from datasets import load_from_disk; ds = load_from_disk("{(exports_dir / "train").resolve()}")')
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
 from components.rope import RoPECache, apply_rope
+
 from ...backends.flex import run as flex_run
 
 
@@ -51,11 +52,7 @@ class SegmentCausalCrossAttentionFlex(nn.Module):
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         B, L, _ = x.shape
-        return (
-            x.reshape(B, L, self.n_heads, self.hdim)
-             .permute(0, 2, 1, 3)
-             .contiguous()
-        )
+        return x.reshape(B, L, self.n_heads, self.hdim).permute(0, 2, 1, 3).contiguous()
 
     def _build_block_mask(self, seg_id_q: torch.Tensor, Lk: int, pad: Optional[torch.Tensor]) -> object:
         # seg_id_q: [B, Lq] long; pad: [B, Lk] bool or None
@@ -100,14 +97,19 @@ class SegmentCausalCrossAttentionFlex(nn.Module):
         q_pos_ids = getattr(segment, "q_pos_ids", None)
         kv_pos_ids = getattr(segment, "kv_pos_ids", None)
         if q_pos_ids is None or kv_pos_ids is None:
-            raise AssertionError("SegmentContext.q_pos_ids and kv_pos_ids are required for regular+flex cross-attention")
+            raise AssertionError(
+                "SegmentContext.q_pos_ids and kv_pos_ids are required for regular+flex cross-attention"
+            )
 
         q_pos = q_pos_ids if q_pos_ids.dim() == 2 else q_pos_ids.unsqueeze(0).expand(B, -1)
         q_pos = q_pos.to(torch.long)
         # kv_pos: gather absolute RoPE positions for each key position per batch
         kv_pos = kv_pos_ids.to(torch.long).view(1, 1, Lk, 1).expand(B, 1, -1, 1)
 
-        cos_all, sin_all = self.rope.cos.to(device=qh.device, dtype=qh.dtype), self.rope.sin.to(device=qh.device, dtype=qh.dtype)
+        cos_all, sin_all = (
+            self.rope.cos.to(device=qh.device, dtype=qh.dtype),
+            self.rope.sin.to(device=qh.device, dtype=qh.dtype),
+        )
         Smax = cos_all.size(2)
         q_pos = torch.clamp(q_pos, 0, Smax - 1)
         q_cos = torch.take_along_dim(cos_all.expand(B, 1, -1, -1), q_pos[:, None, :, None], dim=2)
@@ -129,5 +131,6 @@ class SegmentCausalCrossAttentionFlex(nn.Module):
         ctx = flex_run(qh, kh, vh, block_mask=block, score_mod=None)  # [B,H,Lq,Dh]
         out = ctx.transpose(1, 2).reshape(B, Lq, self.d_attn)
         return self.o_proj(out)
+
 
 __all__ = ["SegmentCausalCrossAttentionFlex"]

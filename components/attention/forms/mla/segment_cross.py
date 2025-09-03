@@ -26,7 +26,7 @@ class SegmentCross(nn.Module):
         backend: str = "flex",
     ) -> None:
         super().__init__()
-        use_flex = (backend == "flex")
+        use_flex = backend == "flex"
         self.inner = MLASegmentCrossAttention(
             q_dim=q_dim,
             kv_dim=kv_dim,
@@ -41,5 +41,6 @@ class SegmentCross(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.inner(*args, **kwargs)
+
 
 __all__ = ["SegmentCross"]

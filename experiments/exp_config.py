@@ -7,7 +7,6 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from components.config_types import PyramidConfig, TopTransformerConfig
 
-
 # ----------------- Runtime / device helpers -----------------
 
 N_CPU = int(os.cpu_count()) if os.cpu_count() else 1
@@ -55,6 +54,7 @@ torch.set_default_dtype(DEFAULT_DTYPE)
 
 
 # ----------------- Experiment-level configuration -----------------
+
 
 @dataclass
 class ExpConfig:
@@ -120,4 +120,3 @@ class ExpConfig:
 
 # Default experiment config instance
 exp_config = ExpConfig()
-

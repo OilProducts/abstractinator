@@ -1,8 +1,8 @@
 from copy import deepcopy
 
-from experiments.exp_config import ExpConfig, exp_config as _base_exp_config
 from components.config_types import AbstractinatorConfig, TopTransformerConfig
-
+from experiments.exp_config import ExpConfig
+from experiments.exp_config import exp_config as _base_exp_config
 
 exp_config: ExpConfig = deepcopy(_base_exp_config)
 exp_config.dataset_name = "HuggingFaceFW/fineweb-edu"

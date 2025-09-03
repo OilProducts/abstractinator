@@ -1,3 +1,5 @@
+from .abstractinator_pyramid import AbstractinatorPyramid
+from .config_types import AbstractinatorConfig, PyramidConfig, TopTransformerConfig
 from .utils import (
     build_segment_queries_mask as build_segment_queries_mask,
 )
@@ -12,9 +14,6 @@ from .utils import (
 )
 from .vector_quantizer import VectorQuantizer as VectorQuantizer
 
-from .abstractinator_pyramid import AbstractinatorPyramid
-from .config_types import AbstractinatorConfig, TopTransformerConfig, PyramidConfig
-
 __all__ = [
     "build_segment_queries_mask",
     "entropy_segments",
@@ -27,7 +26,6 @@ __all__ = [
     "PyramidConfig",
 ]
 
-from .segment_compressor import SegmentCompressor as SegmentCompressor
 from .checkpoint_utils import (
     load_base_components as load_base_components,
 )
@@ -35,9 +33,10 @@ from .checkpoint_utils import (
     save_base_components as save_base_components,
 )
 from .code_sequence_transformer import CodeSequenceTransformer as CodeSequenceTransformer
+from .expander import DecoderOnlyExpanderRVQ as DecoderOnlyExpanderRVQ
+from .segment_compressor import SegmentCompressor as SegmentCompressor
 from .swiglu import SwiGLU as SwiGLU
 from .tokenizer import ByteLevelTokenizer as ByteLevelTokenizer
-from .expander import DecoderOnlyExpanderRVQ as DecoderOnlyExpanderRVQ
 
 __all__ += [
     "SegmentCompressor",

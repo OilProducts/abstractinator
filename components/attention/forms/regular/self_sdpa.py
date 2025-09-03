@@ -1,13 +1,14 @@
 import math
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
-from components.swiglu import SwiGLU
-from ...masks import merge_masks
-from ...backends.sdpa import run as sdpa_run
 from components.rope import RoPECache, apply_rope
+from components.swiglu import SwiGLU
+
+from ...backends.sdpa import run as sdpa_run
+from ...masks import merge_masks
 
 
 class TransformerBlock(nn.Module):
@@ -131,7 +132,9 @@ class TransformerBlock(nn.Module):
         mask = self._combine_masks(attn_mask, key_padding_mask, B, self.n_heads, T, T, x.device, q.dtype)
 
         attn = sdpa_run(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_bias=mask,
             is_causal=is_causal,
             dropout_p=self.attn_drop_p if self.training else 0.0,
@@ -170,19 +173,21 @@ class TransformerEncoder(nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerBlock(
-                d_model=d_model,
-                n_heads=n_heads,
-                d_ff=d_ff,
-                attn_dropout=attn_dropout,
-                resid_dropout=resid_dropout,
-                prenorm=prenorm,
-                ln_eps=ln_eps,
-                bias=bias,
-            )
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    d_ff=d_ff,
+                    attn_dropout=attn_dropout,
+                    resid_dropout=resid_dropout,
+                    prenorm=prenorm,
+                    ln_eps=ln_eps,
+                    bias=bias,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.final_norm = nn.LayerNorm(d_model, eps=ln_eps) if final_layer_norm else nn.Identity()
 
     @torch.compile(fullgraph=False)

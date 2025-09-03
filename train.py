@@ -32,26 +32,28 @@ import logging
 import math
 import os
 import time
-from dataclasses import asdict, replace
+from dataclasses import replace
 from functools import partial
 
 import mlflow  # Logging with MLflow
 import torch
+import torch._dynamo as dynamo
 from datasets import load_dataset  # Import Dataset for the dummy data
 from mlflow.tracking import MlflowClient
 from torch import optim
 from torch.utils.data import DataLoader
-import torch._dynamo as dynamo
 from transformers.optimization import get_scheduler
 
-from components import AbstractinatorPyramid
-from components import CodeSequenceTransformer
+from components import AbstractinatorPyramid, CodeSequenceTransformer
 from components.checkpoint_utils import load_base_components, save_base_components
+
 # from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.metrics import MlflowBatchLogger, TrainingMetrics
+
 # from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
 from components.tokenizer import ByteLevelTokenizer
 from components.utils import short_num
+from data_utils import tokenize_and_process_examples
 from experiments.exp_config import (
     DEVICE as DEFAULT_DEVICE,
 )
@@ -61,8 +63,6 @@ from experiments.exp_config import (
 from experiments.exp_config import (
     ExpConfig,
 )
-from components.config_types import PyramidConfig, TopTransformerConfig
-from data_utils import tokenize_and_process_examples
 
 # Name for loggers created in this module so logs don't show '__main__'
 LOGGER_NAME = "abstractinator.train"
@@ -210,6 +210,7 @@ def initialize_model(
         # Finer breakdown for CodeSequenceTransformer (avoid shadowing by aliasing)
         try:
             from components import CodeSequenceTransformer as _CST  # safe alias
+
             if isinstance(top_lm, _CST):
                 in_proj = _count_params(getattr(top_lm, "in_proj", top_lm))
                 enc = _count_params(getattr(top_lm, "encoder", top_lm))
@@ -217,11 +218,13 @@ def initialize_model(
                 out_proj = _count_params(getattr(top_lm, "out_proj", top_lm))
                 logger.info(
                     "    Top LM breakdown → in: %s | encoder: %s | norm: %s | out: %s",
-                    short_num(in_proj), short_num(enc), short_num(f_norm), short_num(out_proj),
+                    short_num(in_proj),
+                    short_num(enc),
+                    short_num(f_norm),
+                    short_num(out_proj),
                 )
         except Exception:
             pass
-
 
     # Per-level breakdown with a finer split for compressor/expander internals
     if hasattr(model, "levels"):
@@ -289,15 +292,26 @@ def initialize_model(
 
                 logger.info(
                     "    ├─ Compressor breakdown → embed: %s | shared(%d): %s | compression(%d): %s",
-                    short_num(emb), n_shared, short_num(shared), n_comp, short_num(comp_layers),
+                    short_num(emb),
+                    n_shared,
+                    short_num(shared),
+                    n_comp,
+                    short_num(comp_layers),
                 )
                 logger.info(
                     "    │  LM branch → layers(%d): %s | norm: %s | logits: %s",
-                    n_lm, short_num(lm_layers), short_num(lm_norm), short_num(lm_head),
+                    n_lm,
+                    short_num(lm_layers),
+                    short_num(lm_norm),
+                    short_num(lm_head),
                 )
                 logger.info(
                     "    │  Pooler: %s | VQ total: %s (down: %s, up: %s, stages: %s)",
-                    short_num(pool), short_num(vq_total), short_num(vq_down), short_num(vq_up), short_num(vq_stage_params),
+                    short_num(pool),
+                    short_num(vq_total),
+                    short_num(vq_down),
+                    short_num(vq_up),
+                    short_num(vq_stage_params),
                 )
 
             # Expander breakdown
@@ -314,7 +328,11 @@ def initialize_model(
 
                 logger.info(
                     "    └─ Expander breakdown → lo_adapter: %s | hi_adapter: %s | decoder(%d): %s | head: %s",
-                    short_num(lo_adapt), short_num(hi_adapt), n_dec_layers, short_num(dec), short_num(head),
+                    short_num(lo_adapt),
+                    short_num(hi_adapt),
+                    n_dec_layers,
+                    short_num(dec),
+                    short_num(head),
                 )
 
         logger.info(
@@ -495,7 +513,7 @@ def train_loop(
         num_workers=8,
         pin_memory=True if device == "cuda" else False,
         persistent_workers=True,
-        prefetch_factor=2
+        prefetch_factor=2,
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / exp_config.gradient_accumulation_steps)
@@ -526,7 +544,9 @@ def train_loop(
     #     torch.cuda.synchronize()
     training_start_time = time.time()
     metrics = TrainingMetrics(
-        num_levels=len(getattr(model, "levels", [])) if getattr(model, "levels", None) is not None else exp_config.num_levels,
+        num_levels=len(getattr(model, "levels", []))
+        if getattr(model, "levels", None) is not None
+        else exp_config.num_levels,
         aux_lm_enabled=True,  # entropy model loss is always tracked for logging
         top_lm_enabled=getattr(exp_config.pyramid_config, "use_top_code_lm", False),
     )
@@ -587,7 +607,6 @@ def train_loop(
     # for n, m in model.named_modules():
     #     if any(k in n.lower() for k in ["attention", "attn", "softmax", "layernorm", "vq", "loss"]):
     #         m.register_forward_hook(nan_hook(n))
-
 
     for epoch in range(start_epoch, exp_config.num_epochs):
         logger.info("\n--- Epoch %s/%s ---", epoch + 1, exp_config.num_epochs)
@@ -676,7 +695,9 @@ def train_loop(
                     model.eval()
                     with torch.no_grad():
                         sample_text = exp_config.sample_prompt_for_generation
-                        input_gen_tokens = tokenizer.encode(sample_text, add_eos=False).unsqueeze(0).to(device).to(torch.int64)
+                        input_gen_tokens = (
+                            tokenizer.encode(sample_text, add_eos=False).unsqueeze(0).to(device).to(torch.int64)
+                        )
 
                         input_gen_kpm = None
                         if exp_config.propagate_key_padding_mask:
