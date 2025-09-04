@@ -60,8 +60,8 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
 
-    # Only support external harness models (e.g., HF) here.
-    # The old HierarchicalAELM adapter is removed; use AbstractinatorPyramid directly for custom eval.
+    # This entrypoint runs external harness models (e.g., HF). For models from
+    # this repo, write custom evaluation using AbstractinatorPyramid directly.
     model_param = args.model
     model_args_param = args.model_args
 

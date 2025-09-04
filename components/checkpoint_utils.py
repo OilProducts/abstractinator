@@ -24,13 +24,17 @@ def save_base_components(model: AbstractinatorPyramid, path: str) -> None:
         path: Destination file path.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(
-        {
-            "compressors": model.compressors.state_dict(),
-            "expanders": model.expanders.state_dict(),
-        },
-        path,
-    )
+    # Build flat state dicts keyed as "{level_idx}.{param_name}" so they can be
+    # loaded without requiring aggregator attributes on the model.
+    comp_sd: dict[str, torch.Tensor] = {}
+    exp_sd: dict[str, torch.Tensor] = {}
+    for i, lvl in enumerate(getattr(model, "levels", [])):
+        for k, v in lvl.compressor.state_dict().items():
+            comp_sd[f"{i}.{k}"] = v
+        for k, v in lvl.expander.state_dict().items():
+            exp_sd[f"{i}.{k}"] = v
+
+    torch.save({"compressors": comp_sd, "expanders": exp_sd}, path)
     logger.info("Base components saved to %s", path)
 
 
@@ -79,25 +83,28 @@ def load_base_components(
         return [modules[i] for i in sorted(modules)]
 
     loaded_comp = _split_by_module(compressors_sd)
-    for src, dst in zip(loaded_comp, model.compressors, strict=False):
-        dst.load_state_dict(src, strict=False)
+    for src, lvl in zip(loaded_comp, getattr(model, "levels", []), strict=False):
+        lvl.compressor.load_state_dict(src, strict=False)
     n_loaded_comp = len(loaded_comp)
 
     loaded_exp = _split_by_module(expanders_sd)
-    offset = len(model.expanders) - len(loaded_exp)
+    n_levels = len(getattr(model, "levels", []))
+    offset = n_levels - len(loaded_exp)
     loaded_exp_indices: list[int] = []
     for i, src in enumerate(loaded_exp):
-        dst = model.expanders[offset + i]
-        dst.load_state_dict(src, strict=False)
+        lvl = model.levels[offset + i]
+        lvl.expander.load_state_dict(src, strict=False)
         loaded_exp_indices.append(offset + i)
 
     if freeze:
         for i in range(n_loaded_comp):
-            model.compressors[i].requires_grad_(False)
-            model.compressors[i].eval()
+            lvl = model.levels[i]
+            lvl.compressor.requires_grad_(False)
+            lvl.compressor.eval()
         for idx in loaded_exp_indices:
-            model.expanders[idx].requires_grad_(False)
-            model.expanders[idx].eval()
+            lvl = model.levels[idx]
+            lvl.expander.requires_grad_(False)
+            lvl.expander.eval()
 
     logger.info("Loaded base components from %s", path)
 

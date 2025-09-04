@@ -1,29 +1,10 @@
 """
-TODO (training cleanups):
+Training script for AbstractinatorPyramid.
 
-1) Base-component freezing logic
-   - When loading base components via `--load_base_from`, we currently call
-     `model.compressors.eval()` and `model.expanders.eval()` in `train_loop`.
-     The pyramid exposes levels under `model.levels`, each with
-     `level.compressor` and `level.expander`. Replace the blanket calls with:
-       for lvl in model.levels:
-           lvl.compressor.eval()
-           lvl.expander.eval()
-     Optionally also set `requires_grad=False` for their parameters if we intend
-     to fully freeze them (note: `load_base_components(..., freeze=True)` already
-     handles `requires_grad=False`).
-
-2) Top‑LM VQ/quantizer wiring
-   - We set `top_lm = CodeSequenceTransformer(..., vq=None)` and later assign
-     `model.top_lm.vq = model.levels[-1].compressor.vq`, but `SegmentCompressor`
-     exposes `quantizer`, not `vq`. Options:
-       a) If the compressor’s `quantizer` implements the same `(z) ->
-          (z_q, vq_loss, indices, perplexity)` API as `VectorQuantizer`, set
-          `model.top_lm.vq = model.levels[-1].compressor.quantizer`.
-       b) Generalize `CodeSequenceTransformer` to accept a `QuantizerBase`, or
-          add a small adapter/wrapper to match the expected interface.
-   - Decide which quantizer the top LM should use (top level vs. shared), and
-     document the choice.
+Notes:
+- Base-component freezing is handled via `load_base_components(..., freeze=True)`
+  and the Abstractinator.train() override that preserves frozen submodules in eval.
+- The top LM is optional and configured via ExpConfig/top_transformer_config.
 """
 
 import argparse
@@ -537,8 +518,9 @@ def train_loop(
 
     model.train()
     if args.load_base_from:
-        model.compressors.eval()
-        model.expanders.eval()
+        for lvl in getattr(model, "levels", []):
+            lvl.compressor.eval()
+            lvl.expander.eval()
     optimizer.zero_grad()
 
     # if device == "cuda":
@@ -723,8 +705,9 @@ def train_loop(
 
                     model.train()
                     if args.load_base_from:
-                        model.compressors.eval()
-                        model.expanders.eval()
+                        for lvl in getattr(model, "levels", []):
+                            lvl.compressor.eval()
+                            lvl.expander.eval()
                 if global_step > 0 and global_step % exp_config.checkpoint_interval == 0:
                     save_checkpoint(
                         model,

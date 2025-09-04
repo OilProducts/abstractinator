@@ -28,17 +28,19 @@ Run the training loop with the default experiment config:
 python train.py --config experiments/exp_config.py
 ```
 
-Create a different config by copying `experiments/exp_config.py` (for example to `experiments/tiny.py`) and pass it with `--config`:
+Create a different config by copying `experiments/exp_config.py` (for example to `experiments/regular_flex.py`) and pass it with `--config`:
 
 ```bash
 python train.py --config experiments/tiny.py
 ```
 
 Sample experiment files are included:
-- `experiments/tiny.py` – small single-level model for quick runs.
-- `experiments/super_tiny.py` – extra-small sanity-check configuration.
-- `experiments/stage1_super_tiny.py` – pretrain compressor/expander only.
-- `experiments/stage2_super_tiny.py` – train top-level LM (use `--load_base_from`).
+- `experiments/regular_flex.py` – regular attention on Flex backend, single level.
+- `experiments/regular_sdpa.py` – regular attention on SDPA backend.
+- `experiments/mla_flex.py` – MLA attention form with Flex backend.
+- `experiments/mla_sdpa.py` – MLA attention form with SDPA fallback backend.
+- `experiments/regular_flex_512.py` – larger 512‑dimensional variant.
+- `experiments/regular_flex_entropy_frozen.py` – loads a pretrained entropy stack and freezes it.
 
 All experiment settings live in the `exp_config` dictionary within your chosen config file. Edit values there to change model size, dataset selection and training options. Training normally runs for `exp_config['num_epochs']`, but you can specify `exp_config['max_steps']` to cap the total number of optimizer steps instead.
 

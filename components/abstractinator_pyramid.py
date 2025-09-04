@@ -1,8 +1,8 @@
 """
-TODO: Adapter responsibilities formerly covered by HierarchicalAELM
+Adapter responsibilities
 
-This module should expose enough functionality for evaluation/generation without
-the old HierarchicalAELM wrapper. To fully replace that role, consider adding:
+This module exposes training (forward), compression (compress_all), and
+generation (generate_bytes). For convenience, future additions may include:
 
 - from_checkpoint(path, config=None, device=None): helper to instantiate
   AbstractinatorPyramid and load weights, preferring config embedded in the
@@ -10,16 +10,8 @@ the old HierarchicalAELM wrapper. To fully replace that role, consider adding:
 - generate(prompt_tokens, max_top_steps, max_child_len, top_sample_fn): thin
   wrapper around generate_bytes that accepts byte/token inputs and returns
   decoded text or tokens using the project tokenizer.
-- loglikelihood(prefix_tokens, continuation_tokens): teacher-forced scoring
-  that computes per-token negative log-likelihood under the current model
-  (compress to top, decode with expander, accumulate CE over targets). This is
-  useful for LM-style evaluation harnesses.
-- device helpers: to(device), eval/train convenience, and a batch_size hint.
-- tokenizer bridge: minimal utilities to convert between strings and the
-  ByteLevelTokenizer used in training so external callers can pass raw text.
-
-These can be introduced incrementally; for now, AbstractinatorPyramid already
-provides forward() training, compress_all(), and generate_bytes().
+- loglikelihood(prefix_tokens, continuation_tokens): teacher-forced scoring for
+  LM-style evaluation harnesses.
 """
 
 from typing import Any, Dict, List, Optional
