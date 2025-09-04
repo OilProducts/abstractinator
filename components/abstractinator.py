@@ -344,7 +344,7 @@ class Abstractinator(nn.Module):
         # standard CE on logits
         ce = F.cross_entropy(stage_logits[0].transpose(1, 2), tgt)
 
-        vq_loss = comp.vq_loss if comp.vq_loss is not None else torch.zeros((), device=embeddings.device)
+        vq_loss = comp.vq_loss if comp.vq_loss is not None else torch.zeros((), device=memory.device)
         total = cfg.w_code_ce * ce + cfg.w_byte_lm_ce * comp.entropy_loss + cfg.w_vq * vq_loss
 
         # ---- 5) Metrics (compression) ----

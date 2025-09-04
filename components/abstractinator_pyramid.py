@@ -227,7 +227,6 @@ class AbstractinatorPyramid(nn.Module):
             real = (~kpm[0]).nonzero(as_tuple=False)
             return int(real[-1].item()) + 1 if real.numel() else 0
 
-        E = self.levels[-1].compressor.embedding  # (V, D)
         prompt_ent_gen = prompt.clone()
         kpm_ent_gen = prompt_kpm.clone()
         emb = self.levels[-1].compressor.embedding(prompt_ent_gen)  # (1, S, D)
@@ -235,7 +234,6 @@ class AbstractinatorPyramid(nn.Module):
         B = prompt.shape[0]
         compressor = self.levels[-1].compressor
         embed = self.levels[-1].compressor.embedding
-        generated = []
 
         for x in range(128):
             # Prefer Gaussian if cache exposes stats; else fall back to logits
@@ -260,19 +258,6 @@ class AbstractinatorPyramid(nn.Module):
 
             kpm_new = torch.zeros(B, 1, dtype=torch.bool, device=device)  # not padded
             cache, _ = compressor.stream_step(cache, x_new, kpm_new)  # pos auto-advances
-            generated.append(x_new)
-
-        from .tokenizer import ByteLevelTokenizer
-
-        tokenizer = ByteLevelTokenizer()
-        decoded_prompt = tokenizer.decode(prompt_ent_gen.squeeze())
-        decoded_generated = tokenizer.decode(
-            torch.argmax(
-                torch.cat(generated, dim=1) @ E.weight.T,
-                dim=-1,
-            ).squeeze()
-        )
-        print(f"{decoded_prompt}{decoded_generated}")
         for _ in range(max_top_steps):
             # ── Phase 1: Upward compression on current bytes ─────────────────────
             comp_all = self.compress_all(prompt, prompt_kpm, comp_only=True)
@@ -305,11 +290,9 @@ class AbstractinatorPyramid(nn.Module):
                 # Continue under last existing row
                 if top_kpm is not None:
                     valid = int((~top_kpm).sum().item())
-                    valid - 1
                     hi_memory = top_mem[:, :valid, :]
                     src_kpm = top_kpm[:, :valid]
                 else:
-                    top_mem.size(1) - 1
                     hi_memory = top_mem
                     src_kpm = None
 

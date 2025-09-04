@@ -77,7 +77,7 @@ dynamo.config.capture_dynamic_output_shape_ops = True
 
 def parse_args() -> argparse.Namespace:
     """Return command line arguments for the training script."""
-    parser = argparse.ArgumentParser(description="Training script for HierarchicalAutoencoder")
+    parser = argparse.ArgumentParser(description="Training script for AbstractinatorPyramid")
     parser.add_argument(
         "--config",
         type=str,
