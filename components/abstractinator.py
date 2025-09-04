@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 from components.config_types import AbstractinatorConfig
 
@@ -24,11 +25,7 @@ class Abstractinator(nn.Module):
     def __init__(self, cfg: AbstractinatorConfig, lo_vq: Optional[MultiStageResidualVQ] = None):
         super().__init__()
         self.cfg = cfg
-
-        # ---- Shared embedding table (moved from SegmentCompressor)
-        # Construct the token embedding at the Abstractinator level so it can be
-        # owned/shared externally and referenced by the compressor.
-        self.embedding = nn.Embedding(cfg.vocab_size, cfg.D)
+        self._logger = logging.getLogger(__name__)
 
         # ---- 1) Compressor (produces vq_embeddings, vq_indices, seg_id, masks, etc.)
         # Optional high‑side quantizer to bottleneck segment memory while keeping it continuous (D‑space)
@@ -65,8 +62,28 @@ class Abstractinator(nn.Module):
             output_length=cfg.c_output_length,
             quantizer=self.hi_quantizer,
             attention_config=cfg.compressor_attention,
+            entropy_config=cfg.c_entropy_config,
         )
-        # Embedding is owned here; SegmentCompressor consumes precomputed embeddings.
+
+        # Optionally preload and freeze entropy stack (embedding + shared + entropy)
+        if getattr(cfg, "c_entropy_load_path", None):
+            try:
+                from .checkpoint_utils import load_entropy_stack
+
+                map_loc = getattr(cfg, "device", None) or "cpu"
+                load_entropy_stack(
+                    self.compressor,
+                    cfg.c_entropy_load_path,
+                    freeze=bool(getattr(cfg, "c_entropy_freeze", True)),
+                    map_location=map_loc,
+                )
+                self._logger.info(
+                    "Loaded entropy stack for level from %s (freeze=%s)",
+                    cfg.c_entropy_load_path,
+                    bool(getattr(cfg, "c_entropy_freeze", True)),
+                )
+            except Exception:
+                self._logger.exception("Failed to load entropy stack from %s", cfg.c_entropy_load_path)
 
         # ---- 2) Expander
         self.lo_vq: Optional[MultiStageResidualVQ] = lo_vq
@@ -122,6 +139,46 @@ class Abstractinator(nn.Module):
     # Public API
     # ---------------------------
 
+    def train(self, mode: bool = True) -> "Abstractinator":  # type: ignore[override]
+        """
+        Override nn.Module.train() to respect frozen submodules.
+
+        Any module whose parameters are all frozen (requires_grad == False)
+        will be kept in eval() mode even when the parent is switched to train().
+        If the entire Abstractinator is frozen, the whole module is kept in
+        eval() regardless of the requested mode.
+        """
+
+        def _all_params_frozen(mod: nn.Module) -> bool:
+            has_param = False
+            for p in mod.parameters(recurse=True):
+                has_param = True
+                if p.requires_grad:
+                    return False
+            return has_param  # True only if it has params and all are frozen
+
+        # If turning training off, defer to default behavior
+        if not mode:
+            super().train(False)
+            return self
+
+        # If this entire module is frozen, keep it (and children) in eval
+        if _all_params_frozen(self):
+            super().train(False)
+            return self
+
+        # Otherwise, enable training as usual first
+        super().train(True)
+
+        # Then force any fully-frozen submodules back to eval
+        for m in self.modules():
+            if m is self:
+                continue
+            if _all_params_frozen(m):
+                m.eval()
+
+        return self
+
     @torch.no_grad()
     def segment_only(
         self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
@@ -131,16 +188,14 @@ class Abstractinator(nn.Module):
         with embeddings computed at this level.
         Returns (seg_id, patch_end_mask), both (B, S).
         """
-        x = self.embedding(token_ids)
-        return self.compressor.segment_only(x, key_padding_mask=key_padding_mask)
+        return self.compressor.segment_only_ids(token_ids, key_padding_mask=key_padding_mask)
 
     def compress(self, token_ids: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> CompressorOutput:
         """
         Just run the compressor.
         Returns the original CompressorOutput with segment codes/embeddings.
         """
-        x = self.embedding(token_ids)
-        return self.compressor(x, key_padding_mask=key_padding_mask, token_ids=token_ids)
+        return self.compressor.forward_ids(token_ids, key_padding_mask=key_padding_mask)
 
     def uncompress(
         self,
@@ -242,10 +297,8 @@ class Abstractinator(nn.Module):
         cfg = self.cfg
         token_ids.size(0)
 
-        embeddings = self.embedding(token_ids)  # (B, S_in, D)
-
         # ---- 1) Compress ----
-        comp: CompressorOutput = self.compressor(embeddings, key_padding_mask=key_padding_mask, token_ids=token_ids)
+        comp: CompressorOutput = self.compressor.forward_ids(token_ids, key_padding_mask=key_padding_mask)
 
         # hi memory for decoder (continuous)
         # Prefer continuous quantized memory (z_hat). Falls back to pre‑VQ embeddings if needed.

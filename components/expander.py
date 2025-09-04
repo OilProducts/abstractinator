@@ -45,8 +45,8 @@ class SlidingDecoderBlock(nn.Module):
         q_dim,
         kv_dim,
         *,
-        cross_attn_config: "AttentionConfig" | None = None,
-        self_attn_config: "AttentionConfig" | None = None,
+        cross_attn_config: "AttentionConfig | None" = None,
+        self_attn_config: "AttentionConfig | None" = None,
     ):
         super().__init__()
         self.layer_id = f'L{idx}'

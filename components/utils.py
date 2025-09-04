@@ -28,52 +28,6 @@ def safe_softmax(
     return exp / torch.clamp_min(denom, eps)
 
 
-# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None, dim: int = -1) -> torch.Tensor:
-#     # Apply provided mask if present
-#     if mask is not None:
-#         scores = scores.masked_fill(mask, float("-inf"))
-#
-#     # Always guard against fully-masked rows (all -inf), even if mask is None.
-#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
-#
-#     # Replace -inf with 0 so softmax's internal max-subtraction doesn't generate NaNs.
-#     safe_scores = scores.masked_fill(all_masked, 0.0)
-#
-#     attn = torch.softmax(safe_scores, dim=dim)
-#     return attn.masked_fill(all_masked, 0.0)
-
-
-# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-#     """
-#     Identical to soft‑max on `scores.masked_fill(mask, -inf)` *except*
-#     rows where everything is masked yield a zero vector (no NaNs).
-#     """
-#     scores = scores.masked_fill(mask, float("-inf"))
-#
-#     # Identify rows that are completely −inf
-#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
-#
-#     # Replace −inf with 0 in such rows so exp() = 1 → softmax = 1/rowlen
-#     safe_scores = scores.masked_fill(all_masked, 0.0)
-#
-#     attn = torch.softmax(safe_scores, dim=dim)
-#
-#     # Bring the fully‑masked rows back to exact zeros
-#     attn = attn.masked_fill(all_masked, 0.0)
-#     return attn
-
-# def safe_softmax(scores: torch.Tensor, mask: torch.Tensor | None, dim: int = -1) -> torch.Tensor:
-#     if mask is not None:
-#         scores = scores.masked_fill(mask, float("-inf"))
-#     return torch.softmax(scores, dim=dim) if mask is None else _safe_softmax_with_mask(scores, mask, dim)
-#
-# def _safe_softmax_with_mask(scores, mask, dim):
-#     all_masked = torch.isneginf(scores).all(dim=dim, keepdim=True)
-#     safe_scores = scores.masked_fill(all_masked, 0.0)
-#     attn = torch.softmax(safe_scores, dim=dim)
-#     return attn.masked_fill(all_masked, 0.0)
-
-
 def short_num(n):
     n = float(n)
     millnames = ['', 'k', 'm', 'b', 't', 'q']

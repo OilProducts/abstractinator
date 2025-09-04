@@ -23,6 +23,8 @@ level = AbstractinatorConfig(
     d_heads=8,
     d_cross_window=1,
     d_max_len=512,
+    c_entropy_load_path = "./models/entropy_stack_256.pt",
+    c_entropy_freeze = True
 )
 level.compressor_attention = REGULAR_FLEX
 level.decoder_self_attention = REGULAR_FLEX
@@ -42,9 +44,10 @@ exp_config = ExpConfig(
     run_name="regular_flex_256d",
     device=DEVICE,
     pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=True),
-    top_transformer_config=top_lm,
-    batch_size=64,
+    top_transformer_config=None,
+    batch_size=32,
+    gradient_accumulation_steps=2,
     sequence_length=2048,
     num_epochs=1,
-    generation_interval=500,
+    generation_interval=5000,
 )

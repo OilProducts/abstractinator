@@ -97,7 +97,7 @@ class ExpConfig:
 
     # sample_prompt_for_generation: str = "In a land far away, "
     generation_interval: int = 100
-    generation_max_len_override: int = 32
+    generation_max_len_override: int = 256
 
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"

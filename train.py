@@ -186,6 +186,7 @@ def initialize_model(
             freeze=True,
             map_location=device,
         )
+    # Entropy stack may be loaded/frozen per-level via AbstractinatorConfig
 
     def _count_params(module: torch.nn.Module) -> int:
         return sum(p.numel() for p in module.parameters() if p.requires_grad)

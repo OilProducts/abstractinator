@@ -8,6 +8,7 @@ import os
 import torch
 
 from components import AbstractinatorPyramid
+from components.segment_compressor import SegmentCompressor
 
 logger = logging.getLogger(__name__)
 
@@ -99,3 +100,53 @@ def load_base_components(
             model.expanders[idx].eval()
 
     logger.info("Loaded base components from %s", path)
+
+
+def save_entropy_stack(compressor: SegmentCompressor, path: str) -> None:
+    """
+    Save the entropy stack (embedding + shared layers + entropy model) to a checkpoint.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    state = {
+        "embedding": compressor.embedding.state_dict(),
+        "shared_layers": compressor.shared_layers.state_dict(),
+        "entropy_model": compressor.entropy_model.state_dict(),
+    }
+    # Include config when available (best-effort)
+    try:
+        from dataclasses import asdict
+
+        cfg = getattr(compressor.entropy_model, "cfg", None)
+        if cfg is not None:
+            state["entropy_config"] = asdict(cfg)
+    except Exception:
+        pass
+    torch.save(state, path)
+    logger.info("Entropy stack saved to %s", path)
+
+
+def load_entropy_stack(
+    compressor: SegmentCompressor,
+    path: str,
+    *,
+    freeze: bool = True,
+    map_location: str | torch.device | None = "cpu",
+) -> None:
+    """
+    Load embedding + shared_layers + entropy_model into the given compressor.
+    If freeze=True, marks those parameters as non-trainable and sets eval().
+    """
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    if "embedding" in ckpt:
+        compressor.embedding.load_state_dict(ckpt["embedding"], strict=False)
+    if "shared_layers" in ckpt:
+        compressor.shared_layers.load_state_dict(ckpt["shared_layers"], strict=False)
+    if "entropy_model" in ckpt:
+        compressor.entropy_model.load_state_dict(ckpt["entropy_model"], strict=False)
+
+    if freeze:
+        for mod in (compressor.embedding, compressor.shared_layers, compressor.entropy_model):
+            mod.requires_grad_(False)
+            mod.eval()
+
+    logger.info("Loaded entropy stack from %s (freeze=%s)", path, freeze)

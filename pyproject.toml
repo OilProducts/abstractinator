@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate==1.10.1",
     "datasets>=4.0.0",
     "lm-eval>=0.4.9",
     "mlflow>=3.1.4",
-    "torch>=2.7.1",
+    "ruff==0.12.11",
+    "torch==2.8.0",
     "transformers>=4.53.3",
 ]
 

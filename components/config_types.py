@@ -23,6 +23,55 @@ class AttentionConfig:
 
 
 @dataclass
+class EntropyLogitHeadConfig:
+    use: bool = True
+    tie_to_embedding: bool = False
+
+
+@dataclass
+class EntropyGaussianHeadConfig:
+    use: bool = False
+    mixture_components: int = 1
+    clamp_logvar_min: float = -8.0
+    clamp_logvar_max: float = 8.0
+    extra_layers: int = 0
+    detach_trunk: bool = False
+
+
+@dataclass
+class EntropyLossConfig:
+    ce_weight: float = 1.0
+    nll_weight: float = 0.0
+
+
+@dataclass
+class EntropySegmentationConfig:
+    source: str = "logit"  # "logit" | "gaussian"
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = 0
+
+
+@dataclass
+class EntropyModelConfig:
+    # Trunk (causal transformer) configuration
+    n_layers: int = 2
+    n_heads: int = 8
+    window: int = 128
+    attention_config: Optional["AttentionConfig"] = None
+
+    # Heads
+    logit: EntropyLogitHeadConfig = field(default_factory=EntropyLogitHeadConfig)
+    gaussian: EntropyGaussianHeadConfig = field(default_factory=EntropyGaussianHeadConfig)
+
+    # Training losses
+    loss: EntropyLossConfig = field(default_factory=EntropyLossConfig)
+
+    # Segmentation policy
+    segmentation: EntropySegmentationConfig = field(default_factory=EntropySegmentationConfig)
+
+
+@dataclass
 class AbstractinatorConfig:
     # Shared / tokens
     vocab_size: int = 260
@@ -78,6 +127,12 @@ class AbstractinatorConfig:
     compressor_attention: Optional["AttentionConfig"] = None
     decoder_self_attention: Optional["AttentionConfig"] = None
     decoder_cross_attention: Optional["AttentionConfig"] = None
+
+    # Entropy model (segmentation) configuration
+    c_entropy_config: Optional["EntropyModelConfig"] = None
+    # Optional: preload a trained entropy stack and freeze
+    c_entropy_load_path: Optional[str] = None
+    c_entropy_freeze: bool = True
 
 
 @dataclass

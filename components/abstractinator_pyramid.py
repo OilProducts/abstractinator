@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from components.config_types import PyramidConfig
 
 from .abstractinator import Abstractinator
-from .segment_compressor import GaussianEntropyModel
 
 
 class AbstractinatorPyramid(nn.Module):
@@ -228,30 +227,36 @@ class AbstractinatorPyramid(nn.Module):
             real = (~kpm[0]).nonzero(as_tuple=False)
             return int(real[-1].item()) + 1 if real.numel() else 0
 
-        E = self.levels[-1].embedding  # (V, D)
+        E = self.levels[-1].compressor.embedding  # (V, D)
         prompt_ent_gen = prompt.clone()
         kpm_ent_gen = prompt_kpm.clone()
-        emb = self.levels[-1].embedding(prompt_ent_gen)  # (1, S, D)
+        emb = self.levels[-1].compressor.embedding(prompt_ent_gen)  # (1, S, D)
         cache, _ = self.levels[-1].compressor.stream_prefill(emb, kpm_ent_gen)
         B = prompt.shape[0]
         compressor = self.levels[-1].compressor
-        embed = self.levels[-1].embedding
+        embed = self.levels[-1].compressor.embedding
         generated = []
 
         for x in range(128):
-            if isinstance(compressor.entropy_model, GaussianEntropyModel):
-                # next embedding from N(mu, sigma^2) at last position
+            # Prefer Gaussian if cache exposes stats; else fall back to logits
+            if hasattr(cache, "entropy") and hasattr(cache.entropy, "last_mu") and cache.entropy.last_mu is not None:
                 mu = cache.entropy.last_mu  # (B, D)
                 logvar = cache.entropy.last_logvar  # (B, D)
                 std = torch.exp(0.5 * logvar)
-                next_emb = mu + std * torch.randn_like(std)  # temperature=1.0
-                x_new = next_emb.unsqueeze(1)  # (B, 1, D)
-            else:
-                # logits branch: sample next id, then embed to get the new x
-                logits = cache.entropy.last_logits  # (B, V)
+                next_emb = mu + std * torch.randn_like(std)
+                x_new = next_emb.unsqueeze(1)
+            elif hasattr(cache, "entropy") and hasattr(cache.entropy, "last_logits") and cache.entropy.last_logits is not None:
+                logits = cache.entropy.last_logits
                 probs = torch.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, 1).squeeze(-1)  # (B,)
-                x_new = embed(next_id).unsqueeze(1)  # (B, 1, D)
+                next_id = torch.multinomial(probs, 1).squeeze(-1)
+                x_new = embed(next_id).unsqueeze(1)
+            else:
+                # Fallback: query entropy model directly
+                next_emb_or_id = compressor.sample_next(emb, kpm_ent_gen, embed_fn=embed)
+                if next_emb_or_id.dim() == 2 and next_emb_or_id.size(-1) == emb.size(-1):
+                    x_new = next_emb_or_id.unsqueeze(1)
+                else:
+                    x_new = embed(next_emb_or_id).unsqueeze(1)
 
             kpm_new = torch.zeros(B, 1, dtype=torch.bool, device=device)  # not padded
             cache, _ = compressor.stream_step(cache, x_new, kpm_new)  # pos auto-advances
@@ -272,7 +277,12 @@ class AbstractinatorPyramid(nn.Module):
             # ── Phase 1: Upward compression on current bytes ─────────────────────
             comp_all = self.compress_all(prompt, prompt_kpm, comp_only=True)
             top_comp = comp_all[-1]['comp_out']
-            top_mem = top_comp.pre_vq_embeddings  # (1, S_hi, D)
+            # Match training: prefer quantized memory (z_hat) if available
+            top_mem = (
+                top_comp.vq_embeddings
+                if getattr(top_comp, "vq_embeddings", None) is not None
+                else top_comp.pre_vq_embeddings
+            )  # (1, S_hi, D)
             top_kpm = (~top_comp.valid_mask) if top_comp.valid_mask is not None else None
 
             # ── Phase 2: Top-level "append a new row" (optional) ────────────────
