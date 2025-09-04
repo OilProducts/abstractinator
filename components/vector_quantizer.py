@@ -668,6 +668,12 @@ class LearnedCodebookAdapter(nn.Module):
 
 
 class DownProj(nn.Module):  # D -> d_c
+    """Thin wrapper around a shared parameter Wdc to project from model hidden D to code space d_c.
+
+    This keeps the projection tied with UpProj (weight tying), so the adapter can
+    use a single matrix for both directions (D↔d_c) without duplicating params.
+    """
+
     def __init__(self, Wdc: nn.Parameter):
         super().__init__()
         self.Wdc = Wdc  # shape (d_c, D)
@@ -677,6 +683,12 @@ class DownProj(nn.Module):  # D -> d_c
 
 
 class UpProj(nn.Module):  # d_c -> D
+    """Inverse projection back to model hidden D using the same shared Wdc.
+
+    Using the shared weight preserves geometry between code space and model space
+    and keeps parameter count small.
+    """
+
     def __init__(self, Wdc: nn.Parameter):
         super().__init__()
         self.Wdc = Wdc  # same shared Parameter

@@ -100,7 +100,7 @@ class AbstractinatorConfig:
     c_output_length: int = 1024
     c_vq_K: int = 8192
     c_vq_depth: int = 1
-    c_vq_d_c: Optional[int] = None
+    c_vq_d_c: Optional[int] = None  # d_c for compressor's VQ (code-space dim). If None, defaults to 64.
     c_vq_beta: float = 0.25
     c_vq_reset_interval: int = 250
 
@@ -112,7 +112,7 @@ class AbstractinatorConfig:
     d_use_sqdist_logits: bool = False
     d_predict_specials: bool = False
     d_max_len: int = 2048
-    d_lo_d_c: int = 64
+    d_lo_d_c: int = 64  # d_c for bottom-level decoder (no lo_vq). Ignored at upper levels.
 
     # Loss weights (component-local defaults)
     w_code_ce: float = 1.0
