@@ -22,7 +22,7 @@
   - `exp_config.py`: `ExpConfig` dataclass plus device/dtype/flex-attention checks.
   - Other experiment profiles (optional) can live here (e.g., stage variants).
 - `tests/`: Pytest suite for utils, vector quantizer, continuous transformers, and attention components.
-- Top-level scripts: `train.py` (training), `evaluate.py` (benchmarks), `segment_dataset.py`, `expand_codebook.py`, `gaussian_train.py`.
+- Top-level scripts: `train.py` (training), `evaluate.py` (benchmarks).
 - Artifacts (not for PRs): `checkpoints/`, `mlruns/`, `models/`.
 
 ## Build, Test, and Development Commands
@@ -30,9 +30,10 @@
 - Install runtime deps: `pip install -r requirements.txt`
 - Install dev tools (pytest, ruff): `pip install -r requirements-dev.txt`
 - Train (default exp config): `python train.py --config experiments/exp_config.py`
-- Example variants: `experiments/tiny.py`, `experiments/super_tiny.py`,
-  `experiments/stage1_super_tiny.py`, `experiments/stage2_super_tiny.py`.
-- Resume/load base: `python train.py --config experiments/stage2_super_tiny.py --load_base_from ./stage1_base.pt`
+- Example variants: `experiments/regular_flex.py`, `experiments/regular_sdpa.py`,
+  `experiments/mla_flex.py`, `experiments/mla_sdpa.py`, `experiments/regular_flex_512.py`,
+  `experiments/regular_flex_entropy_frozen.py`.
+- Resume/load base: `python train.py --config experiments/regular_flex_entropy_frozen.py --load_base_from ./models/stage1_base.pt`
 - Evaluate HF model: `python evaluate.py --model hf --model_args pretrained=facebook/opt-1.3b`
   
 - Run tests: `pytest -q`

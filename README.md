@@ -31,7 +31,7 @@ python train.py --config experiments/exp_config.py
 Create a different config by copying `experiments/exp_config.py` (for example to `experiments/regular_flex.py`) and pass it with `--config`:
 
 ```bash
-python train.py --config experiments/tiny.py
+python train.py --config experiments/regular_flex.py
 ```
 
 Sample experiment files are included:

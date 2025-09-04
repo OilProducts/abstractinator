@@ -31,7 +31,7 @@ from components.checkpoint_utils import load_base_components, save_base_componen
 # from components.expander import _cached_causal_mask as _cached_causal_mask_cpu
 from components.metrics import MlflowBatchLogger, TrainingMetrics
 
-# from components.sliding_window_attention import _cached_cross_window_mask as _cached_cross_window_mask_cpu
+# (legacy attention cache helpers were removed)
 from components.tokenizer import ByteLevelTokenizer
 from components.utils import short_num
 from data_utils import tokenize_and_process_examples
