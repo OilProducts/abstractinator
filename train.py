@@ -156,7 +156,7 @@ def initialize_model(
     # If we constructed a top LM, attach the top-level compressor VQ so it can quantize/pick EOS
     if top_lm is not None and hasattr(model, "levels") and len(model.levels) > 0:
         try:
-            model.top_lm.vq = model.levels[-1].compressor.vq
+            model.top_lm.vq = model.levels[-1].compressor.quantizer
         except Exception:
             pass
 
@@ -169,10 +169,19 @@ def initialize_model(
         )
     # Entropy stack may be loaded/frozen per-level via AbstractinatorConfig
 
-    def _count_params(module: torch.nn.Module) -> int:
-        return sum(p.numel() for p in module.parameters() if p.requires_grad)
+    def _count_params_trainable(module: torch.nn.Module | None) -> int:
+        try:
+            return sum(p.numel() for p in module.parameters() if p.requires_grad) if module is not None else 0
+        except Exception:
+            return 0
 
-    num_params = _count_params(model)
+    def _count_params_total(module: torch.nn.Module | None) -> int:
+        try:
+            return sum(p.numel() for p in module.parameters()) if module is not None else 0
+        except Exception:
+            return 0
+
+    num_params = _count_params_trainable(model)
     logger.info(
         "Model initialized on %s with %s trainable parameters.",
         device,
@@ -180,13 +189,13 @@ def initialize_model(
     )
 
     # High-level component breakdown
-    levels_params = _count_params(model.levels) if hasattr(model, "levels") else 0
+    levels_params = _count_params_total(model.levels) if hasattr(model, "levels") else 0
     logger.info("  Levels (all): %s parameters", short_num(levels_params))
 
     # Optional top LM module (high level)
     top_lm = getattr(model, "top_lm", None)
     if top_lm is not None:
-        top_lm_params = _count_params(top_lm)
+        top_lm_params = _count_params_total(top_lm)
         logger.info("  Top LM: %s parameters", short_num(top_lm_params))
 
         # Finer breakdown for CodeSequenceTransformer (avoid shadowing by aliasing)
@@ -194,10 +203,10 @@ def initialize_model(
             from components import CodeSequenceTransformer as _CST  # safe alias
 
             if isinstance(top_lm, _CST):
-                in_proj = _count_params(getattr(top_lm, "in_proj", top_lm))
-                enc = _count_params(getattr(top_lm, "encoder", top_lm))
-                f_norm = _count_params(getattr(top_lm, "final_norm", top_lm))
-                out_proj = _count_params(getattr(top_lm, "out_proj", top_lm))
+                in_proj = _count_params_total(getattr(top_lm, "in_proj", top_lm))
+                enc = _count_params_total(getattr(top_lm, "encoder", top_lm))
+                f_norm = _count_params_total(getattr(top_lm, "final_norm", top_lm))
+                out_proj = _count_params_total(getattr(top_lm, "out_proj", top_lm))
                 logger.info(
                     "    Top LM breakdown → in: %s | encoder: %s | norm: %s | out: %s",
                     short_num(in_proj),
@@ -215,10 +224,7 @@ def initialize_model(
 
         # Helper to safely count attributes that may not exist
         def _safe_count(mod: torch.nn.Module | None) -> int:
-            try:
-                return _count_params(mod) if mod is not None else 0
-            except Exception:
-                return 0
+            return _count_params_total(mod)
 
         for li, lvl in enumerate(model.levels):
             comp = getattr(lvl, "compressor", None)
@@ -241,9 +247,11 @@ def initialize_model(
                 emb = _safe_count(getattr(comp, "embedding", None))
                 shared = _safe_count(getattr(comp, "shared_layers", None))
                 comp_layers = _safe_count(getattr(comp, "compression_layers", None))
-                lm_layers = _safe_count(getattr(comp, "lm_layers", None))
-                lm_norm = _safe_count(getattr(comp, "lm_final_norm", None))
-                lm_head = _safe_count(getattr(comp, "logit_proj", None))
+                # Entropy model breakdown (replaces legacy LM branch)
+                ent = getattr(comp, "entropy_model", None)
+                ent_layers = _safe_count(getattr(ent, "layers", None))
+                ent_norm = _safe_count(getattr(ent, "logit_norm", None))
+                ent_head = _safe_count(getattr(ent, "logit_proj", None))
                 pool = _safe_count(getattr(comp, "pooler", None))
                 vq = getattr(comp, "vq", None)
                 vq_total = _safe_count(vq)
@@ -268,9 +276,9 @@ def initialize_model(
                 except Exception:
                     n_comp = 0
                 try:
-                    n_lm = len(getattr(comp, "lm_layers", []))
+                    n_ent_layers = len(getattr(ent, "layers", [])) if ent is not None else 0
                 except Exception:
-                    n_lm = 0
+                    n_ent_layers = 0
 
                 logger.info(
                     "    ├─ Compressor breakdown → embed: %s | shared(%d): %s | compression(%d): %s",
@@ -281,11 +289,11 @@ def initialize_model(
                     short_num(comp_layers),
                 )
                 logger.info(
-                    "    │  LM branch → layers(%d): %s | norm: %s | logits: %s",
-                    n_lm,
-                    short_num(lm_layers),
-                    short_num(lm_norm),
-                    short_num(lm_head),
+                    "    │  Entropy model → layers(%d): %s | norm: %s | logits: %s",
+                    n_ent_layers,
+                    short_num(ent_layers),
+                    short_num(ent_norm),
+                    short_num(ent_head),
                 )
                 logger.info(
                     "    │  Pooler: %s | VQ total: %s (down: %s, up: %s, stages: %s)",
@@ -322,6 +330,17 @@ def initialize_model(
             short_num(total_comp),
             short_num(total_exp),
         )
+
+    # Summarize trainable vs frozen counts
+    total_params_all = _count_params_total(model)
+    trainable_params_count = _count_params_trainable(model)
+    frozen_params_count = max(0, total_params_all - trainable_params_count)
+    logger.info(
+        "Parameters → Trainable: %s | Frozen: %s | Total: %s",
+        short_num(trainable_params_count),
+        short_num(frozen_params_count),
+        short_num(total_params_all),
+    )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=exp_config.learning_rate)
@@ -475,7 +494,7 @@ def train_loop(
         ),
         batched=True,
         remove_columns=raw_dataset.column_names,
-        num_proc=8,
+        num_proc=1,
         desc="Byte-tokenising",
     )
 
@@ -526,11 +545,32 @@ def train_loop(
     # if device == "cuda":
     #     torch.cuda.synchronize()
     training_start_time = time.time()
+    # Enable entropy loss logging only if any level's entropy stack is trainable
+        def _aux_entropy_enabled_by_config(mdl: AbstractinatorPyramid) -> bool:
+        """Return True if any level's config indicates the entropy stack is trainable.
+
+        Uses config only: if a level has c_entropy_load_path set AND c_entropy_freeze=True,
+        treat it as frozen; otherwise consider the aux entropy loss enabled (subject to weight).
+        """
+        try:
+            for lvl in getattr(mdl, "levels", []):
+                cfg = getattr(lvl, "cfg", None)
+                if cfg is None:
+                    continue
+                frozen_by_cfg = bool(getattr(cfg, "c_entropy_load_path", None)) and bool(
+                    getattr(cfg, "c_entropy_freeze", True)
+                )
+                if (not frozen_by_cfg) and float(getattr(cfg, "w_entropy_ce", 0.0)) != 0.0:
+                    return True
+        except Exception:
+            pass
+        return False
+
     metrics = TrainingMetrics(
         num_levels=len(getattr(model, "levels", []))
         if getattr(model, "levels", None) is not None
         else exp_config.num_levels,
-        aux_lm_enabled=True,  # entropy model loss is always tracked for logging
+        entropy_enabled=_aux_entropy_enabled_by_config(model),
         top_lm_enabled=getattr(exp_config.pyramid_config, "use_top_code_lm", False),
     )
 
@@ -598,8 +638,10 @@ def train_loop(
         epoch_start_time = time.time()
         model.train()
         if args.load_base_from:
-            model.compressors.eval()
-            model.expanders.eval()
+            # Keep loaded base components frozen in eval mode during training
+            for lvl in getattr(model, "levels", []):
+                lvl.compressor.eval()
+                lvl.expander.eval()
 
         for i, batch in enumerate(train_dataloader):
             # Make H2D transfers asynchronous to overlap with compute
@@ -616,6 +658,19 @@ def train_loop(
                 w_mse = float(getattr(exp_config, "top_lm_mse_weight", 1.0))
                 # CE path not currently modeled; include only MSE component here
                 total_loss = total_loss + w_top * (w_mse * output_dict["avg_top_code_lm_loss"])
+                # Optional VQ regularizer (typically small); leave disabled unless configured
+                # total_loss = total_loss + w_top * ((w_mse * 0.0) * output_dict["top_code_lm_loss_details"]["top_code_vq_loss"]) 
+                # Add byte-level CE flowing through top LM if present
+                w_ce = float(getattr(exp_config, "top_lm_ce_weight", 1.0))
+                try:
+                    ce_through_top = output_dict.get("top_code_lm_loss_details", {}).get("top_code_byte_ce", None)
+                    if ce_through_top is not None:
+                        # Apply an extra fixed multiplier (0.02) to keep this term gentle
+                        total_loss = total_loss + w_top * (0.02 * w_ce * ce_through_top)
+                except Exception:
+                    pass
+                # Keep console/MLflow "Loss" in sync with the true backward loss
+                output_dict["loss_total"] = total_loss.detach()
 
             loss_for_backward = total_loss / exp_config.gradient_accumulation_steps
             loss_for_backward.backward()
@@ -677,7 +732,16 @@ def train_loop(
                     logger.info("\nStep %s: Generating sample...", global_step)
                     model.eval()
                     with torch.no_grad():
-                        sample_text = exp_config.sample_prompt_for_generation
+                        has_top_lm = (
+                            getattr(model, "top_lm", None) is not None
+                            and bool(getattr(exp_config.pyramid_config, "use_top_code_lm", False))
+                        )
+                        # Prefer a longer Phase 2 prompt when no top LM is present
+                        sample_text = (
+                            getattr(exp_config, "phase2_sample_prompt_for_generation", exp_config.sample_prompt_for_generation)
+                            if not has_top_lm
+                            else exp_config.sample_prompt_for_generation
+                        )
                         input_gen_tokens = (
                             tokenizer.encode(sample_text, add_eos=False).unsqueeze(0).to(device).to(torch.int64)
                         )
@@ -702,6 +766,121 @@ def train_loop(
 
                         mlflow_text_log = f"Original:\n{sample_text}\n\nReconstructed:\n{reconstructed_text}"
                         mlflow.log_text(mlflow_text_log, f"sample_generation_step_{global_step}.txt")
+
+                        # Teacher-forced reconstruction snippet + segment fidelity (bottom level)
+                        # Only run these Phase 2 diagnostics when no top LM is present
+                        if not has_top_lm:
+                            try:
+                                # Use the same prompt as a small held-out snippet
+                                tf_tokens = input_gen_tokens[:, : min(input_gen_tokens.size(1), 512)].contiguous()
+                                tf_kpm = (
+                                    torch.zeros_like(tf_tokens, dtype=torch.bool, device=device)
+                                    if exp_config.propagate_key_padding_mask
+                                    else None
+                                )
+                                comp_all = model.compress_all(tf_tokens, tf_kpm, comp_only=True)
+                                comp0 = comp_all[0]["comp_out"]
+
+                                # memory as in training: prefer quantized embeddings if present
+                                mem0 = (
+                                    comp0.vq_embeddings
+                                    if getattr(comp0, "vq_embeddings", None) is not None
+                                    else comp0.pre_vq_embeddings
+                                )
+                                # src_kpm as in training
+                                if comp0.valid_mask is not None:
+                                    Lq = model.levels[0].compressor.num_queries_per_segment
+                                    if Lq == 1:
+                                        src_kpm0 = ~comp0.valid_mask
+                                    else:
+                                        src_kpm0 = ~comp0.valid_mask.repeat_interleave(Lq, dim=1)
+                                else:
+                                    src_kpm0 = None
+
+                                # decoder inputs are hidden states (training path)
+                                codes_lo0 = comp0.hidden_states
+                                tgt_kpm0 = comp0.input_padding_mask
+                                seg_ids0 = comp0.seg_id
+                                # Align seg_ids for multi-query memories
+                                Lq = model.levels[0].compressor.num_queries_per_segment
+                                if Lq > 1:
+                                    seg_ids0 = seg_ids0 * Lq
+
+                                # Decode logits (teacher forced)
+                                logits0 = model.levels[0].decode_logits(
+                                    memory=mem0,
+                                    codes_lo=codes_lo0,
+                                    src_key_padding_mask=src_kpm0,
+                                    tgt_key_padding_mask=tgt_kpm0,
+                                    seg_ids=seg_ids0,
+                                )
+                                lg0 = logits0["stage_logits"][0]  # (B, L, K)
+
+                                # Shift for next-token metrics
+                                if lg0.size(1) > 1:
+                                    logits_used = lg0[:, :-1, :]
+                                    targets_used = comp0.input_sequence[:, 1:]
+                                    if tgt_kpm0 is not None:
+                                        valid_mask = ~tgt_kpm0[:, 1:]
+                                        denom = valid_mask.sum().clamp(min=1)
+                                        ce_all = torch.nn.functional.cross_entropy(
+                                            logits_used.transpose(1, 2), targets_used, reduction="none"
+                                        )
+                                        ce_val = (ce_all * valid_mask).sum() / denom
+                                        pred_ids = logits_used.argmax(dim=-1)
+                                        acc_val = (pred_ids.eq(targets_used) & valid_mask).sum().float() / denom.float()
+                                    else:
+                                        ce_val = torch.nn.functional.cross_entropy(
+                                            logits_used.transpose(1, 2), targets_used, reduction="mean"
+                                        )
+                                        pred_ids = logits_used.argmax(dim=-1)
+                                        acc_val = (pred_ids.eq(targets_used)).float().mean()
+                                    ppl_val = torch.exp(ce_val.detach().to(torch.float32))
+                                else:
+                                    ce_val = torch.zeros((), device=device)
+                                    ppl_val = torch.ones((), device=device)
+                                    acc_val = torch.zeros((), device=device)
+
+                                # Argmax reconstruction for snippet display
+                                recon_ids = lg0.argmax(dim=-1)  # (B, L)
+                                # Align to original snippet length
+                                recon_text = tokenizer.decode(recon_ids[0, : tf_tokens.size(1)].cpu())
+                                orig_text = tokenizer.decode(tf_tokens[0].cpu())
+
+                                # Segment fidelity: run segmentation on original vs reconstructed tokens
+                                seg_true, b_true = model.levels[0].segment_only(tf_tokens, key_padding_mask=tf_kpm)
+                                seg_pred, b_pred = model.levels[0].segment_only(
+                                    recon_ids[:, : tf_tokens.size(1)]
+                                )
+                                seg_fidelity = (seg_true == seg_pred).float().mean().item()
+                                boundary_fidelity = (b_true == b_pred).float().mean().item()
+
+                                logger.info("--- Teacher-Forced Reconstruction (L0) ---")
+                                logger.info("Original (snippet):\n%s", orig_text)
+                                logger.info("Reconstructed (argmax):\n%s", recon_text)
+                                logger.info(
+                                    "Decoder L0 → PPL: %.3f | Acc: %.3f | SegF: %.3f | BndF: %.3f",
+                                    ppl_val.item(),
+                                    acc_val.item(),
+                                    seg_fidelity,
+                                    boundary_fidelity,
+                                )
+
+                                mlflow.log_text(
+                                    f"Original snippet:\n{orig_text}\n\nReconstructed (argmax):\n{recon_text}",
+                                    f"teacher_forced_step_{global_step}.txt",
+                                )
+                                mlflow_logger.log(
+                                    global_step,
+                                    {
+                                        "eval/decoder_ppl_L0": float(ppl_val.item()),
+                                        "eval/decoder_acc_L0": float(acc_val.item()),
+                                        "eval/seg_fidelity_L0": float(seg_fidelity),
+                                        "eval/boundary_fidelity_L0": float(boundary_fidelity),
+                                    },
+                                )
+                            except Exception as e:
+                                logger.warning("Teacher-forced eval failed: %s", str(e))
 
                     model.train()
                     if args.load_base_from:
