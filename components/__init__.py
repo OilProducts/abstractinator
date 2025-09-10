@@ -34,6 +34,7 @@ from .checkpoint_utils import (
 )
 from .code_sequence_transformer import CodeSequenceTransformer as CodeSequenceTransformer
 from .expander import DecoderOnlyExpanderRVQ as DecoderOnlyExpanderRVQ
+from .expander import DecoderExpander as DecoderExpander
 from .segment_compressor import SegmentCompressor as SegmentCompressor
 from .swiglu import SwiGLU as SwiGLU
 from .tokenizer import ByteLevelTokenizer as ByteLevelTokenizer
@@ -44,6 +45,7 @@ __all__ += [
     "save_base_components",
     "CodeSequenceTransformer",
     "DecoderOnlyExpanderRVQ",
+    "DecoderExpander",
     "SwiGLU",
     "ByteLevelTokenizer",
 ]

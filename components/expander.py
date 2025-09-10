@@ -11,6 +11,7 @@ from .attention.base import SegmentContext
 from .attention.cache import AttnCache
 from .config_types import AttentionConfig
 from .swiglu import SwiGLU
+from .vector_quantizer import VectorQuantizer
 from .vector_quantizer import (
     ComposedIndexCodec,
     LearnedCodebookAdapter,
@@ -191,7 +192,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         H: int = 8,
         cross_window: int = 128,
         eos_id: int = 257,
-        eop_id: int = 259,
         max_len: int = 2048,
         lo_d_c: int = 64,  # Factorized rank for bytes
         residual_conditioning: bool = True,
@@ -206,7 +206,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         self.hi_vq = hi_vq
         self.D = D
         self.eos_id = eos_id
-        self.eop_id = eop_id
         self.max_len = max_len
         self.K_lo = K_lo
 
@@ -220,7 +219,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 bos=lo_vq.bos_token_id,
                 eos=lo_vq.eos_token_id,
                 pad=lo_vq.padding_token_id,
-                eop=lo_vq.eop_token_id,
             )
 
         else:
@@ -231,7 +229,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 d_c=lo_d_c,
                 device=device,
             )
-            self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1, eop=-1)
+            self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1)
 
         # ---- high side (memory) ----
         self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True) if hi_vq is not None else None
@@ -356,7 +354,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             T = generated.size(1)
             q_pos_ids = torch.arange(T, device=device)
 
-            dec_inp = self.lo_adapt.embed_composed(generated)  # (B, T, D)
+            dec_inp = self._embed_decoder_inputs(generated)  # (B, T, D)
             tgt_mask = self._causal_mask(T, device)
             seg_ids_cur = _align_seg_ids(T)  # (B, T)
 
@@ -392,8 +390,181 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             generated = torch.cat([generated, next_id], dim=1)  # (B, T+1)
             kpm = F.pad(kpm, (0, 1), value=False)  # new token is real (not PAD)
             new_tokens = torch.cat([new_tokens, next_id], dim=1)
-            # Early stop on EOS/EOP (after appending)
-            if ((next_id == self.eos_id) | (next_id == self.eop_id)).all():
+            # Early stop on EOS (after appending)
+            if (next_id == self.eos_id).all():
+                break
+
+        return new_tokens
+
+
+class DecoderExpander(nn.Module):
+    """
+    Decoder-only expander that uses a standard VectorQuantizer for the low code space.
+
+    - Low-side embeddings come directly from `vq_lo.codebook` (K, D).
+    - Head logits are computed against that same codebook (dot or -sqdist geometry).
+    - No RVQ adapters, no composed codecs; single-stage classification over K classes.
+    """
+
+    def __init__(
+        self,
+        *,
+        vq_lo: "VectorQuantizer",
+        D: int = 256,
+        N_dec: int = 4,
+        H: int = 8,
+        cross_window: int = 128,
+        eos_id: int = 257,
+        
+        max_len: int = 2048,
+        use_sqdist_logits: bool = False,
+        device: Optional[torch.device] = None,
+        cross_attn_config: Optional[AttentionConfig] = None,
+        self_attn_config: Optional[AttentionConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.vq_lo = vq_lo
+        self.D = int(D)
+        self.eos_id = int(eos_id)
+        
+        self.max_len = int(max_len)
+        self.use_sqdist_logits = bool(use_sqdist_logits)
+
+        # Decoder stack
+        self.decoder = SlidingDecoder(
+            N_dec,
+            D,
+            H,
+            cross_window,
+            q_dim=D,
+            kv_dim=D,
+            cross_attn_config=cross_attn_config,
+            self_attn_config=self_attn_config,
+        )
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        return get_causal_mask(length, device)
+
+    def _logits(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (B, L, D); logits over K using the low-side codebook
+        E = self.vq_lo.codebook  # (K, D)
+        if self.use_sqdist_logits:
+            r2 = (h * h).sum(-1, keepdim=True)  # (B, L, 1)
+            e2 = (E * E).sum(-1).view(1, 1, -1)  # (1, 1, K)
+            dot = F.linear(h, E)  # (B, L, K)
+            return -(r2 - 2 * dot + e2)
+        return F.linear(h, E)  # (B, L, K)
+
+    def forward(
+        self,
+        *,
+        codes_hi: torch.Tensor,  # (B, S_hi, D) continuous
+        codes_lo: torch.Tensor,  # (B, L, D) target ids in [0..K-1]
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+    ) -> Dict[str, List[torch.Tensor] | torch.Tensor]:
+        device = codes_hi.device
+        # memory = self._embed_memory(codes_hi)
+        # dec_inp = self._embed_decoder_inputs(codes_lo)
+        dec_inp = codes_lo
+        memory = codes_hi
+
+        L_q = codes_lo.size(1)
+        L_kv = memory.size(1)
+        q_pos_ids = torch.arange(L_q, device=device)
+        kv_pos_ids = torch.arange(L_kv, device=device)
+
+        tgt_mask = self._causal_mask(L_q, device)
+        adjusted_tgt_kpm = None
+        if tgt_key_padding_mask is not None:
+            adjusted_tgt_kpm = F.pad(tgt_key_padding_mask[:, :-1], (1, 0), value=False)
+
+        h = self.decoder(
+            dec_inp,
+            memory,
+            q_pos_ids=q_pos_ids,
+            kv_pos_ids=kv_pos_ids,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=adjusted_tgt_kpm,
+            memory_key_padding_mask=src_key_padding_mask,
+            seg_ids=seg_ids,
+        )  # (B, L, D)
+
+        lg = self._logits(h)  # (B, L, K)
+        return {"stage_logits": [lg]}
+
+    @torch.no_grad()
+    def generate(
+        self,
+        *,
+        codes_hi: torch.Tensor,  # (B, S_hi, D) continuous
+        codes_lo: torch.Tensor,  # (B, T0) seed ids
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,  # unused except for shape
+        max_len: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
+        seg_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        device = codes_hi.device
+        B = codes_hi.size(0)
+        # memory = self._embed_memory(codes_hi)
+        memory = codes_hi
+        kv_pos_ids = torch.arange(memory.size(1), device=device)
+
+        generated = codes_lo.clone()  # (B, T)
+        kpm = (
+            tgt_key_padding_mask.clone()
+            if tgt_key_padding_mask is not None
+            else torch.zeros_like(generated, dtype=torch.bool)
+        )
+
+        cache = AttnCache()
+        steps_budget = int(max_new_tokens) if max_new_tokens is not None else int((max_len or self.max_len) - 1)
+        steps_budget = max(0, steps_budget)
+
+        def _align_seg_ids(curr_T: int) -> torch.Tensor:
+            if seg_ids is None:
+                last_seg = memory.size(1) - 1
+                return torch.full((B, curr_T), last_seg, dtype=torch.long, device=device)
+            if seg_ids.size(1) < curr_T:
+                pad = seg_ids[:, -1:].expand(-1, curr_T - seg_ids.size(1))
+                return torch.cat([seg_ids, pad], dim=1)
+            if seg_ids.size(1) > curr_T:
+                return seg_ids[:, :curr_T]
+            return seg_ids
+
+        new_tokens = torch.zeros((B, 0), dtype=generated.dtype, device=device)
+        for _ in range(steps_budget):
+            T = generated.size(1)
+            q_pos_ids = torch.arange(T, device=device)
+            print(generated)
+            dec_inp = generated #F.embedding(generated, self.vq_lo.codebook)
+            tgt_mask = self._causal_mask(T, device)
+            seg_ids_cur = _align_seg_ids(T)
+
+            h = self.decoder(
+                dec_inp,
+                memory,
+                q_pos_ids=q_pos_ids,
+                kv_pos_ids=kv_pos_ids,
+                cache=cache,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=kpm,
+                memory_key_padding_mask=src_key_padding_mask,
+                seg_ids=seg_ids_cur,
+            )
+
+            last_h = h[:, -1, :]
+            lg = self._logits(last_h.unsqueeze(1))  # (B, 1, K)
+            next_id = lg.argmax(dim=-1)  # (B,1)
+            print(next_id)
+
+            generated = torch.cat([generated, next_id], dim=1)
+            kpm = F.pad(kpm, (0, 1), value=False)
+            new_tokens = torch.cat([new_tokens, next_id], dim=1)
+
+            if (next_id == self.eos_id).all():
                 break
 
         return new_tokens
