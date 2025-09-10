@@ -49,8 +49,28 @@ def _load_config(path: str):
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("Train only the entropy stack")
-    ap.add_argument("--config", type=str, required=True, help="Path to experiment config .py")
-    ap.add_argument("--save_entropy_to", type=str, required=True, help="Output file for entropy stack")
+    ap.add_argument(
+        "--config",
+        type=str,
+        required=False,
+        help="Path to experiment config .py (required for training; optional for --inspect_entropy)",
+    )
+    ap.add_argument(
+        "--save_entropy_to",
+        type=str,
+        required=False,
+        help="Output file for entropy stack (required for training)",
+    )
+    ap.add_argument(
+        "--inspect_entropy",
+        type=str,
+        default=None,
+        help=(
+            "Path to a saved entropy stack checkpoint to load and print a summary for. "
+            "When provided, the script will instantiate the compressor as per the config, load the stack, "
+            "print parameter counts, and exit."
+        ),
+    )
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--seq_len", type=int, default=2048)
     ap.add_argument("--epochs", type=int, default=1)
@@ -58,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log_every", type=int, default=5)
     ap.add_argument("--max_steps", type=int, default=None)
     ap.add_argument("--device", type=str, default=None)
-    ap.add_argument("--num_workers", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=16)
     return ap.parse_args()
 
 
@@ -77,6 +97,81 @@ def main():
         # torch.backends.cudnn.allow_tf32 = True
     except Exception:
         pass
+    # Early inspector path: load a saved entropy stack and print a summary, then exit.
+    if args.inspect_entropy:
+        try:
+            ckpt = torch.load(args.inspect_entropy, map_location="cpu", weights_only=False)
+
+            def _sum_sd(d: dict | None) -> int:
+                return sum(v.numel() for v in d.values()) if isinstance(d, dict) else 0
+
+            emb_sd = ckpt.get("embedding", None)
+            shared_sd = ckpt.get("shared_layers", None)
+            ent_sd = ckpt.get("entropy_model", None)
+            emb_total = _sum_sd(emb_sd)
+            shared_total = _sum_sd(shared_sd)
+            ent_total = _sum_sd(ent_sd)
+            grand_total = emb_total + shared_total + ent_total
+
+            # Try to infer dimensions and layer counts
+            vocab, dim = None, None
+            if isinstance(emb_sd, dict):
+                w = emb_sd.get("weight", None)
+                if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+                    vocab, dim = int(w.shape[0]), int(w.shape[1])
+
+            def _count_numbered(d: dict | None, prefix: str) -> int:
+                if not isinstance(d, dict):
+                    return 0
+                seen = set()
+                plen = len(prefix)
+                for k in d.keys():
+                    if not k.startswith(prefix):
+                        continue
+                    # expect keys like 'layers.0.qkv.weight' or '0.qkv.weight'
+                    rest = k[plen:]
+                    # strip leading dot if present
+                    if rest.startswith("."):
+                        rest = rest[1:]
+                    num = ""
+                    for ch in rest:
+                        if ch.isdigit():
+                            num += ch
+                        else:
+                            break
+                    if num:
+                        seen.add(int(num))
+                return (max(seen) + 1) if seen else 0
+
+            # FlexibleEntropyModel typically prefixes 'layers.'; shared_layers is a plain ModuleList (prefix '')
+            ent_layers = _count_numbered(ent_sd, prefix="layers")
+            shared_layers = _count_numbered(shared_sd, prefix="")
+
+            # Include saved config if present
+            ent_cfg = ckpt.get("entropy_config", None)
+
+            LOGGER.info("\n=== Entropy Stack Checkpoint Summary ===")
+            if vocab is not None and dim is not None:
+                LOGGER.info("Embedding dims: vocab=%s, D=%s", short_num(vocab), short_num(dim))
+            if ent_cfg:
+                try:
+                    heads = ent_cfg.get("n_heads", ent_cfg.get("n_heads", "?"))
+                    window = ent_cfg.get("window", "?")
+                    LOGGER.info("Config heads=%s, window=%s, trunk_layers=%s", heads, window, ent_cfg.get("n_layers", ent_layers))
+                except Exception:
+                    pass
+            LOGGER.info("Shared layers (inferred): %d | Entropy trunk layers (inferred): %d", shared_layers, ent_layers)
+            LOGGER.info("Embedding params total: %s", short_num(emb_total))
+            LOGGER.info("Shared params total   : %s", short_num(shared_total))
+            LOGGER.info("Entropy params total  : %s", short_num(ent_total))
+            LOGGER.info("TOTAL params          : %s\n", short_num(grand_total))
+        except Exception:
+            LOGGER.exception("Failed inspecting entropy stack at %s", args.inspect_entropy)
+        return
+
+    if not args.config or not args.save_entropy_to:
+        raise SystemExit("--config and --save_entropy_to are required unless --inspect_entropy is provided")
+
     cfg_mod = _load_config(args.config)
     exp_cfg = cfg_mod.exp_config
     # Resolve device from config or CLI default
@@ -106,7 +201,7 @@ def main():
         retr_dim=level_cfg.c_retr_dim,
         num_encoder_layers=level_cfg.c_num_encoder_layers,
         num_shared_encoder_layers=level_cfg.c_num_shared_encoder_layers,
-        num_lm_encoder_layers=level_cfg.c_num_lm_encoder_layers,
+        num_entropy_encoder_layers=level_cfg.c_num_entropy_encoder_layers,
         num_compression_encoder_layers=0,
         num_queries=level_cfg.c_num_queries,
         entropy_delta=level_cfg.c_entropy_delta,
@@ -124,10 +219,18 @@ def main():
     if hasattr(compressor, "quantizer") and compressor.quantizer is not None:
         compressor.quantizer.requires_grad_(False)
 
-    # Optimizer over embedding + shared + entropy_model
-    params = list(compressor.embedding.parameters())
-    params += list(compressor.shared_layers.parameters())
-    params += list(compressor.entropy_model.parameters())
+    # Optimizer over embedding + shared + entropy_model (deduplicate tied params)
+    params_all = []
+    params_all += list(compressor.embedding.parameters())
+    params_all += list(compressor.shared_layers.parameters())
+    params_all += list(compressor.entropy_model.parameters())
+    seen_ids: set[int] = set()
+    params = []
+    for p in params_all:
+        pid = id(p)
+        if pid not in seen_ids:
+            seen_ids.add(pid)
+            params.append(p)
     optimizer = optim.AdamW(params, lr=lr)
 
     tokenizer = ByteLevelTokenizer()
@@ -204,11 +307,24 @@ def main():
     except Exception:
         LOGGER.warning("MLflow not available; continuing without experiment logging.")
 
-    step = 0
+    # Gradient accumulation from experiment config
+    grad_accum_steps: int = int(getattr(exp_cfg, "gradient_accumulation_steps", 1) or 1)
+    step = 0  # optimizer steps
+    micro_step = 0  # minibatches processed
     total_batches_per_epoch = len(loader)
-    total_steps_planned = max_steps if max_steps is not None else (epochs * total_batches_per_epoch)
-    # Approximate total bytes planned (upper bound): steps * batch_size * seq_len
-    approx_total_bytes = total_steps_planned * batch_size * seq_len
+    # Plan optimizer steps (respect max_steps if provided as optimizer-step cap)
+    total_steps_planned = (
+        int(max_steps)
+        if max_steps is not None
+        else math.ceil((epochs * total_batches_per_epoch) / grad_accum_steps)
+    )
+    # Approximate total bytes planned (upper bound): microbatches * batch_size * seq_len
+    total_microbatches_planned = (
+        (epochs * total_batches_per_epoch)
+        if max_steps is None
+        else int(max_steps) * grad_accum_steps
+    )
+    approx_total_bytes = total_microbatches_planned * batch_size * seq_len
     LOGGER.info(
         "Planned run → steps: %s | epochs: %s | batches/epoch: %s | batch_size: %s | seq_len: %s | approx bytes: %s",
         short_num(total_steps_planned),
@@ -288,11 +404,10 @@ def main():
             out = compressor.entropy_loss_ids(input_ids, key_padding_mask)
             loss = out.loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
-            step += 1
+            # Accumulate gradients
+            loss_to_backprop = loss / float(grad_accum_steps)
+            loss_to_backprop.backward()
+            micro_step += 1
 
             # Throughput accounting
             valid_mask = (~key_padding_mask).to(torch.int64)
@@ -303,7 +418,15 @@ def main():
             bytes_total += batch_bytes
             bytes_window += batch_bytes
 
-            if step % log_every == 0:
+            did_optimizer_step = False
+            if (micro_step % grad_accum_steps) == 0:
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                step += 1
+                did_optimizer_step = True
+
+            if did_optimizer_step and (step % log_every == 0):
                 now = time.time()
                 dt = max(1e-6, now - window_start_time)
                 total_dt = max(1e-6, now - start_time)
@@ -348,7 +471,7 @@ def main():
 
             # Periodic generation
             gen_interval = getattr(exp_cfg, "generation_interval", None)
-            if gen_interval and step > 0 and (step % int(gen_interval) == 0):
+            if did_optimizer_step and gen_interval and step > 0 and (step % int(gen_interval) == 0):
                 try:
                     prompt = getattr(exp_cfg, "sample_prompt_for_generation", "The purpose of education is to")
                     max_new = int(getattr(exp_cfg, "generation_max_len_override", 64) or 64)
@@ -370,6 +493,13 @@ def main():
                 break
         if max_steps is not None and step >= max_steps:
             break
+
+        # Flush any leftover gradients at epoch end (partial accumulation)
+        if (micro_step % grad_accum_steps) != 0 and (max_steps is None or step < max_steps):
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            step += 1
 
     os.makedirs(os.path.dirname(args.save_entropy_to) or ".", exist_ok=True)
     save_entropy_stack(compressor, args.save_entropy_to)
