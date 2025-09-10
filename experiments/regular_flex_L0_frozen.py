@@ -28,7 +28,7 @@ level = AbstractinatorConfig(
     c_vq_d_c=256,
     d_lo_d_c=256,
     d_use_standard_vq=True,
-    a_freeze=False,
+    a_freeze=True,
 )
 level.compressor_attention = REGULAR_FLEX
 level.decoder_self_attention = REGULAR_FLEX
@@ -47,11 +47,11 @@ top_lm = TopTransformerConfig(
 exp_config = ExpConfig(
     run_name="regular_flex_256d",
     device=DEVICE,
-    pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=False),
-    top_transformer_config=None,
+    pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=True),
+    top_transformer_config=top_lm,
     batch_size=32,
     gradient_accumulation_steps=2,
     sequence_length=2048,
     num_epochs=1,
-    generation_interval=500,
+    generation_interval=2000,
 )
