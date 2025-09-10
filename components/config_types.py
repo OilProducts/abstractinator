@@ -55,7 +55,7 @@ class EntropySegmentationConfig:
 @dataclass
 class EntropyModelConfig:
     # Trunk (causal transformer) configuration
-    n_layers: int = 2
+    n_layers: int = 16
     n_heads: int = 8
     window: int = 128
     attention_config: Optional["AttentionConfig"] = None
@@ -77,7 +77,7 @@ class AbstractinatorConfig:
     vocab_size: int = 260
     D: int = 512
     eos_id: int = 257
-    eop_id: int = 259
+    
     bos_id: int = 256
     pad_id: int = 258
 
@@ -92,7 +92,8 @@ class AbstractinatorConfig:
 
     c_num_encoder_layers: int = 6
     c_num_shared_encoder_layers: int = 0
-    c_num_lm_encoder_layers: Optional[int] = 4
+    # Entropy trunk layers
+    c_num_entropy_encoder_layers: Optional[int] = 4
     c_num_compression_encoder_layers: Optional[int] = None
     c_num_queries: int = 1
     c_entropy_delta: float = 0.2
@@ -103,6 +104,10 @@ class AbstractinatorConfig:
     c_vq_d_c: Optional[int] = None  # d_c for compressor's VQ (code-space dim). If None, defaults to 64.
     c_vq_beta: float = 0.25
     c_vq_reset_interval: int = 250
+    # Use a standard VectorQuantizer (D-space, single stage) for the compressor
+    # instead of MultiStageResidualVQ. When True, c_vq_depth is ignored for the
+    # compressor (the decoder choices remain as configured).
+    c_use_standard_vq: bool = False
 
     # Expander (decoder) hyperparams
     d_layers: int = 9
@@ -113,11 +118,21 @@ class AbstractinatorConfig:
     d_predict_specials: bool = False
     d_max_len: int = 2048
     d_lo_d_c: int = 64  # d_c for bottom-level decoder (no lo_vq). Ignored at upper levels.
+    # Use a standard VectorQuantizer in the decoder head (no RVQ adapters/codecs)
+    d_use_standard_vq: bool = False
+    # Standard VQ hyperparameters for the decoder head
+    d_vq_beta: float = 0.25
+    d_vq_ema: bool = True
+    d_vq_decay: float = 0.999
+    d_vq_reset_interval: int = 250
+    d_vq_max_codes_to_reset_pct: float = 0.1
+    d_vq_replacement_buffer_size: int = 65536
+    d_vq_vectors_per_step_to_buffer: int = 1024
 
     # Loss weights (component-local defaults)
     w_code_ce: float = 1.0
     w_special_ce: float = 1.0
-    w_byte_lm_ce: float = 1.0
+    w_entropy_ce: float = 1.0
     w_vq: float = 1.0
 
     # Device hint (string form only; experiments resolve actual device)
@@ -133,6 +148,12 @@ class AbstractinatorConfig:
     # Optional: preload a trained entropy stack and freeze
     c_entropy_load_path: Optional[str] = None
     c_entropy_freeze: bool = True
+
+    # Freeze the entire Abstractinator level (compressor + expander). When True,
+    # the module's parameters are marked non-trainable and its training losses
+    # are zeroed, while still producing compressor outputs for downstream use
+    # (e.g., training a top-level LM on frozen abstractions).
+    a_freeze: bool = False
 
 
 @dataclass

@@ -102,7 +102,7 @@ The autoencoder optimizes a `total_loss` that combines several terms:
 
 1. **Reconstruction loss** – Cross-entropy between each expander's output and the target sequence from the level below (or the original bytes). The result is averaged across all levels.
 2. **Vector-quantization loss** – Commitment and codebook losses from each `VectorQuantizer`.
-3. **Auxiliary LM loss** – Optional next-token prediction loss on each compressor's input sequence, scaled by `aux_lm_loss_weight`.
+3. **Entropy‑model loss** – Optional loss from the compressor's entropy_model (categorical CE and/or Gaussian NLL as configured by `EntropyModelConfig.loss`). This is combined into the level objective with the component weight `w_entropy_ce`.
 4. **Top-level LM loss** – Optional language-modeling loss on the top-level codes when a `CodeSequenceTransformer` is used, scaled by `top_lm_loss_weight`.  When the top transformer is configured with `continuous=True` it predicts the next code embedding using mean squared error.  Otherwise it outputs logits over code indices and uses cross‑entropy.
 
 These terms are summed to form `total_loss`, which is used for the backward pass.

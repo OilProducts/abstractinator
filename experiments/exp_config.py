@@ -66,7 +66,7 @@ class ExpConfig:
     initial_vocab_size: int = 260
 
     pyramid_config: PyramidConfig = field(default_factory=lambda: PyramidConfig())
-    aux_lm_loss_weight: float = 1.0
+    entropy_loss_weight: float = 1.0
     top_lm_loss_weight: float = 1.0
     top_lm_mse_weight: float = 1.0
     top_lm_ce_weight: float = 1.0
@@ -93,11 +93,16 @@ class ExpConfig:
     dataset_name: str = "HuggingFaceFW/fineweb-edu"
     dataset_config: str = "sample-10BT"
     dataset_train_split: str = "train"
-    sample_prompt_for_generation = "The purpose of education is to"
+    sample_prompt_for_generation = "The purpose of education is to "
+    # Phase 2 prompt (~200 chars), starts with the requested prefix
+    phase2_sample_prompt_for_generation: str = (
+        "The purpose of education is to cultivate clear thinking, compassionate action, and resilient curiosity; "
+        "to connect knowledge with lived experience, challenge assumptions, and co-create possibilities for a more just future."
+    )
 
     # sample_prompt_for_generation: str = "In a land far away, "
     generation_interval: int = 100
-    generation_max_len_override: int = 256
+    generation_max_len_override: int = 96
 
     checkpoint_interval: int = 1000
     checkpoint_dir: str = "./checkpoints"

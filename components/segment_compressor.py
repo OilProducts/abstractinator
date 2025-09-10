@@ -58,6 +58,8 @@ class CompressorOutput:
     input_sequence: Tensor  # (B, S) long or empty ()
     input_padding_mask: Optional[Tensor]  # (B, S) bool or None
 
+    hidden_states: List[Tensor]  # List of (B, S, D) from shared layers
+
 
 # ---------------------------
 # Quantizer abstraction
@@ -683,12 +685,14 @@ class SegmentCompressor(nn.Module):
         kv_comp_dim: Optional[int] = 64,
         q_comp_dim: Optional[int] = 96,
         retr_dim: Optional[int] = 32,
-        lm_window: Optional[int] = None,
+        # Entropy trunk window
+        entropy_window: Optional[int] = None,
         compression_window: Optional[int] = None,
-        num_encoder_layers: int = 3,
+        num_encoder_layers: int = 2,
         encoder_ffn_dim_multiplier: int = 4,
         num_shared_encoder_layers: int = 0,
-        num_lm_encoder_layers: Optional[int] = None,
+        # Entropy trunk layers
+        num_entropy_encoder_layers: Optional[int] = None,
         num_compression_encoder_layers: Optional[int] = None,
         num_queries: int = 1,
         output_length: int = 1024,
@@ -707,9 +711,10 @@ class SegmentCompressor(nn.Module):
     ):
         super().__init__()
 
-        num_lm_encoder_layers = num_lm_encoder_layers or num_encoder_layers
+        # Canonicalize entropy trunk settings
+        num_entropy_encoder_layers = num_entropy_encoder_layers or num_encoder_layers
         num_compression_encoder_layers = num_compression_encoder_layers or num_encoder_layers
-        lm_window = lm_window or window
+        entropy_window = entropy_window or window
         compression_window = compression_window or window
 
         self.num_queries_per_segment = num_queries
@@ -762,9 +767,9 @@ class SegmentCompressor(nn.Module):
         if entropy_config is None:
             # Build a default config from legacy args
             default_cfg = EntropyModelConfig(
-                n_layers=int(num_lm_encoder_layers),
+                n_layers=int(num_entropy_encoder_layers),
                 n_heads=int(heads),
-                window=int(lm_window),
+                window=int(entropy_window),
                 attention_config=attn_cfg,
             )
             # Default policy: use logit unless gaussian flag requested
@@ -787,8 +792,8 @@ class SegmentCompressor(nn.Module):
             dim=dim,
             vocab_size=vocab_size,
             trunk_heads=heads,
-            trunk_window=lm_window,
-            trunk_layers=num_lm_encoder_layers,
+            trunk_window=entropy_window,
+            trunk_layers=num_entropy_encoder_layers,
             attn_cfg=attn_cfg,
             cfg=entropy_cfg_local,
             tied_embedding_weight=tied_w,
@@ -893,6 +898,7 @@ class SegmentCompressor(nn.Module):
                 token_ids if token_ids is not None else torch.empty(0, dtype=torch.long, device=input_embeddings.device)
             ),
             input_padding_mask=key_padding_mask,
+            hidden_states=hidden,
         )
 
     # --- segmentation-only fast path (shared + entropy only) ---
