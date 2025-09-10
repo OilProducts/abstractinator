@@ -13,33 +13,35 @@ from components.swiglu import SwiGLU
 from ...backends.flex import run as flex_run
 
 
-@lru_cache(maxsize=128)
-def _cached_causal_block_mask(seq_len: int, device: torch.device):
+@lru_cache(maxsize=256)
+def _cached_causal_block_mask_by_shape(B: int, H: int, Q: int, K: int, dev_type: str, dev_index: int):
     def keep(_b, _h, q, k):
         return k <= q
 
+    device = torch.device(dev_type) if dev_index < 0 else torch.device(dev_type, dev_index)
     return create_block_mask(
         keep,
-        B=None,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
+        B=B,
+        H=H,
+        Q_LEN=Q,
+        KV_LEN=K,
         BLOCK_SIZE=128,
         device=device,
     )
 
 
-@lru_cache(maxsize=128)
-def _cached_sliding_block_mask(seq_len: int, window: int, device: torch.device):
+@lru_cache(maxsize=256)
+def _cached_sliding_block_mask_by_shape(B: int, H: int, Q: int, K: int, window: int, dev_type: str, dev_index: int):
     def keep(_b, _h, q, k):
         return (k <= q) & ((q - k) <= window)
 
+    device = torch.device(dev_type) if dev_index < 0 else torch.device(dev_type, dev_index)
     return create_block_mask(
         keep,
-        B=None,
-        H=None,
-        Q_LEN=seq_len,
-        KV_LEN=seq_len,
+        B=B,
+        H=H,
+        Q_LEN=Q,
+        KV_LEN=K,
         BLOCK_SIZE=128,
         device=device,
     )
@@ -107,7 +109,11 @@ class CausalSelfFlexBlock(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        block = _cached_causal_block_mask(L, x.device)
+        # Cached block mask with explicit batch/head sizes
+        Bn, Hn, Qn, Kn = q.size(0), q.size(1), q.size(2), k.size(2)
+        dev_type = x.device.type
+        dev_index = -1 if x.device.index is None else int(x.device.index)
+        block = _cached_causal_block_mask_by_shape(Bn, Hn, Qn, Kn, dev_type, dev_index)
 
         pad = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
 
@@ -187,7 +193,11 @@ class CausalLocalSelfFlexBlock(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        block = _cached_sliding_block_mask(L, self.window, x.device)
+        # Cached block mask with explicit batch/head sizes
+        Bn, Hn, Qn, Kn = q.size(0), q.size(1), q.size(2), k.size(2)
+        dev_type = x.device.type
+        dev_index = -1 if x.device.index is None else int(x.device.index)
+        block = _cached_sliding_block_mask_by_shape(Bn, Hn, Qn, Kn, int(self.window), dev_type, dev_index)
         pad = key_padding_mask.to(torch.bool) if key_padding_mask is not None else None
 
         def score_mod(scores, b, h, q_idx, k_idx):
