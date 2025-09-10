@@ -33,7 +33,7 @@ class VectorQuantizer(nn.Module):
         bos_token_id: int = 0,
         eos_token_id: int = 1,
         padding_token_id: int = 2,
-        eop_token_id: int = 3,
+        
         forbidden_ids: Optional[List[int]] = None,
         protected_ids: Optional[List[int]] = None,
     ):
@@ -55,7 +55,7 @@ class VectorQuantizer(nn.Module):
         self.bos_token_id = int(bos_token_id)
         self.eos_token_id = int(eos_token_id)
         self.padding_token_id = int(padding_token_id)
-        self.eop_token_id = int(eop_token_id)
+        
 
         self.register_buffer("forbidden_mask", torch.zeros(self.K, dtype=torch.bool))
         if forbidden_ids:
@@ -120,13 +120,16 @@ class VectorQuantizer(nn.Module):
         """EMA updates (tensor‑only)."""
         enc = encodings
         # mask specials in EMA stats
-        if self.eop_token_id < enc.size(1):
-            enc = enc.clone()
-            enc[:, self.eop_token_id] = 0
-        if self.padding_token_id < enc.size(1):
+        
+        # Guard: padding index may be invalid; mask only if within range
+        try:
+            pad_id = int(self.padding_token_id)
+        except Exception:
+            pad_id = -1
+        if (pad_id is not None) and (pad_id >= 0) and (pad_id < enc.size(1)):
             if enc is encodings:
                 enc = enc.clone()
-            enc[:, self.padding_token_id] = 0
+            enc[:, pad_id] = 0
 
         dw = enc.transpose(0, 1) @ flat_input  # (K,D)
         cluster = enc.sum(0)  # (K,)
@@ -174,10 +177,13 @@ class VectorQuantizer(nn.Module):
         dead_mask = dead_mask.clone()
         if self.protected_mask.any():
             dead_mask[self.protected_mask] = False
-        if self.eop_token_id < self.K:
-            dead_mask[self.eop_token_id] = False
-        if self.padding_token_id < self.K:
-            dead_mask[self.padding_token_id] = False
+
+        try:
+            pad_id = int(self.padding_token_id)
+        except Exception:
+            pad_id = -1
+        if (pad_id is not None) and (pad_id >= 0) and (pad_id < self.K):
+            dead_mask[pad_id] = False
 
         # Apply mask for sampled rows only; also gate by do_reset & has_source
         apply_rows = dead_mask[rand_idx]
@@ -227,7 +233,7 @@ class VectorQuantizer(nn.Module):
             z_q_ste: (B, Q, D) straight-through quantized vectors
             vq_loss: scalar tensor
             indices: (B, Q) argmin ids
-            perplexity: scalar tensor (excludes EOP/PAD)
+            perplexity: scalar tensor (excludes PAD)
         """
         B, Q, Din = z.shape
         assert Din == self.D, f"Expected D={self.D}, got {Din}"
@@ -266,16 +272,19 @@ class VectorQuantizer(nn.Module):
             if self.reset_codes:
                 self._maybe_vectorized_reset()
 
-        # Perplexity (usage), exclude EOP/PAD
+        # Perplexity (usage), exclude PAD only
         if self.ema:
             counts = self.ema_cluster_size.clone()
         else:
             counts = torch.bincount(indices, minlength=self.K).to(flat.dtype)
 
-        if self.eop_token_id < counts.size(0):
-            counts[self.eop_token_id] = 0
-        if self.padding_token_id < counts.size(0):
-            counts[self.padding_token_id] = 0
+        # Guard: padding_token_id may be unset in some configs; skip masking when not valid
+        try:
+            pad_id = int(self.padding_token_id)
+        except Exception:
+            pad_id = -1
+        if (pad_id is not None) and (pad_id >= 0) and (pad_id < counts.size(0)):
+            counts[pad_id] = 0
 
         counts = counts.clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
@@ -315,7 +324,7 @@ class MultiStageResidualVQ(nn.Module):
         bos_token_id: int = 256,
         eos_token_id: int = 257,
         padding_token_id: int = 258,
-        eop_token_id: int = 259,
+        
     ) -> None:
         super().__init__()
         # if depth < 2:
@@ -331,7 +340,7 @@ class MultiStageResidualVQ(nn.Module):
         self.bos_token_id = int(bos_token_id)
         self.eos_token_id = int(eos_token_id)
         self.padding_token_id = int(padding_token_id)
-        self.eop_token_id = int(eop_token_id)
+        
 
         # expose a codec so downstream code can (de)compose indices
         self.codec = ComposedIndexCodec(
@@ -340,7 +349,6 @@ class MultiStageResidualVQ(nn.Module):
             bos=self.bos_token_id,
             eos=self.eos_token_id,
             pad=self.padding_token_id,
-            eop=self.eop_token_id,
         )
 
         # Allow small effective K; special tokens may be unused for code VQs
@@ -363,11 +371,10 @@ class MultiStageResidualVQ(nn.Module):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             padding_token_id=padding_token_id,
-            eop_token_id=eop_token_id,
         )
         self.stages = nn.ModuleList([VectorQuantizer(K=self.K, D=d_c, **vq_kwargs) for _ in range(self.depth)])
 
-        reserved_stage0 = [K - 1, K - 2, K - 3, K - 4]  # order: PAD, BOS, EOS, EOP
+        reserved_stage0 = [K - 1, K - 2, K - 3]  # order: PAD, BOS, EOS
         self.stages[0].forbidden_mask[...] = False
         self.stages[0].protected_mask[...] = False
         for idx in reserved_stage0:
@@ -436,10 +443,10 @@ class MultiStageResidualVQ(nn.Module):
 
 
 class ComposedIndexCodec:
-    def __init__(self, K: int, depth: int, bos: int, eos: int, pad: int, eop: int):
+    def __init__(self, K: int, depth: int, bos: int, eos: int, pad: int):
         self.K = int(K)
         self.depth = int(depth)
-        self.special = {int(bos), int(eos), int(pad), int(eop)}
+        self.special = {int(bos), int(eos), int(pad)}
         self.special_list = sorted(list(self.special))
         self.special_to_local = {sid: i for i, sid in enumerate(self.special_list)}
 
@@ -646,7 +653,7 @@ class LearnedCodebookAdapter(nn.Module):
 
         # For API parity with RVQ adapter/head
         self.depth = 1
-        self.special_ids = []  # bottom-level: put EOS/EOP inside [0..K-1]
+        self.special_ids = []  # bottom-level: put EOS inside [0..K-1] if needed
         self.special_to_local = {}
         self.special_emb = None
 

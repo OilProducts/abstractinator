@@ -14,7 +14,6 @@ def test_continuous_transformer_forward():
         bos_token_id=0,
         eos_token_id=0,
         padding_token_id=0,
-        eop_token_id=0,
     )
     cfg = TopTransformerConfig(
         embed_dim=4,
