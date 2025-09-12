@@ -91,7 +91,6 @@ class AbstractinatorConfig:
     c_retr_dim: Optional[int] = 32  # r; if None, inferred as D / 4
 
     c_num_encoder_layers: int = 6
-    c_num_shared_encoder_layers: int = 0
     # Entropy trunk layers
     c_num_entropy_encoder_layers: Optional[int] = 4
     c_num_compression_encoder_layers: Optional[int] = None

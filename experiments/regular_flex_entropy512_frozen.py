@@ -15,14 +15,19 @@ level = AbstractinatorConfig(
     D=256,
     c_heads=8,
     c_window=64,
-    c_num_encoder_layers=6,
+    c_num_encoder_layers=2,
     c_num_entropy_encoder_layers=12,
     c_num_compression_encoder_layers=4,
     d_layers=6,
     d_heads=8,
     d_cross_window=1,
-    d_max_len=512,
+    d_max_len=2048,
+    c_entropy_load_path = "./models/entropy_stack_512.pt",
+    c_entropy_freeze = True,
+    c_vq_d_c=256,
+    d_lo_d_c=256,
     d_use_standard_vq=True,
+    a_freeze=False,
 )
 level.compressor_attention = REGULAR_FLEX
 level.decoder_self_attention = REGULAR_FLEX
@@ -31,9 +36,9 @@ level.decoder_cross_attention = REGULAR_FLEX
 
 top_lm = TopTransformerConfig(
     embed_dim=256,
-    dim=256,
+    dim=512,
     num_layers=12,
-    num_heads=8,
+    num_heads=16,
     attention_config=REGULAR_FLEX,
 )
 
@@ -41,10 +46,11 @@ top_lm = TopTransformerConfig(
 exp_config = ExpConfig(
     run_name="regular_flex_256d",
     device=DEVICE,
-    pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=True),
-    top_transformer_config=top_lm,
-    batch_size=64,
-    sequence_length=2048,
+    pyramid_config=PyramidConfig(levels=[level], use_top_code_lm=False),
+    top_transformer_config=None,
+    batch_size=16,
+    gradient_accumulation_steps=4,
+    sequence_length=4096,
     num_epochs=1,
     generation_interval=500,
 )

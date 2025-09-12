@@ -245,7 +245,6 @@ def initialize_model(
             # Compressor breakdown
             if comp is not None:
                 emb = _safe_count(getattr(comp, "embedding", None))
-                shared = _safe_count(getattr(comp, "shared_layers", None))
                 comp_layers = _safe_count(getattr(comp, "compression_layers", None))
                 # Entropy model breakdown (replaces legacy LM branch)
                 ent = getattr(comp, "entropy_model", None)
@@ -268,10 +267,6 @@ def initialize_model(
 
                 # Counts + small context
                 try:
-                    n_shared = len(getattr(comp, "shared_layers", []))
-                except Exception:
-                    n_shared = 0
-                try:
                     n_comp = len(getattr(comp, "compression_layers", []))
                 except Exception:
                     n_comp = 0
@@ -281,10 +276,8 @@ def initialize_model(
                     n_ent_layers = 0
 
                 logger.info(
-                    "    ├─ Compressor breakdown → embed: %s | shared(%d): %s | compression(%d): %s",
+                    "    ├─ Compressor breakdown → embed: %s | compression(%d): %s",
                     short_num(emb),
-                    n_shared,
-                    short_num(shared),
                     n_comp,
                     short_num(comp_layers),
                 )
@@ -546,7 +539,7 @@ def train_loop(
     #     torch.cuda.synchronize()
     training_start_time = time.time()
     # Enable entropy loss logging only if any level's entropy stack is trainable
-        def _aux_entropy_enabled_by_config(mdl: AbstractinatorPyramid) -> bool:
+    def _aux_entropy_enabled_by_config(mdl: AbstractinatorPyramid) -> bool:
         """Return True if any level's config indicates the entropy stack is trainable.
 
         Uses config only: if a level has c_entropy_load_path set AND c_entropy_freeze=True,

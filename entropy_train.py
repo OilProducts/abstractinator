@@ -106,7 +106,7 @@ def main():
                 return sum(v.numel() for v in d.values()) if isinstance(d, dict) else 0
 
             emb_sd = ckpt.get("embedding", None)
-            shared_sd = ckpt.get("shared_layers", None)
+            shared_sd = None
             ent_sd = ckpt.get("entropy_model", None)
             emb_total = _sum_sd(emb_sd)
             shared_total = _sum_sd(shared_sd)
@@ -143,9 +143,9 @@ def main():
                         seen.add(int(num))
                 return (max(seen) + 1) if seen else 0
 
-            # FlexibleEntropyModel typically prefixes 'layers.'; shared_layers is a plain ModuleList (prefix '')
+            # FlexibleEntropyModel typically prefixes 'layers.'
             ent_layers = _count_numbered(ent_sd, prefix="layers")
-            shared_layers = _count_numbered(shared_sd, prefix="")
+            shared_layers = 0
 
             # Include saved config if present
             ent_cfg = ckpt.get("entropy_config", None)
@@ -160,7 +160,7 @@ def main():
                     LOGGER.info("Config heads=%s, window=%s, trunk_layers=%s", heads, window, ent_cfg.get("n_layers", ent_layers))
                 except Exception:
                     pass
-            LOGGER.info("Shared layers (inferred): %d | Entropy trunk layers (inferred): %d", shared_layers, ent_layers)
+            LOGGER.info("Entropy trunk layers (inferred): %d", ent_layers)
             LOGGER.info("Embedding params total: %s", short_num(emb_total))
             LOGGER.info("Shared params total   : %s", short_num(shared_total))
             LOGGER.info("Entropy params total  : %s", short_num(ent_total))
@@ -200,7 +200,6 @@ def main():
         q_comp_dim=level_cfg.c_q_comp_dim,
         retr_dim=level_cfg.c_retr_dim,
         num_encoder_layers=level_cfg.c_num_encoder_layers,
-        num_shared_encoder_layers=level_cfg.c_num_shared_encoder_layers,
         num_entropy_encoder_layers=level_cfg.c_num_entropy_encoder_layers,
         num_compression_encoder_layers=0,
         num_queries=level_cfg.c_num_queries,
@@ -219,10 +218,9 @@ def main():
     if hasattr(compressor, "quantizer") and compressor.quantizer is not None:
         compressor.quantizer.requires_grad_(False)
 
-    # Optimizer over embedding + shared + entropy_model (deduplicate tied params)
+    # Optimizer over entropy embedding + entropy_model (deduplicate tied params)
     params_all = []
     params_all += list(compressor.embedding.parameters())
-    params_all += list(compressor.shared_layers.parameters())
     params_all += list(compressor.entropy_model.parameters())
     seen_ids: set[int] = set()
     params = []
@@ -275,14 +273,12 @@ def main():
         return sum(p.numel() for p in mod.parameters() if p.requires_grad)
 
     emb_params = _count_params(compressor.embedding)
-    shared_params = _count_params(compressor.shared_layers)
     entropy_params = _count_params(compressor.entropy_model)
-    total_trainable = emb_params + shared_params + entropy_params
+    total_trainable = emb_params + entropy_params
 
     LOGGER.info(
-        "Trainable params → embedding: %s | shared: %s | entropy: %s | total: %s",
+        "Trainable params → embedding: %s | entropy: %s | total: %s",
         short_num(emb_params),
-        short_num(shared_params),
         short_num(entropy_params),
         short_num(total_trainable),
     )

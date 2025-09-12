@@ -16,7 +16,6 @@ level = AbstractinatorConfig(
     c_heads=8,
     c_window=64,
     c_num_encoder_layers=6,
-    c_num_shared_encoder_layers=0,
     c_num_entropy_encoder_layers=12,
     c_num_compression_encoder_layers=4,
     d_layers=6,

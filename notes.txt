@@ -1,0 +1,101 @@
+> Context Summary
+
+  - Goal: Train a top LM on a frozen, converged L0 Abstractinator; align training/generation so the
+  top LM predicts on the same manifold the expander expects.
+  - Change made: Train top LM on top quantized memory rows and generate by appending quantized top
+  rows.
+  - Pain point: TopAcc ~0.02–0.05 at 151M top positions; post‑VQ MSE plateaus; SmoothPPL shows 8192
+  due to frozen EMA.
+
+  Changes So Far
+
+  - Training targets: Use top_co.vq_embeddings (not pre‑VQ) as targets for the top LM.
+  - Preds used for loss: Use lm_out["predictions"] (already quantized) for MSE, not
+  predictions_pre_vq.
+  - Generation: Use lm_out["predictions"] for the appended top row (no re‑quantize needed).
+  - VQ wiring: model.top_lm.vq = model.levels[-1].compressor.quantizer (shared, frozen).
+  - Loss: Include top_code_vq_loss in total loss with small weight.
+  - Metrics added:
+      - Effective positions: top_lm/effective_positions_* and console TopSeen ….
+      - Top‑1 accuracy: top_lm/accuracy_avg_accum and console TopAcc.
+
+  Files To Review
+
+  - components/abstractinator_pyramid.py
+      - Forward: search top_co.vq_embeddings, predictions, top_code_acc.
+      - Generation: search preds = lm_out.get("predictions") and how next_top is appended.
+  - train.py
+      - Top VQ wiring: search compressor.quantizer assignment to top_lm.vq.
+      - Loss add: search avg_top_code_lm_loss and top_code_vq_loss terms.
+  - components/metrics.py
+      - TopSeen computation from top valid_mask.
+      - Console parts: TopAcc, TopSeen.
+      - MLflow keys: top_lm/accuracy_avg_accum, top_lm/effective_positions_*.
+  - components/vector_quantizer.py
+      - Perplexity computation uses EMA counts when training; with frozen/eval quantizer, EMA won’t
+  update.
+
+  Verify At Runtime
+
+  - Quantizer is truly frozen:
+      - model.top_lm.vq.training == False
+      - All quantizer params requires_grad == False
+      - model.top_lm.vq is model.levels[-1].compressor.quantizer
+  - Train/gen match: both use predictions (quantized) for top LM outputs.
+  - Entropy loss excluded: L0 frozen; aux byte‑LM loss should not contribute.
+  - Effective positions: top_lm/effective_positions_total grows as expected; ratio aligns with
+  compression.
+
+  Metrics To Watch
+
+  - TopAcc: top_lm/accuracy_avg_accum and console TopAcc.
+  - TopSeen: top_lm/effective_positions_total for progress scale (prefer this over steps).
+  - Top MSE & TopVQ: loss_detail_avg_accum/top_code_mse and …/top_code_vq_loss to gauge balance.
+  - VQ (compressor) vs TopVQ: different inputs; VQ stable, TopVQ should drop then plateau.
+  - SmoothPPL: will be ≈ K (8192) when quantizer is frozen; treat as a known artifact, not model
+  health.
+
+  If Accuracy Stalls Post ~1B TopSeen
+
+  - Weight balance: reduce top VQ multiplier further (e.g., from 0.1× MSE to 0.05×) so MSE drives
+  boundary crossings.
+  - Add diagnostics (no behavior change):
+      - Margin: distance of pre‑VQ pred to target center minus to current pred center; trend ≤ 0
+  indicates imminent flips.
+      - Pre‑VQ MSE to target center; should trend down even when TopAcc is flat.
+      - Top‑k accuracy (5/10) using distance logits; moves earlier than top‑1 with large K.
+  - Warm‑start (short): 2–5k steps using MSE on predictions_pre_vq vs vq_embeddings, then switch back
+  to post‑VQ MSE + VQ.
+
+  Known Gotchas
+
+  - SmoothPPL=8192 constant: EMA counts don’t update under frozen/eval; either accept as cosmetic or
+  compute a logging‑only perplexity from indices if needed later.
+  - Post‑VQ MSE plateaus: expected stepwise behavior with STE; rely on accuracy/margins to assess
+  progress.
+  - K=8192: random top‑1 ≈ 0.00012; TopAcc ~0.02–0.05 is >100× random but still low; improvements
+  come in jumps.
+
+  Next‑Step Experiments (if needed)
+
+  - Slightly lower top_code_vq_loss weight again; observe TopAcc trajectory over another 100–200M
+  TopSeen.
+  - Add top‑k accuracy and margin metrics for earlier signal (logging only).
+  - As a bigger change: consider a small CE term over top indices with distance logits (0.1–0.2× MSE)
+  to smooth gradients across boundaries.
+
+  Quick Reference
+
+  - Train targets: abstractinator_pyramid.py → top_co.vq_embeddings
+  - Preds used: abstractinator_pyramid.py → lm_out["predictions"]
+  - Generation append: abstractinator_pyramid.py → append quantized next_top
+  - VQ hook: train.py → model.top_lm.vq = model.levels[-1].compressor.quantizer
+  - Loss add: train.py → add avg_top_code_lm_loss and scaled top_code_vq_loss
+  - Metrics keys:
+      - Accuracy: top_lm/accuracy_avg_accum
+      - Effective positions: top_lm/effective_positions_total
+      - Details: loss_detail_avg_accum/top_code_mse, …/top_code_vq_loss
+
+  These notes should bring you (future me) up to speed fast and provide a clear checklist for
+  verifying the current setup and deciding next moves if TopAcc remains flat after ~1B effective
+  top positions.

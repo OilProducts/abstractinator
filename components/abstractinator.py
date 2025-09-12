@@ -66,7 +66,6 @@ class Abstractinator(nn.Module):
             q_comp_dim=cfg.c_q_comp_dim,
             retr_dim=cfg.c_retr_dim,
             num_encoder_layers=cfg.c_num_encoder_layers,
-            num_shared_encoder_layers=cfg.c_num_shared_encoder_layers,
             num_entropy_encoder_layers=cfg.c_num_entropy_encoder_layers,
             num_compression_encoder_layers=cfg.c_num_compression_encoder_layers,
             num_queries=cfg.c_num_queries,
@@ -620,9 +619,9 @@ class Abstractinator(nn.Module):
             T = generated.size(1)
 
             # Prepare decoder inputs as compressor hidden states, mirroring training
-            inp_emb = self.compressor.embedding(generated)  # (B, T, D)
-            h_shared = self.compressor._run_shared(inp_emb, kpm)
-            dec_inp = self.compressor._run_compression(h_shared, kpm)  # (B, T, D)
+            # Use compression branch embedding and encoder to mirror training path
+            inp_emb = self.compressor.embedding_comp(generated)  # (B, T, D)
+            dec_inp = self.compressor._run_compression(inp_emb, kpm)  # (B, T, D)
 
             seg_ids_cur = _align_seg_ids(T)  # (B, T)
 

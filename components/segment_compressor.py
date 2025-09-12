@@ -58,7 +58,7 @@ class CompressorOutput:
     input_sequence: Tensor  # (B, S) long or empty ()
     input_padding_mask: Optional[Tensor]  # (B, S) bool or None
 
-    hidden_states: List[Tensor]  # List of (B, S, D) from shared layers
+    hidden_states: Tensor  # (B, S, D) final compression-branch hidden states
 
 
 # ---------------------------
@@ -559,47 +559,6 @@ def _categorical_entropy_bits(
     logp = F.log_softmax(logits, dim=-1)
     H_nats = -(logp.exp() * logp).sum(dim=-1)
     return H_nats / math.log(2.0)
-    # @torch.no_grad()
-    # def predictive_entropy_next_bits(
-    #     self,
-    #     x: Tensor,
-    #     key_padding_mask: Tensor | None = None,
-    #     *,
-    #     temperature: float = 1.0,
-    #     top_p: float = 1.0,
-    #     top_k: int = 0
-    # ) -> Tensor:
-    #     """
-    #     Shannon entropy H(p) in bits at the last position (B,).
-    #     Applies temperature/top-k/top-p to the *next* distribution if provided.
-    #     """
-    #     h = self._run_stack(x, key_padding_mask)   # (B, S, D)
-    #     logits = self.proj(h)[:, -1, :]            # (B, V)
-    #
-    #     # temperature (logits / tau)
-    #     if temperature is not None and temperature > 0.0 and temperature != 1.0:
-    #         logits = logits / float(temperature)
-    #
-    #     # top-k
-    #     if top_k and top_k < logits.size(-1):
-    #         v, idx = torch.topk(logits, top_k, dim=-1)
-    #         neg_inf = torch.full_like(logits, float("-inf"))
-    #         logits = neg_inf.scatter(-1, idx, v)
-    #
-    #     # top-p (nucleus)
-    #     if 0.0 < top_p < 1.0:
-    #         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-    #         probs = F.softmax(sorted_logits, dim=-1)
-    #         cdf = probs.cumsum(dim=-1)
-    #         cutoff = (cdf > top_p).float().argmax(dim=-1, keepdim=True)
-    #         mask = torch.arange(sorted_logits.size(-1), device=logits.device)[None, :] <= cutoff
-    #         masked_sorted = torch.where(mask, sorted_logits, torch.full_like(sorted_logits, float("-inf")))
-    #         logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, masked_sorted)
-    #
-    #     logp = F.log_softmax(logits, dim=-1)        # (B, V), nats
-    #     H_nats = -(logp.exp() * logp).sum(dim=-1)   # (B,)
-    #     return H_nats / math.log(2.0)
-
 
 # ---------------------------
 # Segmentation helper
@@ -636,7 +595,7 @@ class Segmenter(nn.Module):
 
 
 # ---------------------------
-# Streaming cache for the whole path (shared + entropy)
+# Streaming cache for the entropy path
 # ---------------------------
 
 
@@ -649,7 +608,6 @@ class NextPred:
 
 @dataclass
 class StreamCache:
-    shared: List[Tuple[Tensor, Tensor]]
     entropy: Any  # FlexibleEntropyModel cache (FlexCache)
     pos: int
     next_pred: NextPred | None = None
@@ -665,7 +623,7 @@ class StreamCache:
 
 class SegmentCompressor(nn.Module):
     """
-    End-to-end: shared encoder → (entropy branch, compression branch) → pool → quantize.
+    End-to-end: separate entropy and compression branches → pool → quantize.
 
     Sampling:
       - call `sample_next()` to draw from the entropy model (embedding for Gaussian,
@@ -690,7 +648,6 @@ class SegmentCompressor(nn.Module):
         compression_window: Optional[int] = None,
         num_encoder_layers: int = 2,
         encoder_ffn_dim_multiplier: int = 4,
-        num_shared_encoder_layers: int = 0,
         # Entropy trunk layers
         num_entropy_encoder_layers: Optional[int] = None,
         num_compression_encoder_layers: Optional[int] = None,
@@ -723,8 +680,9 @@ class SegmentCompressor(nn.Module):
             use_flex_attention if (attention_config is None) else (attention_config.kernel == "flex")
         )
 
-        # Token embedding shared by both entropy and compression branches
-        self.embedding = nn.Embedding(vocab_size, dim)
+        # Separate token embeddings for entropy and compression branches
+        self.embedding = nn.Embedding(vocab_size, dim)  # entropy branch
+        self.embedding_comp = nn.Embedding(vocab_size, dim)  # compression branch
 
         # Shared stack
         attn_cfg = attention_config or AttentionConfig(
@@ -734,19 +692,6 @@ class SegmentCompressor(nn.Module):
             kv_comp_dim=kv_comp_dim,
             q_comp_dim=q_comp_dim,
             retr_dim=retr_dim,
-        )
-
-        self.shared_layers = nn.ModuleList(
-            [
-                make_sliding_self_block(
-                    dim=dim,
-                    num_heads=heads,
-                    window_size=window,
-                    ffn_dim_multiplier=encoder_ffn_dim_multiplier,
-                    cfg=attn_cfg,
-                )
-                for _ in range(num_shared_encoder_layers)
-            ]
         )
 
         # Compression branch
@@ -816,11 +761,6 @@ class SegmentCompressor(nn.Module):
 
     # ---- helpers ----
 
-    def _run_shared(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
-        for layer in self.shared_layers:
-            x = layer(x, key_padding_mask=kpm)
-        return x
-
     def _run_compression(self, x: Tensor, kpm: Optional[Tensor]) -> Tensor:
         for layer in self.compression_layers:
             x = layer(x, key_padding_mask=kpm)
@@ -834,15 +774,18 @@ class SegmentCompressor(nn.Module):
         key_padding_mask: Optional[Tensor] = None,
     ) -> CompressorOutput:
         """Convenience wrapper: embed tokens then run forward path."""
-        embeddings = self.embedding(token_ids)
-        return self.forward(embeddings, key_padding_mask=key_padding_mask, token_ids=token_ids)
+        # Entropy/compression use separate embeddings
+        emb_e = self.embedding(token_ids)
+        emb_c = self.embedding_comp(token_ids)
+        return self.forward(emb_e, key_padding_mask=key_padding_mask, token_ids=token_ids, comp_embeddings=emb_c)
 
     def forward(
         self,
-        input_embeddings: Tensor,  # (B, S, D)
+        input_embeddings: Tensor,  # (B, S, D) entropy branch embeddings
         key_padding_mask: Optional[Tensor] = None,  # (B, S) True=pad
         *,
         token_ids: Optional[Tensor] = None,  # (B, S) for logit loss
+        comp_embeddings: Optional[Tensor] = None,  # (B, S, D) compression branch embeddings
     ) -> CompressorOutput:
         """
         1) shared -> entropy & compression branches
@@ -850,14 +793,16 @@ class SegmentCompressor(nn.Module):
         3) pool by segment -> (B, Q_max, D)
         4) quantize (pluggable)
         """
-        x_shared = self._run_shared(input_embeddings, key_padding_mask)
-
         # Entropy model: pass targets for logit CE if available
-        ent_out = self.entropy_model(x_shared, key_padding_mask, targets=token_ids)
+        ent_out = self.entropy_model(input_embeddings, key_padding_mask, targets=token_ids)
         boundaries = self.segmenter(ent_out.bits)
 
         # Compression branch
-        hidden = self._run_compression(x_shared, key_padding_mask)
+        if comp_embeddings is None:
+            if token_ids is None:
+                raise RuntimeError("SegmentCompressor.forward requires token_ids or comp_embeddings for compression path")
+            comp_embeddings = self.embedding_comp(token_ids)
+        hidden = self._run_compression(comp_embeddings, key_padding_mask)
 
         # Pool per segment
         pooled_embeddings, _ = self.pooler(
@@ -901,7 +846,7 @@ class SegmentCompressor(nn.Module):
             hidden_states=hidden,
         )
 
-    # --- segmentation-only fast path (shared + entropy only) ---
+    # --- segmentation-only fast path (entropy only) ---
     @torch.no_grad()
     def segment_only_ids(
         self, token_ids: Tensor, key_padding_mask: Optional[Tensor] = None
@@ -912,8 +857,7 @@ class SegmentCompressor(nn.Module):
     def segment_only(
         self, input_embeddings: Tensor, key_padding_mask: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
-        x_shared = self._run_shared(input_embeddings, key_padding_mask)
-        bits = self.entropy_model.entropy(x_shared, key_padding_mask)
+        bits = self.entropy_model.entropy(input_embeddings, key_padding_mask)
         b = self.segmenter(bits)
         return b.seg_id, b.patch_end_mask
 
@@ -923,8 +867,7 @@ class SegmentCompressor(nn.Module):
     ) -> EntropyOut:
         """Compute entropy-model outputs (bits and loss) from token ids only."""
         x = self.embedding(token_ids)
-        h = self._run_shared(x, key_padding_mask)
-        return self.entropy_model(h, key_padding_mask, targets=token_ids)
+        return self.entropy_model(x, key_padding_mask, targets=token_ids)
 
     # --- sampling from the entropy model ---
     @torch.no_grad()
@@ -943,12 +886,11 @@ class SegmentCompressor(nn.Module):
           - Gaussian model: (B, D) next embedding
           - Logit model: (B,) next token id unless `embed_fn` is provided (then (B, D))
         """
-        x_shared = self._run_shared(input_embeddings, key_padding_mask)
         return self.entropy_model.sample_next(
-            x_shared, key_padding_mask, temperature=temperature, top_p=top_p, top_k=top_k, embed_fn=embed_fn
+            input_embeddings, key_padding_mask, temperature=temperature, top_p=top_p, top_k=top_k, embed_fn=embed_fn
         )
 
-    # --- streaming APIs (shared + entropy) ---
+    # --- streaming APIs (entropy) ---
     @torch.no_grad()
     def stream_prefill_ids(
         self, token_ids: Tensor, key_padding_mask: Optional[Tensor] = None
@@ -960,15 +902,11 @@ class SegmentCompressor(nn.Module):
         self, input_embeddings: Tensor, key_padding_mask: Optional[Tensor] = None
     ) -> Tuple[StreamCache, Tensor]:
         """
-        Build caches for shared + entropy stacks and return entropy bits for prefix.
+        Build caches for entropy stack and return entropy bits for prefix.
         """
         h = input_embeddings
-        shared_caches: List[Tuple[Tensor, Tensor]] = []
-        for blk in self.shared_layers:
-            h, cache = blk.prefill(h, pos_start=0, key_padding_mask=key_padding_mask)
-            shared_caches.append(cache)
         entropy_caches, bits = self.entropy_model.prefill(h, key_padding_mask)
-        return StreamCache(shared=shared_caches, entropy=entropy_caches, pos=int(h.size(1))), bits
+        return StreamCache(entropy=entropy_caches, pos=int(h.size(1))), bits
 
     @torch.no_grad()
     def stream_step_ids(
@@ -985,10 +923,6 @@ class SegmentCompressor(nn.Module):
         """
         h = new_embeddings
         pos0 = cache.pos
-        for i, blk in enumerate(self.shared_layers):
-            h, cache.shared[i] = blk.step(
-                h, cache=cache.shared[i], pos_start=pos0, key_padding_mask_new=key_padding_mask_new
-            )
         cache.entropy, bits = self.entropy_model.step(
             cache.entropy, h, pos_start=pos0, key_padding_mask_new=key_padding_mask_new
         )
@@ -997,7 +931,7 @@ class SegmentCompressor(nn.Module):
 
     @torch.no_grad()
     def enable_mla_fusions_for_inference(self):
-        for blk in list(self.shared_layers) + list(self.compression_layers):
+        for blk in list(self.compression_layers):
             blk.attn.mla.enable_inference_fusions()
         # Entropy model blocks too:
         for blk in getattr(self.entropy_model, "layers", []):
@@ -1011,8 +945,7 @@ class SegmentCompressor(nn.Module):
         H(next|prefix) in bits, shape (B,).
         Gaussian: differential entropy; Logit: categorical Shannon entropy.
         """
-        x_shared = self._run_shared(input_embeddings, key_padding_mask)
-        return self.entropy_model.predictive_entropy_next_bits(x_shared, key_padding_mask, **kw)
+        return self.entropy_model.predictive_entropy_next_bits(input_embeddings, key_padding_mask, **kw)
 
     @torch.no_grad()
     def predictive_entropy_next_bits_ids(
@@ -1037,9 +970,8 @@ class SegmentCompressor(nn.Module):
         """
         Gaussian-only shortcut: H_bits / D (B,).
         """
-        x_shared = self._run_shared(input_embeddings, key_padding_mask)
         if hasattr(self.entropy_model, "predictive_bpd_next"):
-            return self.entropy_model.predictive_bpd_next(x_shared, key_padding_mask, temperature=temperature)
+            return self.entropy_model.predictive_bpd_next(input_embeddings, key_padding_mask, temperature=temperature)
         raise NotImplementedError("predictive_bpd_next is only defined for Gaussian entropy models.")
 
     @torch.no_grad()
