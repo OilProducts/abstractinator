@@ -101,7 +101,7 @@ class AbstractinatorConfig:
     c_vq_K: int = 8192
     c_vq_depth: int = 1
     c_vq_d_c: Optional[int] = None  # d_c for compressor's VQ (code-space dim). If None, defaults to 64.
-    c_vq_beta: float = 0.25
+    c_vq_beta: float = 0.1
     c_vq_reset_interval: int = 250
     # Use a standard VectorQuantizer (D-space, single stage) for the compressor
     # instead of MultiStageResidualVQ. When True, c_vq_depth is ignored for the
@@ -120,7 +120,7 @@ class AbstractinatorConfig:
     # Use a standard VectorQuantizer in the decoder head (no RVQ adapters/codecs)
     d_use_standard_vq: bool = False
     # Standard VQ hyperparameters for the decoder head
-    d_vq_beta: float = 0.25
+    d_vq_beta: float = 0.1
     d_vq_ema: bool = True
     d_vq_decay: float = 0.999
     d_vq_reset_interval: int = 250
