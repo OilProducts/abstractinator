@@ -127,14 +127,9 @@ Key modules under `components/` include:
   representations via a bank of learned queries.
 - **VectorQuantizer** – EMA codebook with dead‑code resets; discretizes segment
   embeddings and provides the VQ loss.
-- **Code spaces (D vs d_c)** – The model's hidden width is `D`. Quantization and
-  factorized heads operate in a smaller code space `d_c` for efficiency. The
-  compressor's VQ uses `c_vq_d_c` (defaults to 64 when unset) for its internal
-  code vectors; the decoder's bottom‑level adapter uses `d_lo_d_c` for byte‑level
-  embeddings and logits when no low‑side VQ is present. Upper levels inherit
-  `d_c` from the child VQ via the RVQ adapter. Keeping `d_c` small reduces
-  compute in nearest‑neighbor search and K‑way logits without changing external
-  tensor shapes (memory remains `D`‑dim).
+- **Code space (D)** – The model's hidden width is `D`. Multi-stage residual VQ
+  and decoder heads now operate directly in this space; each stage codebook is
+  `(K, D)` and logits are computed without any intermediate down-projection.
 - **Attention** – Pluggable attention along two axes:
   - Forms: Regular vs MLA (Multi‑Head Latent Attention)
   - Backends: SDPA vs FlexAttention

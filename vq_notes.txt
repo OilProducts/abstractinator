@@ -1,0 +1,98 @@
+> Here’s a focused, high‑impact set of improvements to the VQ flow and its integration, with
+  concrete code touchpoints.
+
+  Integration correctness
+
+  - Wire child VQ across levels: Pass the lower level’s quantizer to the next level’s expander
+  so it predicts child digits instead of a flat K.
+      - Where: components/abstractinator_pyramid.py::__init__
+      - Change: track prev_vq as levels[-1].hi_quantizer (or levels[-1].compressor.quantizer)
+  and pass as lo_vq to the next Abstractinator.
+  - Use factorized CE when predicting multi‑stage digits:
+      - Where: components/abstractinator.py::forward
+      - Change: if self.lo_codec.depth > 1, call compute_code_loss() and sum per‑stage CE;
+  don’t just train stage_logits[0].
+
+  Training signals and stability
+
+  - Warm‑up quantization:
+      - Start with low beta (commitment) and EMA disabled, ramp over N steps.
+      - Or briefly use soft/relaxed codes (e.g., Gumbel‑Softmax on stage logits) for a small
+  warm‑up window before hard argmin.
+      - Where: schedule in train.py or add a warmup_steps knob inside MultiStageResidualVQ to
+  temporarily skip argmin.
+  - Per‑stage usage regularization:
+      - Add a small entropy bonus on stage usage (discourage collapse to few codes).
+      - Where: compute per‑stage usage from VectorQuantizer.ema_cluster_size and add a
+  weighted term to total loss (guarded by config).
+  - Code reset policy:
+      - Gate resets by both low usage and “staleness” (time since last assignment).
+      - Where: VectorQuantizer._maybe_vectorized_reset(); maintain a small “last hit” EMA
+  (0‑dim) per code and include that in dead_mask.
+  - Keep codebooks mixed‑precision safe:
+      - Compute distances and EMA updates in fp32 regardless of model dtype.
+      - Where: wrap distance/EMA blocks with torch.amp.autocast(enabled=False) or cast to
+  float().
+
+  Performance
+
+  - Prefer digits over composed ids internally:
+      - Store digits: List[(B,Q)] alongside vq_indices in CompressorOutput to avoid repeated
+  compose/decompose overhead and very large composed domains when depth > 2.
+      - Where: components/segment_compressor.py::forward
+  - Hoist codebook reads:
+      - When computing stage logits, prefetch stage_codebook(s) once per layer/step (they’re
+  detached) and reuse.
+      - Where: components/vector_quantizer.py::rvq_stage_logits
+  - Cache codebook norms:
+      - For squared‑distance logits, maintain cached ||e||^2 per stage (updates only when
+  codebook changes).
+      - Where: in adapter or head; invalidate/update when stage_codebook changes.
+
+  API simplifications
+
+  - Unify naming and exposure:
+      - Rename Abstractinator.hi_quantizer → quantizer and always access quantizer via
+  level.compressor.quantizer to eliminate stale attributes (.vq) across the repo.
+      - Ensure CompressorOutput always carries vq_depth, K, and optionally digits for clarity.
+  - Explicit detach rules:
+      - Document and enforce that expander helpers read codebooks detached (no grads into
+  compressor’s VQ).
+  - Single source of special tokens:
+      - Centralize special IDs (BOS/EOS/EOP/PAD) in a shared structure and thread them into
+  all VQs/adapters consistently (already mostly done; make it explicit).
+
+  Better monitoring
+
+  - Per‑stage perplexity and resets:
+      - Log stage‑wise perplexity, reset counts, and fraction of “dead” codes per stage/level.
+      - Where: produce lists in AbstractinatorPyramid.forward under a new key (e.g.,
+  vq_stage_metrics) and aggregate in components/metrics.py.
+  - Usage histograms (optional artifact):
+      - Periodically dump usage histograms (per stage) as MLflow artifacts to visualize spread
+  over time.
+
+  Top‑LM and discrete prior (optional)
+
+  - If you plan a discrete top LM later, expose the top quantizer cleanly:
+      - Wire model.top_lm.vq = model.levels[-1].compressor.quantizer so it can quantize
+  predictions and emit indices/VQ loss.
+      - Consider an auxiliary “code prior” loss at the top over digits (factorized CE) for
+  Stage‑2.
+
+  Doc/tests polish
+
+  - Unit tests:
+      - Tests for compose/decompose roundtrip on random digits.
+      - Test that expander heads do not backprop into compressor codebooks (grad check).
+
+  Concrete minimal patches I can do next (if you want)
+
+  - Wire lo_vq across levels in AbstractinatorPyramid.
+  - Switch Abstractinator.forward() to use compute_code_loss() when lo_codec.depth > 1.
+  - Add per‑stage metrics (perplexity/resets) to outputs/metrics.
+  - Make CompressorOutput optionally return digits to avoid recompute (no behavior change
+  elsewhere).
+
+  These changes keep the current design but make multi‑level RVQ training correct by default,
+  improve stability, and add visibility into codebook health without blowing up complexity.
