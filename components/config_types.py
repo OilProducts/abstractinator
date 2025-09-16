@@ -100,7 +100,6 @@ class AbstractinatorConfig:
     c_output_length: int = 1024
     c_vq_K: int = 8192
     c_vq_depth: int = 1
-    c_vq_d_c: Optional[int] = None  # d_c for compressor's VQ (code-space dim). If None, defaults to 64.
     c_vq_beta: float = 0.1
     c_vq_reset_interval: int = 250
     # Use a standard VectorQuantizer (D-space, single stage) for the compressor
@@ -116,7 +115,6 @@ class AbstractinatorConfig:
     d_use_sqdist_logits: bool = False
     d_predict_specials: bool = False
     d_max_len: int = 2048
-    d_lo_d_c: int = 64  # d_c for bottom-level decoder (no lo_vq). Ignored at upper levels.
     # Use a standard VectorQuantizer in the decoder head (no RVQ adapters/codecs)
     d_use_standard_vq: bool = False
     # Standard VQ hyperparameters for the decoder head

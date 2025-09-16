@@ -22,10 +22,8 @@ level = AbstractinatorConfig(
     d_heads=8,
     d_cross_window=1,
     d_max_len=512,
-    c_entropy_load_path = "./models/entropy_stack_256.pt",
-    c_entropy_freeze = True,
-    c_vq_d_c=256,
-    d_lo_d_c=256,
+    c_entropy_load_path="./models/entropy_stack_256.pt",
+    c_entropy_freeze=True,
     d_use_standard_vq=True,
     a_freeze=False,
 )

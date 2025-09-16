@@ -14,10 +14,10 @@ from .swiglu import SwiGLU
 from .vector_quantizer import VectorQuantizer
 from .vector_quantizer import (
     ComposedIndexCodec,
-    LearnedCodebookAdapter,
     MultiStageResidualVQ,
-    RVQEmbeddingAdapter,
-    RVQFactorizedHead,
+    embed_rvq_indices,
+    rvq_stage_logits,
+    rvq_stage_logits_and_greedy,
 )
 
 
@@ -184,7 +184,7 @@ class DecoderOnlyExpanderRVQ(nn.Module):
 
     def __init__(
         self,
-        lo_vq: "MultiStageResidualVQ",  # MS-RVQ for the *target* code space
+        lo_vq: Optional["MultiStageResidualVQ"],  # MS-RVQ for the *target* code space
         hi_vq: Optional["MultiStageResidualVQ"],  # MS-RVQ for the *memory* code space
         K_lo: Optional[int] = None,  # if lo_vq is None
         D: int = 256,
@@ -193,7 +193,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         cross_window: int = 128,
         eos_id: int = 257,
         max_len: int = 2048,
-        lo_d_c: int = 64,  # Factorized rank for bytes
         residual_conditioning: bool = True,
         use_sqdist_logits: bool = False,
         device: Optional[torch.device] = None,
@@ -204,51 +203,35 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         super().__init__()
         self.lo_vq = lo_vq
         self.hi_vq = hi_vq
-        self.D = D
-        self.eos_id = eos_id
-        self.max_len = max_len
-        self.K_lo = K_lo
+        self.D = int(D)
+        self.eos_id = int(eos_id)
+        self.max_len = int(max_len)
+        self.use_sqdist_logits = bool(use_sqdist_logits)
+        self.residual_conditioning = bool(residual_conditioning)
 
-        # Reuse VQ projections and codebooks
-        # ---- low side (what we predict) ----
-        if lo_vq is not None:
-            self.lo_adapt = RVQEmbeddingAdapter(lo_vq, target_D=D, use_shared_proj=True, tie_up_down=True)
-            self.lo_codec = ComposedIndexCodec(
-                K=lo_vq.K,
-                depth=lo_vq.depth,
-                bos=lo_vq.bos_token_id,
-                eos=lo_vq.eos_token_id,
-                pad=lo_vq.padding_token_id,
-            )
-
+        if self.lo_vq is not None:
+            self.K_lo = self.lo_vq.K
+            self.lo_codec = self.lo_vq.codec
+            self.lo_embed: Optional[nn.Embedding] = None
         else:
-            assert K_lo is not None, "Need K_lo for bottom level when lo_vq is None."
-            self.lo_adapt = LearnedCodebookAdapter(
-                K=K_lo,
-                D=D,
-                d_c=lo_d_c,
-                device=device,
-            )
-            self.lo_codec = ComposedIndexCodec(K=K_lo, depth=1, bos=-1, eos=-1, pad=-1)
+            if K_lo is None:
+                raise ValueError("Need K_lo for bottom level when lo_vq is None.")
+            self.K_lo = int(K_lo)
+            self.lo_embed = nn.Embedding(self.K_lo, self.D, device=device)
+            self.lo_codec = ComposedIndexCodec(K=self.K_lo, depth=1, bos=-1, eos=-1, pad=-1)
 
-        # ---- high side (memory) ----
-        self.hi_adapt = RVQEmbeddingAdapter(hi_vq, target_D=D, use_shared_proj=True) if hi_vq is not None else None
+        self.hi_codec = hi_vq.codec if hi_vq is not None else None
 
         # Decoder block with configurable attention forms/backends
         self.decoder = SlidingDecoder(
             N_dec,
-            D,
+            self.D,
             H,
             cross_window,
-            q_dim=D,
-            kv_dim=D,
+            q_dim=self.D,
+            kv_dim=self.D,
             cross_attn_config=cross_attn_config,
             self_attn_config=self_attn_config,
-        )
-
-        # Factorized head
-        self.head = RVQFactorizedHead(
-            self.lo_adapt, residual_conditioning=residual_conditioning, use_sqdist_logits=use_sqdist_logits
         )
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
@@ -258,14 +241,18 @@ class DecoderOnlyExpanderRVQ(nn.Module):
         # Either high side is already continuous (D), or embed via hi_vq
         if codes_hi.is_floating_point():
             return codes_hi
-        if self.hi_adapt is None:
-            raise ValueError("codes_hi is discrete but hi_vq/hi_adapt not provided")
-        return self.hi_adapt.embed_composed(codes_hi)
+        if self.hi_vq is None:
+            raise ValueError("codes_hi is discrete but hi_vq not provided")
+        return embed_rvq_indices(self.hi_vq, codes_hi)
 
     def _embed_decoder_inputs(self, codes_lo: torch.Tensor) -> torch.Tensor:
         # Shift-right with EOS
         decoder_input_ids = F.pad(codes_lo[:, :-1], (1, 0), value=self.eos_id)
-        return self.lo_adapt.embed_composed(decoder_input_ids)
+        if self.lo_vq is not None:
+            return embed_rvq_indices(self.lo_vq, decoder_input_ids)
+        if self.lo_embed is None:
+            raise RuntimeError("lo_embed should be defined when lo_vq is None")
+        return self.lo_embed(decoder_input_ids)
 
     def forward(
         self,
@@ -300,11 +287,19 @@ class DecoderOnlyExpanderRVQ(nn.Module):
             seg_ids=seg_ids,
         )  # (B, L, D)
 
-        # Teacher-forced residual conditioning uses *true* digits at (B,L)
-        teacher_digits, _ = self.lo_codec.decompose(codes_lo)
-        logits = self.head(h, teacher_digits=teacher_digits)  # dict
+        if self.lo_vq is not None:
+            teacher_digits, _ = self.lo_codec.decompose(codes_lo)
+            stage_logits = rvq_stage_logits(
+                self.lo_vq,
+                h,
+                residual_conditioning=self.residual_conditioning,
+                use_sqdist_logits=self.use_sqdist_logits,
+                teacher_digits=teacher_digits,
+            )
+            return {"stage_logits": stage_logits}
 
-        return logits  # {"stage_logits": [B,L,K]*depth, "special_logits": (B,L,S) or None}
+        logits = self._standard_vq_logits(h)
+        return {"stage_logits": [logits]}
 
     @torch.no_grad()
     def generate(
@@ -348,7 +343,6 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 return seg_ids[:, :curr_T]
             return seg_ids
 
-        depth = self.lo_codec.depth  # works for both MS-RVQ and learned single-stage
         new_tokens = torch.zeros((B, 0), dtype=generated.dtype, device=device)  # (B,0)
         for step in range(steps_budget):
             T = generated.size(1)
@@ -370,21 +364,20 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 seg_ids=seg_ids_cur,
             )  # (B, T, D)
 
-            last_h = h[:, -1, :]  # (B,1,D)
-            r_dc = self.lo_adapt.down(last_h)  # (B,1,d_c)
-
-            # Greedy stage-by-stage with residual updates
-            digits = []
-            for s in range(depth):
-                W = self.lo_adapt.stage_codebook(s)  # (K, d_c)
-                logit_s = self.head._stage_logits(r_dc, W)  # (B,1,K)
-                idx_s = logit_s.argmax(dim=-1)  # (B,1)
-                digits.append(idx_s)  # keep time dim
-                r_dc = r_dc - F.embedding(idx_s, W)  # (B,1,d_c)
-
-            next_id = self.lo_codec.compose(digits)  # (B,1) or (B,)
-            if next_id.ndim == 1:
-                next_id = next_id.unsqueeze(1)  # (B,1)
+            if self.lo_vq is not None:
+                last_h = h[:, -1:, :]  # (B,1,D)
+                _, greedy_digits = rvq_stage_logits_and_greedy(
+                    self.lo_vq,
+                    last_h,
+                    residual_conditioning=self.residual_conditioning,
+                    use_sqdist_logits=self.use_sqdist_logits,
+                )
+                next_id = self.lo_codec.compose(greedy_digits)
+                if next_id.ndim == 1:
+                    next_id = next_id.unsqueeze(1)
+            else:
+                logits_next = self._standard_vq_logits(h[:, -1:, :])
+                next_id = logits_next.argmax(dim=-1)
 
             # Append next_id to the sequence and extend masks accordingly
             generated = torch.cat([generated, next_id], dim=1)  # (B, T+1)
@@ -395,6 +388,17 @@ class DecoderOnlyExpanderRVQ(nn.Module):
                 break
 
         return new_tokens
+
+    def _standard_vq_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if self.lo_embed is None:
+            raise RuntimeError("lo_embed should be defined when lo_vq is None")
+        E = self.lo_embed.weight
+        if self.use_sqdist_logits:
+            r2 = (h * h).sum(-1, keepdim=True)
+            e2 = (E * E).sum(-1).view(1, 1, -1)
+            dot = F.linear(h, E)
+            return -(r2 - 2 * dot + e2)
+        return F.linear(h, E)
 
 
 class DecoderExpander(nn.Module):

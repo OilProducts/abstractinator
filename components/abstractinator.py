@@ -43,12 +43,10 @@ class Abstractinator(nn.Module):
             )
         else:
             # Multi-stage residual VQ
-            vq_d_c = cfg.c_vq_d_c if cfg.c_vq_d_c is not None else 64
             self.hi_quantizer = MultiStageResidualVQ(
                 K=int(cfg.c_vq_K),
                 D=int(cfg.D),
                 depth=int(cfg.c_vq_depth),
-                d_c=int(vq_d_c),
                 beta=float(cfg.c_vq_beta),
                 reset_interval=int(cfg.c_vq_reset_interval),
                 bos_token_id=int(cfg.bos_id),
@@ -223,7 +221,6 @@ class Abstractinator(nn.Module):
                 cross_window=cfg.d_cross_window,
                 eos_id=eos_id,
                 max_len=cfg.d_max_len,
-                lo_d_c=cfg.d_lo_d_c,
                 residual_conditioning=cfg.d_residual_conditioning,
                 use_sqdist_logits=cfg.d_use_sqdist_logits,
                 device=cfg.device,

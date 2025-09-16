@@ -299,10 +299,10 @@ def initialize_model(
 
             # Expander breakdown
             if expn is not None:
-                lo_adapt = _safe_count(getattr(expn, "lo_adapt", None))
-                hi_adapt = _safe_count(getattr(expn, "hi_adapt", None))
+                lo_vq_params = _safe_count(getattr(expn, "lo_vq", None))
+                lo_embed_params = _safe_count(getattr(expn, "lo_embed", None))
+                hi_vq_params = _safe_count(getattr(expn, "hi_vq", None))
                 dec = _safe_count(getattr(expn, "decoder", None))
-                head = _safe_count(getattr(expn, "head", None))
 
                 try:
                     n_dec_layers = len(getattr(getattr(expn, "decoder", None), "layers", []))
@@ -310,12 +310,12 @@ def initialize_model(
                     n_dec_layers = 0
 
                 logger.info(
-                    "    └─ Expander breakdown → lo_adapter: %s | hi_adapter: %s | decoder(%d): %s | head: %s",
-                    short_num(lo_adapt),
-                    short_num(hi_adapt),
+                    "    └─ Expander breakdown → lo_vq: %s | lo_embed: %s | hi_vq: %s | decoder(%d): %s",
+                    short_num(lo_vq_params),
+                    short_num(lo_embed_params),
+                    short_num(hi_vq_params),
                     n_dec_layers,
                     short_num(dec),
-                    short_num(head),
                 )
 
         logger.info(

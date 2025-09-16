@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from components.config_types import PyramidConfig
 
 from .abstractinator import Abstractinator
+from .vector_quantizer import embed_rvq_indices
 
 
 class AbstractinatorPyramid(nn.Module):
@@ -221,11 +222,10 @@ class AbstractinatorPyramid(nn.Module):
                         idx_b = torch.arange(B_all, device=pred.device)
 
                         # Branch on quantizer type: MS-RVQ vs standard VQ
-                        if hasattr(vq, "down") and hasattr(vq, "stages") and hasattr(vq, "codec"):
+                        if hasattr(vq, "stage_codebook") and hasattr(vq, "codec"):
                             # ---- MS-RVQ path ----
-                            r_dc = vq.down(pred)  # (B, S-1, d_c)
-                            W0 = vq.stages[0].codebook  # (K, d_c)
-                            r_last = r_dc[idx_b, last_idx, :]  # (B, d_c)
+                            W0 = vq.stage_codebook(0)  # (K, D)
+                            r_last = pred[idx_b, last_idx, :]  # (B, D)
                             dot = F.linear(r_last, W0)  # (B, K)
                             e2 = (W0 * W0).sum(dim=1).view(1, -1)  # (1, K)
                             logits0 = 2.0 * dot - e2  # (B, K)
@@ -251,8 +251,8 @@ class AbstractinatorPyramid(nn.Module):
 
                             # Top-k over all valid positions (stage 0 digits)
                             # Compute logits for all positions with constant-shape matmul
-                            r_dc_2d = r_dc.reshape(-1, r_dc.size(-1))  # (B*T, d_c)
-                            dot_all = F.linear(r_dc_2d, W0).view(r_dc.size(0), r_dc.size(1), -1)  # (B,T,K)
+                            r2d = pred.reshape(-1, pred.size(-1))  # (B*T, D)
+                            dot_all = F.linear(r2d, W0).view(pred.size(0), pred.size(1), -1)  # (B,T,K)
                             logits0_all = 2.0 * dot_all - e2.view(1, 1, -1)  # (B,T,K)
                             t0_all = digits_tgt_all[0]  # (B,T)
                             for k in (5, 10):
@@ -266,17 +266,9 @@ class AbstractinatorPyramid(nn.Module):
                                     acc_topk_all = in_topk_all.mean()
                                 top_lm_details[f"top_code_acc_top{k}_stage0"] = acc_topk_all
 
-                            def _embed_indices_D_rvq(indices: torch.Tensor) -> torch.Tensor:
-                                digits, _ = vq.codec.decompose(indices)
-                                y_dc = torch.zeros(indices.size(0), indices.size(1), vq.d_c, device=pred.device, dtype=pred.dtype)
-                                for s in range(vq.depth):
-                                    W = vq.stages[s].codebook  # (K, d_c)
-                                    y_dc = y_dc + F.embedding(digits[s], W)
-                                return vq.up(y_dc)  # (B, T, D)
-
                             z = pred
-                            center_tgt_D = _embed_indices_D_rvq(tgt_idx)
-                            center_pred_D = _embed_indices_D_rvq(pred_idx)
+                            center_tgt_D = embed_rvq_indices(vq, tgt_idx)
+                            center_pred_D = embed_rvq_indices(vq, pred_idx)
                             d2_tgt = ((z - center_tgt_D) ** 2).sum(dim=-1)
                             d2_pred = ((z - center_pred_D) ** 2).sum(dim=-1)
                             margin = d2_tgt - d2_pred
