@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Tuple
+import logging
 
 import torch
 import torch._dynamo as dynamo
@@ -23,7 +24,7 @@ class VectorQuantizer(nn.Module):
         D: int,
         beta: float = 0.25,
         ema: bool = True,
-        decay: float = 0.999,
+        decay: float = 0.99,
         eps: float = 1e-5,
         reset_codes: bool = True,
         reset_interval: int = 250,
@@ -33,6 +34,8 @@ class VectorQuantizer(nn.Module):
         bos_token_id: int = 0,
         eos_token_id: int = 1,
         padding_token_id: int = 2,
+        # Reset gating / usage controls
+        stale_after: int = 1000,
         
         forbidden_ids: Optional[List[int]] = None,
         protected_ids: Optional[List[int]] = None,
@@ -68,8 +71,8 @@ class VectorQuantizer(nn.Module):
         # Codebook and EMA stats
         self.codebook = nn.Parameter(torch.randn(self.K, self.D))
         if self.ema:
-            self.register_buffer("ema_cluster_size", torch.zeros(self.K))
-            self.register_buffer("ema_weight_sum", self.codebook.data.clone())
+            self.register_buffer("ema_cluster_size", torch.zeros(self.K, dtype=torch.float32))
+            self.register_buffer("ema_weight_sum", self.codebook.data.clone().to(torch.float32))
 
         # Replacement/reset machinery as DEVICE STATE (no Python mirrors)
         if self.reset_codes:
@@ -84,6 +87,10 @@ class VectorQuantizer(nn.Module):
             self.min_usage_threshold = 1.0
             # constant reset budget (shape‑stable)
             self.R_MAX = int(max(0, round(self.K * self.max_codes_to_reset_pct)))
+            # global step and per-code last-hit tracker for staleness gating
+            self.register_buffer("step", torch.zeros((), dtype=torch.long))
+            self.register_buffer("last_hit_step", torch.zeros(self.K, dtype=torch.long))
+            self.stale_after = int(stale_after)
 
     # ---------------------------
     # Internal helpers (tensor‑only)
@@ -131,15 +138,35 @@ class VectorQuantizer(nn.Module):
                 enc = enc.clone()
             enc[:, pad_id] = 0
 
-        dw = enc.transpose(0, 1) @ flat_input  # (K,D)
-        cluster = enc.sum(0)  # (K,)
+        # NEW: cast inputs to float32 for stable EMA math
+        enc_f = enc.to(torch.float32)  # (N,K) float32
+        flat_f = flat_input.to(torch.float32)  # (N,D) float32
+
+        # NEW: compute dw and cluster in float32
+        dw = enc_f.transpose(0, 1) @ flat_f  # (K,D) float32
+        cluster = enc_f.sum(0)  # (K,)  float32
+
+        # dw = enc.transpose(0, 1) @ flat_input  # (K,D)
+        # cluster = enc.sum(0)  # (K,)
 
         self.ema_cluster_size.mul_(self.decay).add_(cluster, alpha=1 - self.decay)
         self.ema_weight_sum.mul_(self.decay).add_(dw, alpha=1 - self.decay)
 
         n = self.ema_cluster_size.sum()
         stabilized = ((self.ema_cluster_size + self.eps) / (n + self.K * self.eps)) * n
-        self.codebook.data.copy_(self.ema_weight_sum / stabilized.unsqueeze(1))
+        new_cb_f32 = self.ema_weight_sum / stabilized.unsqueeze(1)  # (K,D) float32
+        self.codebook.data.copy_(new_cb_f32.to(self.codebook.dtype))
+
+        # self.codebook.data.copy_(self.ema_weight_sum / stabilized.unsqueeze(1))
+
+        # Track recency of usage for reset gating: update last_hit_step for codes
+        # that were assigned at least once this step.
+        # cluster is float32 (K,); treat > 0 as hit mask.
+        hits = cluster > 0
+        if hits.any():
+            idx = hits.nonzero(as_tuple=False).squeeze(1)
+            # Broadcast current step value to all hit indices
+            self.last_hit_step.index_copy_(0, idx, self.step.expand(idx.size(0)))
 
     @torch.no_grad()
     def _maybe_vectorized_reset(self) -> None:
@@ -167,7 +194,7 @@ class VectorQuantizer(nn.Module):
         # Sample R_MAX candidate code rows (constant shape)
         rand_idx = torch.randint(0, self.K, (self.R_MAX,), device=self.codebook.device)
 
-        # Which of those candidates are dead? (exclude specials)
+        # Which of those candidates are dead? (exclude specials) and stale
         if self.ema:
             usage = self.ema_cluster_size
         else:
@@ -184,6 +211,13 @@ class VectorQuantizer(nn.Module):
             pad_id = -1
         if (pad_id is not None) and (pad_id >= 0) and (pad_id < self.K):
             dead_mask[pad_id] = False
+
+        # Staleness gating: only reset codes not used for a while
+        stale_mask = torch.ones_like(dead_mask, dtype=torch.bool)
+        if hasattr(self, "last_hit_step"):
+            # Broadcast 0-dim step to (K,) and compare
+            stale_mask = (self.step - self.last_hit_step) >= int(getattr(self, "stale_after", 0))
+        dead_mask &= stale_mask
 
         # Apply mask for sampled rows only; also gate by do_reset & has_source
         apply_rows = dead_mask[rand_idx]
@@ -217,6 +251,18 @@ class VectorQuantizer(nn.Module):
             old_sum = self.ema_weight_sum.index_select(0, rand_idx)
             new_sum = torch.where(apply_rows.unsqueeze(1), cand_new, old_sum)
             self.ema_weight_sum.index_copy_(0, rand_idx, new_sum)
+
+        # Console log: how many codes were reset vs eligible (among sampled)
+        resets = int(apply_rows.to(torch.int64).sum().item())
+        if resets > 0:
+            eligible = int(dead_mask[rand_idx].to(torch.int64).sum().item())
+            logging.getLogger(__name__).info(
+                "VQ reset: %d codes reset out of %d eligible (R_MAX=%d, K=%d)",
+                resets,
+                eligible,
+                int(self.R_MAX),
+                int(self.K),
+            )
 
         # Zero the step counter when reset actually fired (tensor math; no Python if)
         keep = (~do_reset).to(self.steps_since_last_reset.dtype)
@@ -270,9 +316,11 @@ class VectorQuantizer(nn.Module):
                 onehot = F.one_hot(indices, self.K).type_as(flat)  # (N,K)
                 self._ema_update(onehot, flat)
             if self.reset_codes:
+                # advance global step for staleness gating
+                self.step.add_(1)
                 self._maybe_vectorized_reset()
 
-        # Perplexity (usage), exclude PAD only
+        # Perplexity (usage), exclude PAD and forbidden ids
         if self.ema:
             counts = self.ema_cluster_size.clone()
         else:
@@ -285,6 +333,9 @@ class VectorQuantizer(nn.Module):
             pad_id = -1
         if (pad_id is not None) and (pad_id >= 0) and (pad_id < counts.size(0)):
             counts[pad_id] = 0
+        # Also exclude forbidden ids from PPL to reflect only valid assignables
+        if self.forbidden_mask.any():
+            counts = counts.masked_fill(self.forbidden_mask, 0)
 
         counts = counts.clamp(min=self.eps)
         probs = counts / (counts.sum() + self.eps)
