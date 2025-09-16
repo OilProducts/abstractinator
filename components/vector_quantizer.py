@@ -347,10 +347,9 @@ class VectorQuantizer(nn.Module):
 
 class MultiStageResidualVQ(nn.Module):
     """
-    Residual VQ with N stages in a compressed space.
+    Residual VQ with N stages that operate directly in model space ``D``.
 
-    - Uses a shared down-projection (D -> d_c) and tied up-projection (d_c -> D).
-    - Each stage quantizes the residual; outputs are summed before up-projection.
+    - Each stage quantizes the running residual; outputs are summed in ``D``.
     - Exposes a composed integer index per position so downstream components can
       treat it as a single discrete token in a space of size K**depth.
     - Provides a ``pad_vector`` sentinel in D-space used to short-circuit to a
@@ -362,7 +361,6 @@ class MultiStageResidualVQ(nn.Module):
         K: int,
         D: int,
         depth: int = 2,
-        d_c: int = 64,
         beta: float = 0.25,
         ema: bool = True,
         decay: float = 0.999,
@@ -381,8 +379,7 @@ class MultiStageResidualVQ(nn.Module):
         # if depth < 2:
         #     raise ValueError("MultiStageResidualVQ requires depth >= 2")
 
-        self.D = D
-        self.d_c = d_c
+        self.D = int(D)
         self.depth = int(depth)
         self.K = int(K)
         self.K_eff = int(self.K**self.depth)
@@ -404,11 +401,6 @@ class MultiStageResidualVQ(nn.Module):
 
         # Allow small effective K; special tokens may be unused for code VQs
 
-        # Shared down/up with tied weights
-        self.down = nn.Linear(D, d_c, bias=False)
-        self.up = nn.Linear(d_c, D, bias=False)
-        # Initialize after orthogonal init (done below)
-
         vq_kwargs = dict(
             beta=beta,
             ema=ema,
@@ -423,7 +415,7 @@ class MultiStageResidualVQ(nn.Module):
             eos_token_id=eos_token_id,
             padding_token_id=padding_token_id,
         )
-        self.stages = nn.ModuleList([VectorQuantizer(K=self.K, D=d_c, **vq_kwargs) for _ in range(self.depth)])
+        self.stages = nn.ModuleList([VectorQuantizer(K=self.K, D=self.D, **vq_kwargs) for _ in range(self.depth)])
 
         reserved_stage0 = [K - 1, K - 2, K - 3]  # order: PAD, BOS, EOS
         self.stages[0].forbidden_mask[...] = False
@@ -434,11 +426,6 @@ class MultiStageResidualVQ(nn.Module):
 
         # Sentinel pad vector in the D-space
         self.register_buffer("pad_vector", torch.zeros(D))
-
-        # bfloat16‑friendly init: Xavier uniform for down, then copy transpose to up
-        with torch.no_grad():
-            nn.init.xavier_uniform_(self.down.weight)
-            self.up.weight.copy_(self.down.weight.T.to(self.up.weight.dtype))
 
     def _compose_indices(self, idx_list: list[torch.Tensor]) -> torch.Tensor:
         base = 1
@@ -456,13 +443,11 @@ class MultiStageResidualVQ(nn.Module):
         pad_vec = self.pad_vector.view(1, 1, -1)
         is_pad = (z == pad_vec).all(dim=-1)  # (B, Q)
 
-        y = self.down(z)
-
         total_loss = torch.tensor(0.0, device=z.device)
         idx_list: list[torch.Tensor] = []
         ppl_list: list[torch.Tensor] = []
-        q_sum = torch.zeros_like(y)
-        r = y
+        q_sum = torch.zeros_like(z)
+        r = z
         for stage in self.stages:
             q_i, loss_i, idx_i, ppl_i = stage(r)
             q_sum = q_sum + q_i
@@ -471,7 +456,7 @@ class MultiStageResidualVQ(nn.Module):
             ppl_list.append(ppl_i)
             r = r - q_i.detach()
 
-        z_hat = self.up(q_sum)
+        z_hat = q_sum
         idx_comp = self._compose_indices(idx_list).view(B, Q)
 
         if is_pad.any():
@@ -486,7 +471,7 @@ class MultiStageResidualVQ(nn.Module):
 
     # convenience accessors
     def stage_codebook(self, s: int) -> torch.Tensor:
-        return self.stages[s].codebook  # (K, d_c)
+        return self.stages[s].codebook  # (K, D)
 
     @property
     def stage_codebooks(self) -> list[torch.Tensor]:
@@ -550,206 +535,101 @@ class ComposedIndexCodec:
         return idx
 
 
-class RVQEmbeddingAdapter(nn.Module):
-    """
-    Bridges MultiStageResidualVQ to the expander.
+def embed_rvq_indices(vq: "MultiStageResidualVQ", idx: torch.Tensor) -> torch.Tensor:
+    """Embed composed RVQ indices by summing stage code vectors in model space ``D``."""
 
-    * Embeds discrete composed indices by summing stage code vectors in d_c, then up to D.
-    * Optionally embeds specials with a tiny (num_special × D) table.
-    * Exposes stage codebooks for factorized output heads.
-    """
+    idx = idx.long()
+    B, L = idx.shape
+    device = idx.device
+    dtype = vq.stage_codebook(0).dtype
 
-    def __init__(
-        self, vq: "MultiStageResidualVQ", target_D: int, use_shared_proj: bool = True, tie_up_down: bool = False
-    ):
-        super().__init__()
-        self.vq = vq
-        self.K = vq.K
-        self.depth = vq.depth
-        self.d_c = vq.d_c
-        self.D_vq = vq.D
-        self.D = int(target_D)
+    digits, _ = vq.codec.decompose(idx)
+    emb = torch.zeros(B, L, vq.D, device=device, dtype=dtype)
+    for s, digit in enumerate(digits):
+        emb = emb + F.embedding(digit, vq.stage_codebook(s))
 
-        # projections
-        share_ok = False  # use_shared_proj and (self.D == self.D_vq)
-        if share_ok:
-            self.up = vq.up  # d_c -> Das
-            self.down = vq.down  # D -> d_c
+    pad_id = getattr(vq, "padding_token_id", None)
+    if pad_id is not None and pad_id >= 0:
+        pad_mask = idx == pad_id
+        if pad_mask.any():
+            pad_vec = vq.pad_vector.to(device=device, dtype=emb.dtype)
+            emb = torch.where(pad_mask.unsqueeze(-1), pad_vec.view(1, 1, -1), emb)
+
+    return emb
+
+
+def rvq_stage_logits(
+    vq: "MultiStageResidualVQ",
+    h: torch.Tensor,
+    *,
+    residual_conditioning: bool = True,
+    use_sqdist_logits: bool = False,
+    teacher_digits: Optional[List[torch.Tensor]] = None,
+) -> List[torch.Tensor]:
+    logits, _ = _rvq_stage_logits_internal(
+        vq,
+        h,
+        residual_conditioning=residual_conditioning,
+        use_sqdist_logits=use_sqdist_logits,
+        teacher_digits=teacher_digits,
+        return_greedy=False,
+    )
+    return logits
+
+
+def rvq_stage_logits_and_greedy(
+    vq: "MultiStageResidualVQ",
+    h: torch.Tensor,
+    *,
+    residual_conditioning: bool = True,
+    use_sqdist_logits: bool = False,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    logits, greedy = _rvq_stage_logits_internal(
+        vq,
+        h,
+        residual_conditioning=residual_conditioning,
+        use_sqdist_logits=use_sqdist_logits,
+        teacher_digits=None,
+        return_greedy=True,
+    )
+    return logits, greedy
+
+
+def _rvq_stage_logits_internal(
+    vq: "MultiStageResidualVQ",
+    h: torch.Tensor,
+    *,
+    residual_conditioning: bool,
+    use_sqdist_logits: bool,
+    teacher_digits: Optional[List[torch.Tensor]],
+    return_greedy: bool,
+) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]]]:
+    """Internal helper optionally returning greedy digits when teacher targets absent."""
+
+    r = h
+    logits: List[torch.Tensor] = []
+    greedy_digits: List[torch.Tensor] = []
+    for s in range(vq.depth):
+        codebook = vq.stage_codebook(s)
+        if use_sqdist_logits:
+            r2 = (r * r).sum(-1, keepdim=True)
+            e2 = (codebook * codebook).sum(-1).view(1, 1, -1)
+            dot = F.linear(r, codebook)
+            logits_s = -(r2 - 2 * dot + e2)
         else:
-            # One shared parameter for both directions
-            dtype = vq.up.weight.dtype
-            device = vq.up.weight.device
-            Wdc = nn.Parameter(torch.empty(self.d_c, self.D, dtype=dtype, device=device))
-            nn.init.xavier_uniform_(Wdc)
-            self.down = DownProj(Wdc)  # D -> d_c
-            self.up = UpProj(Wdc)  # d_c -> D
+            logits_s = F.linear(r, codebook)
+        logits.append(logits_s)
 
-    @torch.no_grad()
-    def stage_codebook(self, s: int) -> torch.Tensor:
-        # Return d_c codebook of stage s, detached so no grads leak into VQ from expander.
-        return self.vq.stages[s].codebook.detach()
+        if residual_conditioning:
+            if teacher_digits is not None:
+                digits_s = teacher_digits[s]
+            else:
+                digits_s = logits_s.argmax(dim=-1)
+                if return_greedy:
+                    greedy_digits.append(digits_s)
+            e = F.embedding(digits_s, codebook)
+            r = r - e.detach()
 
-    def embed_composed(self, idx: torch.Tensor) -> torch.Tensor:
-        """Embed composed ids via factorized codebooks only."""
-        idx = idx.long()
-        B, L = idx.shape
-        dev = idx.device
-        dtype = self.up.Wdc.dtype
-        digits, _ = self.vq.codec.decompose(idx)  # list len=depth, each (B,L) in [0..K-1]
-        y_dc = torch.zeros(B, L, self.d_c, device=dev, dtype=dtype)
-        for s in range(self.depth):
-            W = self.stage_codebook(s)  # (K, d_c)
-            y_dc = y_dc + F.embedding(digits[s], W)
-        return self.up(y_dc)
-
-
-class RVQFactorizedHead(nn.Module):
-    """
-    Produces stage-wise logits for a MultiStageResidualVQ:
-      - Project decoder states h: D → d_c (tie to VQ.down)
-      - If residual_conditioning=True:
-            stage 0 sees y0
-            stage 1 sees (y0 - e[i0]),
-            stage 2 sees (y0 - e[i0] - e[i1]), ...
-        where e[i] are stage code vectors (d_c).
-      - Logits per stage are dot(y_res, codebook_s^T) or -||y_res - e||^2.
-      - Tiny special head (optional).
-    """
-
-    def __init__(
-        self, adapter: RVQEmbeddingAdapter, residual_conditioning: bool = True, use_sqdist_logits: bool = False
-    ):
-        super().__init__()
-        self.adapt = adapter
-        self.depth = adapter.depth
-        self.K = adapter.K
-        self.d_c = adapter.d_c
-        self.D = adapter.D
-        self.residual_conditioning = residual_conditioning
-        self.use_sqdist_logits = use_sqdist_logits
-
-    def _stage_logits(self, r_dc: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-        # r_dc: (B, L, d_c), codebook: (K, d_c)
-        if self.use_sqdist_logits:
-            # -||r - e||^2 = - (||r||^2 - 2 r·e + ||e||^2) → same ordering as dot, but better geometry
-            r2 = (r_dc * r_dc).sum(-1, keepdim=True)  # (B, L, 1)
-            e2 = (codebook * codebook).sum(-1).view(1, 1, -1)  # (1, 1, K)
-            dot = F.linear(r_dc, codebook)  # (B, L, K)
-            return -(r2 - 2 * dot + e2)
-        else:
-            return F.linear(r_dc, codebook)  # (B, L, K)
-
-    def forward(
-        self,
-        h: torch.Tensor,  # (B, L, D) decoder hidden
-        teacher_digits: Optional[List[torch.Tensor]] = None,
-    ) -> Dict[str, List[torch.Tensor]]:
-        """
-        Returns:
-            {
-              "stage_logits": [ (B,L,K) for s in 0..depth-1 ],
-            }
-        """
-        y0 = self.adapt.down(h)  # (B, L, d_c)
-        r = y0
-        out: List[torch.Tensor] = []
-
-        for s in range(self.depth):
-            W = self.adapt.stage_codebook(s)  # (K, d_c)
-            logits_s = self._stage_logits(r, W)  # (B, L, K)
-            out.append(logits_s)
-
-            if self.residual_conditioning:
-                if teacher_digits is not None:
-                    e = F.embedding(teacher_digits[s], W)  # (B, L, d_c)
-                else:
-                    # greedy residual update at inference
-                    e = F.embedding(logits_s.argmax(dim=-1), W)
-                r = r - e.detach()  # stop gradients across stages
-
-        return {"stage_logits": out}
-
-
-class LearnedCodebookAdapter(nn.Module):
-    """
-    Bottom-level adapter that behaves like RVQ with depth=1:
-      - codebook E: (K, d_c)
-      - tied projections via a single shared matrix Wdc: d_c<->D
-      - exposes 'stage_codebook(0)' and 'depth' for the same interface as MS-RVQ adapters.
-    """
-
-    def __init__(
-        self, K: int, D: int, d_c: int = 64, dtype: torch.dtype | None = None, device: torch.device | None = None
-    ):
-        super().__init__()
-        self.K, self.D, self.d_c = int(K), int(D), int(d_c)
-        # Codebook lives in d_c (factorized embedding)
-        self.codebook = nn.Embedding(self.K, self.d_c, dtype=dtype, device=device)
-        # Shared projection parameter Wdc (d_c x D)
-        self.Wdc = nn.Parameter(
-            torch.empty(
-                self.d_c,
-                self.D,
-                dtype=dtype or self.codebook.weight.dtype,
-                device=device or self.codebook.weight.device,
-            )
-        )
-        # Tied modules
-        self.down = DownProj(self.Wdc)  # D -> d_c
-        self.up = UpProj(self.Wdc)  # d_c -> D
-
-        # Inits
-        nn.init.normal_(self.codebook.weight, std=0.02)
-        nn.init.xavier_uniform_(self.Wdc)
-
-        # For API parity with RVQ adapter/head
-        self.depth = 1
-        self.special_ids = []  # bottom-level: put EOS inside [0..K-1] if needed
-        self.special_to_local = {}
-        self.special_emb = None
-
-    # ---- RVQ-compatible surface ----
-    def stage_codebook(self, s: int = 0) -> torch.Tensor:
-        assert s == 0, "LearnedCodebookAdapter has depth=1"
-        return self.codebook.weight  # (K, d_c)
-
-    def embed_composed(self, ids: torch.Tensor) -> torch.Tensor:
-        """
-        ids: (B, L) int64 in [0..K-1].
-        Returns (B, L, D).
-        """
-        # Optional guard in eager:
-        # if not torch._dynamo.is_compiling():
-        #     assert ids.min().item() >= 0 and ids.max().item() < self.K, "byte id OOB"
-        y_dc = self.codebook(ids)  # (B, L, d_c)
-        return self.up(y_dc)  # (B, L, D)
-
-
-class DownProj(nn.Module):  # D -> d_c
-    """Thin wrapper around a shared parameter Wdc to project from model hidden D to code space d_c.
-
-    This keeps the projection tied with UpProj (weight tying), so the adapter can
-    use a single matrix for both directions (D↔d_c) without duplicating params.
-    """
-
-    def __init__(self, Wdc: nn.Parameter):
-        super().__init__()
-        self.Wdc = Wdc  # shape (d_c, D)
-
-    def forward(self, x):  # F.linear: x @ Wdc^T
-        return F.linear(x, self.Wdc)
-
-
-class UpProj(nn.Module):  # d_c -> D
-    """Inverse projection back to model hidden D using the same shared Wdc.
-
-    Using the shared weight preserves geometry between code space and model space
-    and keeps parameter count small.
-    """
-
-    def __init__(self, Wdc: nn.Parameter):
-        super().__init__()
-        self.Wdc = Wdc  # same shared Parameter
-
-    def forward(self, x):  # x @ (Wdc^T)^T = x @ Wdc
-        return F.linear(x, self.Wdc.t())
+    if return_greedy:
+        return logits, greedy_digits
+    return logits, None
