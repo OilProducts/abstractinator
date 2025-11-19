@@ -122,7 +122,7 @@ class AbstractinatorConfig:
     d_vq_ema: bool = True
     d_vq_decay: float = 0.999
     d_vq_reset_interval: int = 250
-    d_vq_max_codes_to_reset_pct: float = 0.1
+    d_vq_max_codes_to_reset_pct: float = 0.5
     d_vq_replacement_buffer_size: int = 65536
     d_vq_vectors_per_step_to_buffer: int = 1024
 
